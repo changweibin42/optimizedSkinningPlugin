@@ -1,0 +1,25 @@
+cmake_minimum_required(VERSION 3.22.1)
+project(optimizedSkinningPlugin)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# 引入 Maya 官方 pluginEntry.cmake
+include($ENV{DEVKIT_LOCATION}/cmake/pluginEntry.cmake)
+
+set(PROJECT_NAME optimizedSkinningPlugin)
+
+set(SOURCE_FILES
+    src/plugin_main.cpp
+    src/optimizedSkinCluster.cpp
+    src/algorithms.cpp
+)
+
+set(LIBRARIES
+    OpenMaya
+    Foundation
+    OpenMayaAnim
+    OpenMayaUI
+)
+
+build_plugin()
