@@ -1,5 +1,6 @@
 #pragma once
 #include <cmath>
+#include <algorithm>
 
 // ================================================================
 // 纯数学库 — 无 Maya 依赖，可直接复用到 GPU 内核
@@ -27,6 +28,11 @@ inline Vec3 v3_scale(const Vec3& a, double s) {
 }
 inline double v3_dot(const Vec3& a, const Vec3& b) {
     return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+inline Vec3 v3_cross(const Vec3& a, const Vec3& b) {
+    return { a.y * b.z - a.z * b.y,
+            a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x };
 }
 inline double v3_len(const Vec3& a) {
     return std::sqrt(v3_dot(a, a));
@@ -79,6 +85,31 @@ inline Vec3 q_rotate_v3(const Quat& q, const Vec3& v) {
     Quat r = q_mul(q_mul(q, v_q), q_conjugate(q));
     return {r.x, r.y, r.z};
 }
+
+inline Quat q_axis_angle(const Vec3& axis, double angle) {
+    double len = std::sqrt(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z);
+    if (len < 1e-12 || std::abs(angle) < 1e-9)
+        return { 0.0, 0.0, 0.0, 1.0 };
+    double s = std::sin(angle * 0.5) / len;
+    return { axis.x * s, axis.y * s, axis.z * s, std::cos(angle * 0.5) };
+}
+
+inline Quat q_between(const Vec3& a, const Vec3& b) {
+    Vec3 an = v3_norm(a);
+    Vec3 bn = v3_norm(b);
+    double d = v3_dot(an, bn);
+    if (d > 1.0 - 1e-9) return { 0.0, 0.0, 0.0, 1.0 };
+    if (d < -1.0 + 1e-9) {
+        Vec3 ax = v3_cross(an, { 1.0, 0.0, 0.0 });
+        if (v3_len(ax) < 1e-6) ax = v3_cross(an, { 0.0, 1.0, 0.0 });
+        return q_axis_angle(ax, 3.14159265358979323846);
+    }
+    // 显式 clamp，避免 std::min/max 依赖
+    if (d < -1.0) d = -1.0;
+    if (d > 1.0) d = 1.0;
+    return q_axis_angle(v3_cross(an, bn), std::acos(d));
+}
+
 
 // ---------- 刚性变换 (q, t) ----------
 struct RigidTransform {

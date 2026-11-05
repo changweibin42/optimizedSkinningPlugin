@@ -1,0 +1,164 @@
+// ================================================================
+// optimizedSkinBind.mel
+// 用法 1（推荐）：选 mesh + joints，执行
+//   optimizedSkinBindFromSelection();
+// 用法 2：
+//   optimizedSkinBind("pCylinder1", {"j_root", "j_mid", "j_tip"});
+// ================================================================
+global proc string optimizedSkinBind(
+    string $meshTransform,
+    string $joints[])
+{
+    // ============================================================
+    // 0. 参数检查
+    // ============================================================
+    if (!`objExists $meshTransform`) {
+        warning ("Mesh not found: " + $meshTransform);
+        return "";
+    }
+
+    string $shapes[] = `listRelatives -s $meshTransform`;
+    if (size($shapes) == 0) {
+        warning ($meshTransform + " is not a mesh");
+        return "";
+    }
+    string $meshShape = $shapes[0];
+
+    int $nJoints = size($joints);
+    if ($nJoints == 0) {
+        warning "No joints specified";
+        return "";
+    }
+
+    print ("[optimizedSkinBind] mesh = " + $meshShape + "\n");
+    print ("[optimizedSkinBind] " + $nJoints + " joints\n");
+
+    // ============================================================
+    // 1. 建 Node A
+    // ============================================================
+    select -r $meshShape;
+    string $defA[] = `deformer -type "optimizedSkinCluster" $meshShape`;
+    string $nodeA = $defA[0];
+    print ("[optimizedSkinBind] Node A = " + $nodeA + "\n");
+
+    // 找到原 mesh 的输出
+    string $origConn[] = `listConnections -s 1 -d 0 -p 1
+        ($nodeA + ".input[0].inputGeometry")`;
+    string $origOutPlug = ($origConn[0]);
+    print ("[optimizedSkinBind] origOutPlug = " + $origOutPlug + "\n");
+
+    // ============================================================
+    // 2. 把 A.outputGeometry[0] 重定向到 dummy mesh
+    // ============================================================
+    catchQuiet(`disconnectAttr ($nodeA + ".outputGeometry[0]")
+                                 ($meshShape + ".inMesh")`);
+    string $dummyName = ($nodeA + "_dummyShape");
+    string $dummyMesh = `createNode "mesh" -n $dummyName`;
+    connectAttr -f ($nodeA + ".outputGeometry[0]") ($dummyMesh + ".inMesh");
+    setAttr ($dummyMesh + ".visibility") 0;
+
+    // ============================================================
+    // 3. 绑定骨骼到 A
+    // ============================================================
+    int $i = 0;
+    for ($j in $joints) {
+        if (!`objExists $j`) {
+            warning ("Joint missing: " + $j);
+            $i++;
+            continue;
+        }
+        if (!`objExists ($j + ".lockInfluenceWeights")`) {
+            select -r $j;
+            addAttr -sn "liw" -ln "lockInfluenceWeights" -at "bool";
+        }
+        catchQuiet(`connectAttr -f ($j + ".liw")
+                                  ($nodeA + ".lockWeights[" + $i + "]")`);
+        catchQuiet(`connectAttr -f ($j + ".worldMatrix[0]")
+                                  ($nodeA + ".matrix[" + $i + "]")`);
+        catchQuiet(`connectAttr -f ($j + ".objectColorRGB")
+                                  ($nodeA + ".influenceColor[" + $i + "]")`);
+
+        float $m[] = `getAttr ($j + ".wim")`;
+        catchQuiet(`setAttr ($nodeA + ".bindPreMatrix[" + $i + "]")
+            -type "matrix"
+            $m[0]  $m[1]  $m[2]  $m[3]
+            $m[4]  $m[5]  $m[6]  $m[7]
+            $m[8]  $m[9]  $m[10] $m[11]
+            $m[12] $m[13] $m[14] $m[15]`);
+        $i++;
+    }
+    print ("[optimizedSkinBind] bound " + $i + " joints\n");
+
+    // ============================================================
+    // 4. 建 Node B
+    // ============================================================
+    string $nodeB = `createNode "optimizedSkinClusterCompute"`;
+    print ("[optimizedSkinBind] Node B = " + $nodeB + "\n");
+
+    connectAttr -f $origOutPlug ($nodeB + ".input[0].inputGeometry");
+    connectAttr -f ($nodeB + ".outputGeometry[0]") ($meshShape + ".inMesh");
+
+    connectAttr -f ($nodeA + ".outData")  ($nodeB + ".inData");
+    connectAttr -f ($nodeA + ".useGPU")   ($nodeB + ".inUseGPU");
+
+    catchQuiet(`setAttr ($nodeA + ".envelope") 1.0`);
+    catchQuiet(`setAttr ($nodeB + ".envelope") 1.0`);
+    catchQuiet(`setAttr ($nodeA + ".useGPU") 0`);
+
+    print ("[optimizedSkinBind] done\n");
+    return $nodeB;
+}
+
+// ================================================================
+// 从当前选择绑定
+//   第一个 mesh（transform 或 shape），其余选中的是 joint
+// ================================================================
+global proc string optimizedSkinBindFromSelection()
+{
+    string $sel[] = `ls -sl`;
+    if (size($sel) < 2) {
+        warning "Select mesh + joints first";
+        return "";
+    }
+
+    string $mesh = "";
+    string $joints[];
+    for ($s in $sel) {
+        string $type = `nodeType $s`;
+        if ($type == "transform" || $type == "mesh") {
+            if ($mesh == "") $mesh = $s;
+        } else if ($type == "joint") {
+            $joints[size($joints)] = $s;
+        }
+    }
+
+    if ($mesh == "") {
+        warning "No mesh in selection";
+        return "";
+    }
+    if (size($joints) == 0) {
+        warning "No joints in selection";
+        return "";
+    }
+
+    return optimizedSkinBind($mesh, $joints);
+}
+
+// ================================================================
+// 解绑
+// ================================================================
+global proc optimizedSkinUnbind(string $nodeA)
+{
+    if (!`objExists $nodeA`) return;
+
+    string $b_conns[] = `listConnections -s 0 -d 1
+        ($nodeA + ".outData")`;
+    for ($b in $b_conns) {
+        if (`nodeType $b` == "optimizedSkinClusterCompute") {
+            catchQuiet(`delete $b`);
+        }
+    }
+
+    catchQuiet(`delete $nodeA`);
+    print ("[optimizedSkinUnbind] deleted " + $nodeA + "\n");
+}

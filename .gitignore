@@ -366,3 +366,12 @@ FodyWeavers.xsd
 *.mll
 *.lib
 *.exp
+
+# CMake build output
+# 注意：上面模板里的 [Bb]in/、bld/ 都不匹配 build/，必须显式列出，
+# 否则 CMake 生成的 .mll/.obj/缓存会被一并提交
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake

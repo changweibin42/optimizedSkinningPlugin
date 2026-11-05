@@ -4,15 +4,26 @@ project(optimizedSkinningPlugin)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 寮曞叆 Maya 瀹樻柟 pluginEntry.cmake
 include($ENV{DEVKIT_LOCATION}/cmake/pluginEntry.cmake)
+
+add_compile_options(/utf-8)
+add_compile_options(/openmp)
+
+link_directories($ENV{DEVKIT_LOCATION}/lib)
 
 set(PROJECT_NAME optimizedSkinningPlugin)
 
+# 只编译 CPU 版本所需文件
 set(SOURCE_FILES
     src/plugin_main.cpp
-    src/optimizedSkinCluster.cpp
+    src/skinClusterData.cpp
     src/algorithms.cpp
+    src/ocd_math.cpp 
+    src/optimizedSkinCluster.cpp
+    src/optimizedSkinClusterCoR.cpp
+    src/optimizedSkinClusterCmd.cpp
+    src/optimizedSkinClusterCoRViewer.cpp
+    src/optimizedSkinClusterCoRViewerOverride.cpp
 )
 
 set(LIBRARIES
@@ -20,6 +31,10 @@ set(LIBRARIES
     Foundation
     OpenMayaAnim
     OpenMayaUI
+    OpenMayaRender
 )
 
 build_plugin()
+
+# GPU 相关文件不编译、不拷贝（保留在 src/ 供参考）
+# add_custom_command(... kernels ...)  ← 已移除

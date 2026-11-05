@@ -1,0 +1,57 @@
+// ================================================================
+// optimizedSkinAutoWeight.mel
+// 用途：给 optimizedSkinCluster 自动分配权重（按 Y 高度分 3 段）
+// 用法：optimizedSkinAutoWeight("optimizedSkinCluster1", "pCylinderShape1");
+// ================================================================
+global proc optimizedSkinAutoWeight(
+    string $nodeA,
+    string $meshShape)
+{
+    if (!`objExists $nodeA`) {
+        warning ("Node not found: " + $nodeA);
+        return;
+    }
+    if (!`objExists $meshShape`) {
+        warning ("Mesh not found: " + $meshShape);
+        return;
+    }
+
+    // 求顶点数
+    int $vCountArr[] = `polyEvaluate -v $meshShape`;
+    int $vCount = $vCountArr[0];
+
+    // 批量读顶点坐标
+    float $pts[] = `xform -q -t -ws ($meshShape + ".vtx[*]")`;
+
+    // 找 Y 范围
+    float $yMin = 1e30;
+    float $yMax = -1e30;
+    for ($v = 0; $v < $vCount; $v++) {
+        float $y = $pts[$v * 3 + 1];
+        if ($y < $yMin) $yMin = $y;
+        if ($y > $yMax) $yMax = $y;
+    }
+    float $yRange = $yMax - $yMin;
+    if ($yRange < 1e-6) $yRange = 1.0;
+
+    // 分配权重（前 3 根骨骼）
+    int $nJoints = `getAttr -size ($nodeA + ".matrix")`;
+    if ($nJoints == 0) return;
+
+    for ($v = 0; $v < $vCount; $v++) {
+        // 清零
+        for ($k = 0; $k < $nJoints; $k++) {
+            catchQuiet(`setAttr ($nodeA + ".weightList[" + $v + "].weights[" + $k + "]") 0.0`);
+        }
+        // 按 Y 分段
+        float $y = $pts[$v * 3 + 1];
+        float $t = ($y - $yMin) / $yRange;
+        int $b = 1;
+        if ($t > 0.66)      $b = 0;
+        else if ($t < 0.33) $b = 2;
+        if ($b >= $nJoints) $b = $nJoints - 1;
+        catchQuiet(`setAttr ($nodeA + ".weightList[" + $v + "].weights[" + $b + "]") 1.0`);
+    }
+
+    print ("[optimizedSkinAutoWeight] set weights for " + $vCount + " verts\n");
+}

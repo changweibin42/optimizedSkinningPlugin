@@ -1,0 +1,97 @@
+// ================================================================
+// createOptimizedSkin.mel
+// 用法：先选 mesh 或 mesh transform，然后 createOptimizedSkin();
+// ================================================================
+global proc string createOptimizedSkin(string $joints[])
+{
+    string $sel[] = `ls -sl`;
+    if (size($sel) == 0) {
+        warning "Please select a mesh first.";
+        return "";
+    }
+
+    string $meshTransform = $sel[0];
+    string $shapes[] = `listRelatives -s $meshTransform`;
+    if (size($shapes) == 0) {
+        warning ($meshTransform + " is not a mesh.");
+        return "";
+    }
+    string $meshShape = $shapes[0];
+
+    int $nJoints = size($joints);
+    if ($nJoints == 0) {
+        warning "No joints provided.";
+        return "";
+    }
+
+    // ---- 1. 建 Node A ----
+    select -r $meshShape;
+    string $defA[] = `deformer -type "optimizedSkinCluster" $meshShape`;
+    string $nodeA = $defA[0];
+    print("[createOptimizedSkin] Node A = " + $nodeA + "\n");
+
+    // ---- 2. 手工连骨骼到 A ----
+    int $idx = 0;
+    for ($j in $joints) {
+        if (!`objExists $j`) continue;
+        if (!`objExists ($j + ".lockInfluenceWeights")`) {
+            select -r $j;
+            addAttr -sn "liw" -ln "lockInfluenceWeights" -at "bool";
+        }
+        catchQuiet(`connectAttr -f ($j + ".liw") ($nodeA + ".lockWeights[" + $idx + "]")`);
+        catchQuiet(`connectAttr -f ($j + ".worldMatrix[0]") ($nodeA + ".matrix[" + $idx + "]")`);
+        catchQuiet(`connectAttr -f ($j + ".objectColorRGB") ($nodeA + ".influenceColor[" + $idx + "]")`);
+
+        float $m[] = `getAttr ($j + ".wim")`;
+        catchQuiet(`setAttr ($nodeA + ".bindPreMatrix[" + $idx + "]")
+            -type "matrix"
+            $m[0]  $m[1]  $m[2]  $m[3]
+            $m[4]  $m[5]  $m[6]  $m[7]
+            $m[8]  $m[9]  $m[10] $m[11]
+            $m[12] $m[13] $m[14] $m[15]`);
+        $idx++;
+    }
+    print("[createOptimizedSkin] Bound " + $idx + " joints\n");
+
+    // ---- 3. 简单权重（按 Y 高度分 N 段）----
+    int $vCountArr[] = `polyEvaluate -v $meshShape`;
+    int $vCount = $vCountArr[0];
+    for ($v = 0; $v < $vCount; $v++) {
+        for ($k = 0; $k < $nJoints; $k++) {
+            catchQuiet(`setAttr ($nodeA + ".weightList[" + $v + "].weights[" + $k + "]") 0.0`);
+        }
+        float $pt[] = `pointPosition ($meshShape + ".vtx[" + $v + "]")`;
+        float $y = $pt[1];
+        int $b = 1;
+        if ($y > 1.0)        $b = 0;
+        else if ($y > -1.0)  $b = 1;
+        else                 $b = 2;
+        if ($b >= $nJoints) $b = $nJoints - 1;
+        catchQuiet(`setAttr ($nodeA + ".weightList[" + $v + "].weights[" + $b + "]") 1.0`);
+    }
+    print("[createOptimizedSkin] Weights for " + $vCount + " verts\n");
+
+    // ---- 4. 建 Node B ----
+    string $nodeB = `createNode "optimizedSkinClusterCompute"`;
+    print("[createOptimizedSkin] Node B = " + $nodeB + "\n");
+
+    // ---- 5. 数据连接（只连一个 outData → inData）----
+    catchQuiet(`connectAttr -f ($nodeA + ".outData")    ($nodeB + ".inData")`);
+    catchQuiet(`connectAttr -f ($nodeA + ".useGPU")     ($nodeB + ".inUseGPU")`);
+    catchQuiet(`connectAttr -f ($nodeA + ".message")    ($nodeB + ".srcCluster")`);
+
+    // ---- 6. 几何链 ----
+    string $aOutPlug   = $nodeA + ".outputGeometry[0]";
+    string $inMeshPlug = $meshShape + ".inMesh";
+
+    connectAttr -f $aOutPlug ($nodeB + ".input[0].inputGeometry");
+    connectAttr -f ($nodeB + ".outputGeometry[0]") $inMeshPlug;
+
+    // ---- 7. 默认状态 ----
+    catchQuiet(`setAttr ($nodeA + ".useGPU") 0`);
+    catchQuiet(`setAttr ($nodeA + ".envelope") 1.0`);
+    catchQuiet(`setAttr ($nodeB + ".envelope") 1.0`);
+
+    print("[createOptimizedSkin] Done.\n");
+    return $nodeB;
+}
