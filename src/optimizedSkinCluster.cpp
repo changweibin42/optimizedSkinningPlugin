@@ -4249,6 +4249,8 @@ MStatus OptimizedSkinCluster::deformCoRComp(
         //   用 LBS 后位置 lbs 相对关节 bc_cur 的偏移方向与 in_dir 点积判定
         double w_in = 0.5;
         double w_out = 0.5;
+        mathcore::Vec3 in_dir_cur = { 0.0, 0.0, 0.0 };
+        bool has_in_dir = false;
         if (vw.size() >= 2) {
             const unsigned int b1 = vw[0].first;
             const unsigned int b2 = vw[1].first;
@@ -4291,6 +4293,8 @@ MStatus OptimizedSkinCluster::deformCoRComp(
                     if (in_len > 1e-6) {
                         const mathcore::Vec3 in_dir =
                             mathcore::v3_scale(in_dir_raw, 1.0 / in_len);
+                        in_dir_cur = in_dir;
+                        has_in_dir = true;
 
                         // 用 LBS 后位置作为"顶点当前方位"参考
                         const mathcore::Vec3 rel = mathcore::v3_sub(lbs, bc_cur);
@@ -4310,19 +4314,48 @@ MStatus OptimizedSkinCluster::deformCoRComp(
             }
         }
 
-        // ---- 3.6 合成 effective strength ----
-        //   effective = strength + strengthIn·w_in + strengthOut·w_out
-        //   端点：内 w_in=1 → strength+in；外 w_out=1 → strength+out
-        //   in=out=0 → effective = strength（完全等价于 V1）
-        const double effective = strengthFinal
-            + strengthIn * w_in
-            + strengthOut * w_out;
-
-        // ---- 4. P_final = P_CoR + effective · M · (P_CoR − P_LBS) ----
+        // ---- 4. 合成 ----
+        // 两层叠加，语义完全解耦：
+        //
+        //   [层 A] 基础补偿：strength 放大 CoR 补偿量
+        //          combined = P_CoR + strength·M·(P_CoR − P_LBS)
+        //          这是 V1 原有语义，strength=0 时完全关闭
+        //
+        //   [层 B] 方向位移：in/out 沿 in_dir 加固定方向位移
+        //          内角：沿 -in_dir 推（in > 0 时朝外鼓）
+        //          外角：沿 +in_dir 推（out > 0 时朝内收）
+        //          w_in/w_out 严格分区，in 只影响内角、out 只影响外角
+        //          幅度基准 = |P_CoR − P_LBS| · M
+        //
+        //   关键：层 B 不是"放大补偿向量"，而是"沿固定方向加独立位移"，
+        //         所以 in 不会跨区影响外角轮廓，反之亦然。
+        //         这是 MOS 里 in/out bulge 的做法。
         const mathcore::Vec3 delta = mathcore::v3_sub(corDef, lbs);
-        const mathcore::Vec3 combined = mathcore::v3_add(
+        const double delta_scale = mathcore::v3_len(delta);
+
+        // 层 A：基础补偿
+        mathcore::Vec3 combined = mathcore::v3_add(
             corDef,
-            mathcore::v3_scale(delta, effective * M));
+            mathcore::v3_scale(delta, strengthFinal * M));
+
+        // 层 B：内/外单侧方向位移
+        if (has_in_dir && delta_scale > 1e-9) {
+            const double amt = delta_scale * M;
+
+            // 内角：沿 -in_dir 外推（strengthIn > 0 时内角外鼓）
+            //   w_in ≈ 1（内角顶点）→ 完整幅度
+            //   w_in ≈ 0（外角顶点）→ 无影响
+            combined = mathcore::v3_add(
+                combined,
+                mathcore::v3_scale(in_dir_cur, -strengthIn * w_in * amt));
+
+            // 外角：沿 +in_dir 内收（strengthOut > 0 时外角内收）
+            //   w_out ≈ 1（外角顶点）→ 完整幅度
+            //   w_out ≈ 0（内角顶点）→ 无影响
+            combined = mathcore::v3_add(
+                combined,
+                mathcore::v3_scale(in_dir_cur, strengthOut * w_out * amt));
+        }
 
         // ---- 5. Envelope（一次）----
         const mathcore::Vec3 bl = applyEnvelope(origPos, combined, envFinal);
