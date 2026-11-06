@@ -64,6 +64,7 @@ namespace optimized_skin_internal {
         const std::vector<std::vector<unsigned int>>& clusterMembers,
         const std::vector<std::vector<std::pair<double, unsigned int>>>& vertClusterDists,
         const std::vector<SparseW>& allW,
-        unsigned int numTris);
+        unsigned int numTris,
+        double sigma);          // ★ 新增
 
 } // namespace optimized_skin_internal

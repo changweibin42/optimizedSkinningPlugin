@@ -48,6 +48,16 @@ public:
     static MObject aCorTriLayerExpand;
     static MObject aCorVertLayerExpand;
     static MObject aCorIncBudgetDiv;
+    static MObject aCorMosSecondaryWeight;
+    // ---- CoR 补偿增强（algorithmType = 5） ----
+    // Strength = 0：严格 CoR；1：CoR 补偿量翻倍；-1：取消 CoR（退化为 LBS）
+    static MObject aCorCompStrength;
+    // Mask 的幂次：M^falloff。falloff=1 原始，>1 收窄，<1 放宽
+    static MObject aCorCompFalloff;
+    // 内侧/外侧额外补偿倍率（基于 bind 时顶点相对关节的方向判断）
+    static MObject aCorCompStrengthIn;
+    static MObject aCorCompStrengthOut;
+    static MObject aCorSigma;
     static MObject aDisplayCoR;
 
     // ---- MOS 可调参数 ----
@@ -80,6 +90,9 @@ public:
 
     static MObject aMosScaleWeight;
     static MObject aMosScaleMode;
+
+    // [DIAG] 诊断开关 bit mask：bit0=FJ_HARD, bit1=W_LINEAR, bit2=WC_UNITY
+    static MObject aDiagFlags;
 
     bool getCoRData(std::vector<mathcore::Vec3>& out) const;
 
@@ -123,6 +136,12 @@ public:
         double scaleWeight = 0.0;
         int    scaleMode = 1;
 
+        // ---- CoR + MOS Secondary 专用 ----
+        // 次级修正（bulge/slide）的总强度倍率，只在 algorithmType==4 时生效。
+        // 1.0 = 完整叠加；0.0 = 关闭次级修正（退化为纯 CoR）；
+        // 允许 >1 做夸张化。bulge/slide 各自权重仍然独立生效。
+        double corMosSecondaryWeight = 1.0;
+
         bool nearlyEqual(const MosParams& rhs) const;
     };
 
@@ -134,6 +153,8 @@ private:
     MStatus deformDLB(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int);
     MStatus deformDQSComp(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int);
     MStatus deformMOS(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int);
+    MStatus deformCoRMosSecondary(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int);
+    MStatus deformCoRComp(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int);
 
     bool readBoneTransforms(MDataBlock&,
         std::vector<mathcore::RigidTransform>& out_rest,
@@ -209,6 +230,9 @@ private:
         std::vector<int> depths;
         std::vector<mathcore::Vec3> boneDirRest;
         std::vector<mathcore::Vec3> jointPosRest;
+        // 每个 joint 的"唯一" grandchild joint（用于当前 pose 判断内角方向）
+        // -1 = leaf 或无唯一 child（多 child 或 0 child），此时 in/out 分区回退到 0.5/0.5
+        std::vector<int> boneSoleChild;
         unsigned long long topologySignature = 0;
     };
     BoneInfo m_boneInfo;

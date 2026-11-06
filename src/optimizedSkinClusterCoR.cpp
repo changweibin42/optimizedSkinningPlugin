@@ -349,11 +349,12 @@ namespace optimized_skin_internal {
         const std::vector<std::vector<unsigned int>>& clusterMembers,
         const std::vector<std::vector<std::pair<double, unsigned int>>>& vertClusterDists,
         const std::vector<SparseW>& allW,
-        unsigned int numTris) {
+        unsigned int numTris,
+        double sigma) {
 
         const double OMEGA_SQ = 0.01;
         const double SIM_EPS = 1e-6;
-        const double sigma = 0.1;
+        if (sigma < 1e-3) sigma = 0.1;   // 防御：极端值退化
         unsigned int MAX_BFS = (unsigned int)allW.size() / 8;
         if (MAX_BFS < 2000) MAX_BFS = 2000;
         if (MAX_BFS > 20000) MAX_BFS = 20000;
