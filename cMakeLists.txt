@@ -18,6 +18,7 @@ set(SOURCE_FILES
     src/plugin_main.cpp
     src/skinClusterData.cpp
     src/algorithms.cpp
+    src/cor_paper.cpp
     src/dlb_gpu.cpp
     src/ocd_math.cpp 
     src/optimizedSkinCluster.cpp

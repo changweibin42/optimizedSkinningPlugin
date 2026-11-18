@@ -32,6 +32,7 @@
 #include <chrono>
 #include <cstdio>
 #include <string>
+#include <set>
 
 using optimized_skin_internal::SparseW;
 using optimized_skin_internal::TriInfo;
@@ -625,6 +626,9 @@ MStatus OptimizedSkinCluster::setDependentsDirty(
 
     MObject attr = plug.attribute();
 
+    if (attr == MPxSkinCluster::input || attr == MPxSkinCluster::inputGeom)
+        m_paperCoR.valid = false;
+
     if (attr == aDiagFlags) {
         // diagFlags 影响 bind 时的 w_c 计算与 deform 时的 F 计算，
         // 直接失效 MOS cache 让下次 deform 全量重建
@@ -635,6 +639,7 @@ MStatus OptimizedSkinCluster::setDependentsDirty(
     if (attr == aCorSigma) {
         // σ 影响 CoR 中心的权重相似性核，必须强制全量重算 CoR cache
         m_corCache.valid = false;
+        m_paperCoR.valid = false;
         return MS::kSuccess;
     }
 
@@ -734,6 +739,8 @@ MStatus OptimizedSkinCluster::preEvaluation(const MDGContext& context,
         m_vtxCache.valid = false;
         ++m_currentWeightVersion;
     }
+    if (evaluationNode.dirtyPlugExists(MPxSkinCluster::inputGeom))
+        m_paperCoR.valid = false;
     return MPxSkinCluster::preEvaluation(context, evaluationNode);
 }
 
@@ -1516,12 +1523,13 @@ MStatus OptimizedSkinCluster::deform(
     int algo = block.inputValue(aAlgorithmType, &status).asShort();
     if (!status) return status;
 
+    if (algo == 0) return deformCoR(block, iter, worldMat, multiIndex);
+
     unsigned int nV = iter.count();
     collectBoneInfo(block);
     rebuildVtxCache(block, nV);
 
     switch (algo) {
-    case 0: return deformCoR(block, iter, worldMat, multiIndex);
     case 1: return deformDLB(block, iter, worldMat, multiIndex,
         block.inputValue(aDlbUseOpenCL).asBool());
     case 2: return deformDQSComp(block, iter, worldMat, multiIndex);
@@ -1535,95 +1543,174 @@ MStatus OptimizedSkinCluster::deform(
 // ================================================================
 // deformCoR
 // ================================================================
+MStatus OptimizedSkinCluster::rebuildPaperCoR(
+    MDataBlock& block, unsigned int geometryIndex, double sigma) {
+    MStatus status;
+    MPlug inputPlug(thisMObject(), MPxSkinCluster::input);
+    status = inputPlug.selectAncestorLogicalIndex(geometryIndex, MPxSkinCluster::input);
+    if (!status) return status;
+    auto input = block.inputValue(inputPlug, &status);
+    if (!status) return status;
+    const auto meshObject = input.child(MPxSkinCluster::inputGeom).asMesh();
+    MFnMesh mesh(meshObject, &status);
+    if (!status) return status;
+
+    MPointArray positions;
+    status = mesh.getPoints(positions, MSpace::kObject);
+    if (!status) return status;
+    MIntArray triangleCounts, indices;
+    status = mesh.getTriangles(triangleCounts, indices);
+    if (!status) return status;
+
+    std::vector<mathcore::Vec3> restPoints;
+    restPoints.reserve(positions.length());
+    for (unsigned int i = 0; i < positions.length(); ++i) {
+        const auto& p = positions[i];
+        restPoints.push_back({p.x, p.y, p.z});
+    }
+    std::vector<cor_paper::Triangle> triangles;
+    triangles.reserve(indices.length() / 3);
+    for (unsigned int i = 0; i + 2 < indices.length(); i += 3) {
+        cor_paper::Triangle triangle = {static_cast<unsigned int>(indices[i]),
+            static_cast<unsigned int>(indices[i + 1]), static_cast<unsigned int>(indices[i + 2])};
+        if (triangle[0] >= restPoints.size() || triangle[1] >= restPoints.size() ||
+            triangle[2] >= restPoints.size()) return MS::kFailure;
+        triangles.push_back(triangle);
+    }
+
+    auto weightList = block.inputArrayValue(MPxSkinCluster::weightList, &status);
+    if (!status) return status;
+
+    PaperCoRCache next;
+    next.weights.resize(restPoints.size());
+    std::set<unsigned int> influenceIds;
+    for (unsigned int i = 0; i < next.weights.size(); ++i) {
+        // The geometry and influence arrays use sparse logical indices.
+        if (!weightList.jumpToElement(i)) continue;
+        auto element = weightList.inputValue(&status);
+        if (!status) return status;
+        MArrayDataHandle influences(element.child(MPxSkinCluster::weights));
+        auto& vertex = next.weights[i];
+        const unsigned int count = influences.elementCount();
+        for (unsigned int j = 0; j < count; ++j) {
+            status = influences.jumpToArrayElement(j);
+            if (!status) return status;
+            const unsigned int id = influences.elementIndex(&status);
+            if (!status) return status;
+            auto value = influences.inputValue(&status);
+            if (!status) return status;
+            const double weight = value.asDouble();
+            if (weight > 0.0 && std::isfinite(weight))
+                vertex.emplace_back(id, weight);
+        }
+        std::sort(vertex.begin(), vertex.end());
+        double total = 0.0;
+        for (const auto& weight : vertex) total += weight.second;
+        if (!std::isfinite(total)) return MS::kFailure;
+        for (auto& weight : vertex) {
+            weight.second /= total;
+            influenceIds.insert(weight.first);
+        }
+    }
+
+    next.influenceIds.assign(influenceIds.begin(), influenceIds.end());
+    for (auto& vertex : next.weights) {
+        for (auto& weight : vertex) {
+            weight.first = static_cast<unsigned int>(std::lower_bound(next.influenceIds.begin(),
+                next.influenceIds.end(), weight.first) - next.influenceIds.begin());
+        }
+    }
+
+    next.centers = cor_paper::computeCenters(restPoints, next.weights, triangles, sigma);
+    next.geometryIndex = geometryIndex;
+    next.weightVersion = m_currentWeightVersion;
+    next.sigma = sigma;
+    next.valid = true;
+    m_paperCoR = std::move(next);
+    return MS::kSuccess;
+}
+
 MStatus OptimizedSkinCluster::deformCoR(
     MDataBlock& block, MItGeometry& iter,
-    const MMatrix& worldMat, unsigned int /*multiIndex*/) {
+    const MMatrix& worldMat, unsigned int multiIndex) {
+    const double envelope = readEnvelopeFromNode();
 
-    double env = readEnvelopeFromNode();
-    std::vector<mathcore::RigidTransform> rest, Cs;
-    std::vector<mathcore::Quat> poseQ;
-    if (!readBoneTransforms(block, rest, Cs, poseQ)) return MS::kSuccess;
+    MStatus status;
+    const double sigma = block.inputValue(aCorSigma, &status).asDouble();
+    if (!status) return status;
+    const bool forceFull = block.inputValue(aForceFullCoR, &status).asBool();
+    if (!status) return status;
 
-    unsigned int nV = iter.count();
-
-    MStatus s2;
-    bool forceFull = block.inputValue(aForceFullCoR, &s2).asBool();
-    if (s2 && forceFull) m_corCache.valid = false;
-
-    MStatus s3;
-    int triLayers = block.inputValue(aCorTriLayerExpand, &s3).asInt();
-    if (!s3) triLayers = 1;
-    int vertLayerOverride = block.inputValue(aCorVertLayerExpand, &s3).asInt();
-    if (!s3) vertLayerOverride = -1;
-    int budgetDiv = block.inputValue(aCorIncBudgetDiv, &s3).asInt();
-    if (!s3) budgetDiv = 10;
-
-    if (!m_corCache.valid || m_corCache.numVertices != nV) {
-        if (!computeCoRCache(block, nV))
-            return deformDLB(block, iter, worldMat, 0);
+    if (forceFull || !m_paperCoR.valid || m_paperCoR.geometryIndex != multiIndex ||
+        m_paperCoR.weightVersion != m_currentWeightVersion || m_paperCoR.sigma != sigma) {
+        m_paperCoR.valid = false;
+        status = rebuildPaperCoR(block, multiIndex, sigma);
+        if (!status) return status;
     }
-    else if (m_hasPlugDirty || m_needFullWeightScan) {
-        std::vector<unsigned int> dirtyList;
-        if (m_hasPlugDirty) {
-            for (unsigned int i = 0;
-                i < (unsigned int)m_dirtyVertFlags.size() && i < nV; ++i)
-                if (m_dirtyVertFlags[i]) dirtyList.push_back(i);
+    const auto& cache = m_paperCoR;
+    if (envelope <= 1e-6 || cache.influenceIds.empty()) return MS::kSuccess;
+
+    auto poses = block.inputArrayValue(MPxSkinCluster::matrix, &status);
+    if (!status) return status;
+    auto bindInverses = block.inputArrayValue(MPxSkinCluster::bindPreMatrix, &status);
+    if (!status) return status;
+
+    const mathcore::RigidTransform identity{{0.0, 0.0, 0.0, 1.0}, {0.0, 0.0, 0.0}};
+    std::vector<mathcore::RigidTransform> bindToPose(cache.influenceIds.size(), identity);
+    for (size_t i = 0; i < cache.influenceIds.size(); ++i) {
+        const unsigned int id = cache.influenceIds[i];
+        if (!poses.jumpToElement(id)) continue;
+        const MMatrix pose = poses.inputValue(&status).asMatrix();
+        if (!status) return status;
+        MMatrix bindInverse;
+        if (bindInverses.jumpToElement(id)) {
+            bindInverse = bindInverses.inputValue(&status).asMatrix();
+            if (!status) return status;
         }
-        if (m_needFullWeightScan) {
-            MStatus wStatus;
-            MArrayDataHandle wlH = block.inputArrayValue(
-                MPxSkinCluster::weightList, &wStatus);
-            if (wStatus) {
-                for (unsigned int i = 0; i < nV; ++i) {
-                    WeightMap curW = readVertexWeightsFromHandle(wlH, i);
-                    SparseW sw; sw.buildFrom(curW);
-                    if (!sparseEqual(sw, m_corCache.allW[i])) dirtyList.push_back(i);
-                }
-            }
-        }
-        if (!dirtyList.empty()) {
-            std::sort(dirtyList.begin(), dirtyList.end());
-            dirtyList.erase(std::unique(dirtyList.begin(), dirtyList.end()),
-                dirtyList.end());
-            if (dirtyList.size() > (size_t)nV / 4) {
-                computeCoRCache(block, nV);
-            }
-            else {
-                int vertLayers = computeVertLayers(
-                    (unsigned int)dirtyList.size(), nV,
-                    vertLayerOverride, budgetDiv);
-                updateCoRCacheIncremental(block, dirtyList, triLayers, vertLayers);
-            }
-        }
-        clearDirtyFlags();
+
+        // Maya uses row vectors, so inverse bind is applied before pose.
+        const MMatrix relative = bindInverse * pose;
+        const MQuaternion q = MTransformationMatrix(relative).rotation();
+        bindToPose[i] = {mathcore::q_normalize({q.x, q.y, q.z, q.w}),
+            {relative[3][0], relative[3][1], relative[3][2]}};
     }
 
     MPointArray points;
-    iter.allPositions(points);
-    MMatrix wInv = worldMat.inverse();
-    const double envFinal = env;
+    status = iter.allPositions(points);
+    if (!status) return status;
+    bool dense = points.length() == cache.centers.size();
+    unsigned int sequentialIndex = 0;
+    for (; dense && !iter.isDone(); iter.next())
+        dense = iter.index() == static_cast<int>(sequentialIndex++);
+    dense = dense && sequentialIndex == points.length();
+    status = iter.reset();
+    if (!status) return status;
 
+    const MMatrix worldInverse = worldMat.inverse();
+    const auto deformPoint = [&](const MPoint& p, unsigned int vertex) {
+        if (vertex >= cache.weights.size() || cache.weights[vertex].empty()) return p;
+        const MPoint restWorld = p * worldMat;
+        const auto& center = cache.centers[vertex];
+        const MPoint centerWorld = MPoint(center.x, center.y, center.z) * worldMat;
+        const auto transform = cor_paper::vertexTransform(
+            {centerWorld.x, centerWorld.y, centerWorld.z}, cache.weights[vertex], bindToPose);
+        const mathcore::Vec3 original{restWorld.x, restWorld.y, restWorld.z};
+        const auto result = applyEnvelope(original, mathcore::apply_transform(transform, original), envelope);
+        return MPoint(result.x, result.y, result.z) * worldInverse;
+    };
+
+    if (dense) {
 #pragma omp parallel for schedule(static)
-    for (int i = 0; i < (int)nV; ++i) {
-        const auto& vw = m_vtxCache.vertices[i];
-        if (vw.empty()) continue;
-        MPoint ptW = points[i] * worldMat;
-        mathcore::Vec3 origPos = { ptW.x, ptW.y, ptW.z };
-
-        mathcore::Vec3 cor = origPos;
-        if ((unsigned)i < m_corCache.cors.size()) {
-            mathcore::Vec3 cl = m_corCache.cors[i];
-            MPoint cw(cl.x, cl.y, cl.z); cw *= worldMat;
-            cor = { cw.x, cw.y, cw.z };
-        }
-
-        mathcore::Vec3 def = cor_vertex_v2(origPos, cor, vw, Cs);
-        mathcore::Vec3 bl = applyEnvelope(origPos, def, envFinal);
-        MPoint out(bl.x, bl.y, bl.z);
-        out *= wInv;
-        points[i] = out;
+        for (int i = 0; i < static_cast<int>(points.length()); ++i)
+            points[i] = deformPoint(points[i], static_cast<unsigned int>(i));
+        return iter.setAllPositions(points);
     }
-    iter.setAllPositions(points);
+
+    // Respect the iterator's vertex IDs when the deformer affects a component subset.
+    for (; !iter.isDone(); iter.next()) {
+        status = iter.setPosition(deformPoint(iter.position(), static_cast<unsigned int>(iter.index())));
+        if (!status) return status;
+    }
     return MS::kSuccess;
 }
 
@@ -4400,6 +4487,11 @@ MStatus OptimizedSkinCluster::deformCoRComp(
 // ================================================================
 bool OptimizedSkinCluster::getCoRData(
     std::vector<mathcore::Vec3>& out) const {
+    if (MPlug(thisMObject(), aAlgorithmType).asShort() == 0) {
+        if (!m_paperCoR.valid || m_paperCoR.weightVersion != m_currentWeightVersion) return false;
+        out = m_paperCoR.centers;
+        return true;
+    }
     if (!m_corCache.valid) return false;
     out = m_corCache.cors;
     return true;

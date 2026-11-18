@@ -19,6 +19,7 @@
 
 #include "math_core.h"
 #include "algorithms.h"
+#include "cor_paper.h"
 #include "ocd_math.h"
 #include "optimizedSkinClusterCoR.h"
 
@@ -199,6 +200,19 @@ private:
         std::vector<std::vector<std::pair<double, unsigned int>>> vertClusterDists;
     };
     CoRCache m_corCache;
+
+    struct PaperCoRCache {
+        bool valid = false;
+        unsigned int geometryIndex = 0;
+        unsigned long long weightVersion = 0;
+        double sigma = 0.0;
+        std::vector<unsigned int> influenceIds;
+        std::vector<cor_paper::Weights> weights;
+        std::vector<mathcore::Vec3> centers;
+    };
+    PaperCoRCache m_paperCoR;
+
+    MStatus rebuildPaperCoR(MDataBlock& block, unsigned int geometryIndex, double sigma);
 
     bool computeCoRCache(MDataBlock& block, unsigned int numVertices);
     void updateCoRCacheIncremental(MDataBlock& block,
