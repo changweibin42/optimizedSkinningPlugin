@@ -12,6 +12,7 @@
 #include <maya/MPlug.h>
 #include <maya/MPlugArray.h>
 
+#include <memory>
 #include <vector>
 #include <utility>
 #include <unordered_map>
@@ -20,6 +21,8 @@
 #include "algorithms.h"
 #include "ocd_math.h"
 #include "optimizedSkinClusterCoR.h"
+
+class DlbGpu;
 
 class OptimizedSkinCluster : public MPxSkinCluster {
 public:
@@ -37,11 +40,15 @@ public:
     virtual MStatus setDependentsDirty(const MPlug& plug,
         MPlugArray& plugArray) override;
 
+    MStatus preEvaluation(const MDGContext& context,
+        const MEvaluationNode& evaluationNode) override;
+
     static MTypeId id;
     static MString typeName;
 
     // ---- 通用属性 ----
     static MObject aAlgorithmType;
+    static MObject aDlbUseOpenCL;
     static MObject aDQSCompStrength;
     static MObject aForceFullCoR;
 
@@ -150,7 +157,9 @@ private:
     // 四种算法的 deform 实现
     // ================================================================
     MStatus deformCoR(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int);
-    MStatus deformDLB(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int);
+    MStatus deformDLB(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int,
+        bool useOpenCL = false);
+    std::unique_ptr<DlbGpu> m_dlbGpu;
     MStatus deformDQSComp(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int);
     MStatus deformMOS(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int);
     MStatus deformCoRMosSecondary(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int);

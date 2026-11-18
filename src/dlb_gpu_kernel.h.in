@@ -1,0 +1,5 @@
+#pragma once
+
+constexpr char dlbOpenCLSource[] = R"DlbOpenCL(
+@DLB_OPENCL_SOURCE@
+)DlbOpenCL";

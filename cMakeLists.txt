@@ -1,10 +1,11 @@
 cmake_minimum_required(VERSION 3.22.1)
 project(optimizedSkinningPlugin)
 
+include($ENV{DEVKIT_LOCATION}/cmake/pluginEntry.cmake)
+
+# The DevKit sets a default standard. Apply the project standard afterward.
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-include($ENV{DEVKIT_LOCATION}/cmake/pluginEntry.cmake)
 
 add_compile_options(/utf-8)
 add_compile_options(/openmp)
@@ -13,11 +14,11 @@ link_directories($ENV{DEVKIT_LOCATION}/lib)
 
 set(PROJECT_NAME optimizedSkinningPlugin)
 
-# 只编译 CPU 版本所需文件
 set(SOURCE_FILES
     src/plugin_main.cpp
     src/skinClusterData.cpp
     src/algorithms.cpp
+    src/dlb_gpu.cpp
     src/ocd_math.cpp 
     src/optimizedSkinCluster.cpp
     src/optimizedSkinClusterCoR.cpp
@@ -32,9 +33,14 @@ set(LIBRARIES
     OpenMayaAnim
     OpenMayaUI
     OpenMayaRender
+    clew
 )
 
-build_plugin()
+# Embed the kernel so the test plug-in can be loaded from the .mll alone.
+set(DLB_KERNEL_FILE "${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/kernel_dlb.cl")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${DLB_KERNEL_FILE}")
+file(READ "${DLB_KERNEL_FILE}" DLB_OPENCL_SOURCE)
+configure_file(src/dlb_gpu_kernel.h.in dlb_gpu_kernel.h @ONLY)
+list(APPEND INCLUDE_DIRS "${CMAKE_CURRENT_BINARY_DIR}")
 
-# GPU 相关文件不编译、不拷贝（保留在 src/ 供参考）
-# add_custom_command(... kernels ...)  ← 已移除
+build_plugin()

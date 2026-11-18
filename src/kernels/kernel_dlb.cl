@@ -119,3 +119,53 @@ __kernel void dlb_deform(
     outPos[idx*3+1] = result.y;
     outPos[idx*3+2] = result.z;
 }
+
+// DLB used by the skinCluster's regular deform() path. The host supplies
+// the same sorted weights and bind-relative transforms as dlb_vertex_v2.
+__kernel void dlb_skin_cluster(
+    __global const float* input,
+    __global float* output,
+    __global const uint* offsets,
+    __global const uint* boneIds,
+    __global const float* weights,
+    __global const float4* transforms,
+    const uint vertexCount,
+    const float envelope)
+{
+    const size_t vertex = get_global_id(0);
+    if (vertex >= vertexCount) return;
+
+    const uint first = offsets[vertex];
+    const uint last = offsets[vertex + 1];
+    const float3 p = vload3(vertex, input);
+    if (first == last) {
+        vstore3(p, vertex, output);
+        return;
+    }
+
+    const float4 reference = transforms[2 * boneIds[first]];
+    float4 realSum = (float4)(0.0f);
+    float4 dualSum = (float4)(0.0f);
+    for (uint i = first; i < last; ++i) {
+        const uint bone = boneIds[i];
+        const float4 real = transforms[2 * bone];
+        const float alignment = dot(reference, real);
+        // Close to 180 degrees, float rounding can flip the branch used
+        // by the double-precision CPU implementation. Request CPU here.
+        if (i != first && fabs(alignment) < 1e-6f) {
+            vstore3((float3)(NAN), vertex, output);
+            return;
+        }
+        const float w = alignment < 0.0f ? -weights[i] : weights[i];
+        realSum += real * w;
+        dualSum += transforms[2 * bone + 1] * w;
+    }
+
+    const float normalizer = length(realSum);
+    if (normalizer < 1e-8f) {
+        vstore3(p, vertex, output);
+        return;
+    }
+    const float3 deformed = dlb_transform(realSum / normalizer, dualSum / normalizer, p);
+    vstore3(envelope * deformed + (1.0f - envelope) * p, vertex, output);
+}

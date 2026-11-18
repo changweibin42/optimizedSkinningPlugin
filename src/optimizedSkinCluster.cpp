@@ -1,8 +1,10 @@
 #include "optimizedSkinCluster.h"
 #include "algorithms.h"
+#include "dlb_gpu.h"
 #include "node_ids.h"
 #include "plugin_debug.h"
 
+#include <maya/MEvaluationNode.h>
 #include <maya/MFnEnumAttribute.h>
 #include <maya/MFnNumericAttribute.h>
 #include <maya/MFnUnitAttribute.h>
@@ -47,6 +49,7 @@ MTypeId OptimizedSkinCluster::id(OPTIMIZED_SKIN_CLUSTER_NODE_ID);
 MString OptimizedSkinCluster::typeName("optimizedSkinCluster");
 
 MObject OptimizedSkinCluster::aAlgorithmType;
+MObject OptimizedSkinCluster::aDlbUseOpenCL;
 MObject OptimizedSkinCluster::aDQSCompStrength;
 MObject OptimizedSkinCluster::aForceFullCoR;
 MObject OptimizedSkinCluster::aCorTriLayerExpand;
@@ -92,7 +95,7 @@ MObject OptimizedSkinCluster::aMosScaleMode;
 // [DIAG] 诊断开关属性
 MObject OptimizedSkinCluster::aDiagFlags;
 
-OptimizedSkinCluster::OptimizedSkinCluster() {}
+OptimizedSkinCluster::OptimizedSkinCluster() : m_dlbGpu(std::make_unique<DlbGpu>()) {}
 OptimizedSkinCluster::~OptimizedSkinCluster() {}
 void* OptimizedSkinCluster::creator() { return new OptimizedSkinCluster(); }
 
@@ -170,6 +173,14 @@ MStatus OptimizedSkinCluster::initialize() {
     eAttr.setKeyable(true);
     eAttr.setStorable(true);
     addAttribute(aAlgorithmType);
+
+    aDlbUseOpenCL = nAttr.create("dlbUseOpenCL", "dlbcl", MFnNumericData::kBoolean, false, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    nAttr.setKeyable(false);
+    nAttr.setStorable(true);
+    nAttr.setNiceNameOverride("DLB Use OpenCL");
+    CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aDlbUseOpenCL));
+    CHECK_MSTATUS_AND_RETURN_IT(attributeAffects(aDlbUseOpenCL, MPxSkinCluster::outputGeom));
 
     aDQSCompStrength = nAttr.create("dqsCompStrength", "dqscs",
         MFnNumericData::kDouble, 1.0, &status);
@@ -714,6 +725,16 @@ MStatus OptimizedSkinCluster::setDependentsDirty(
         return MS::kSuccess;
     }
     return MS::kSuccess;
+}
+
+MStatus OptimizedSkinCluster::preEvaluation(const MDGContext& context,
+    const MEvaluationNode& evaluationNode) {
+    if (evaluationNode.dirtyPlugExists(MPxSkinCluster::weightList) ||
+        evaluationNode.dirtyPlugExists(MPxSkinCluster::weights)) {
+        m_vtxCache.valid = false;
+        ++m_currentWeightVersion;
+    }
+    return MPxSkinCluster::preEvaluation(context, evaluationNode);
 }
 
 void OptimizedSkinCluster::markDirtyVert(unsigned int vi) {
@@ -1501,7 +1522,8 @@ MStatus OptimizedSkinCluster::deform(
 
     switch (algo) {
     case 0: return deformCoR(block, iter, worldMat, multiIndex);
-    case 1: return deformDLB(block, iter, worldMat, multiIndex);
+    case 1: return deformDLB(block, iter, worldMat, multiIndex,
+        block.inputValue(aDlbUseOpenCL).asBool());
     case 2: return deformDQSComp(block, iter, worldMat, multiIndex);
     case 3: return deformMOS(block, iter, worldMat, multiIndex);
     case 4: return deformCoRMosSecondary(block, iter, worldMat, multiIndex);
@@ -1610,7 +1632,7 @@ MStatus OptimizedSkinCluster::deformCoR(
 // ================================================================
 MStatus OptimizedSkinCluster::deformDLB(
     MDataBlock& block, MItGeometry& iter,
-    const MMatrix& worldMat, unsigned int /*multiIndex*/) {
+    const MMatrix& worldMat, unsigned int /*multiIndex*/, bool useOpenCL) {
 
     double env = readEnvelopeFromNode();
     std::vector<mathcore::RigidTransform> rest, Cs;
@@ -1622,6 +1644,11 @@ MStatus OptimizedSkinCluster::deformDLB(
     iter.allPositions(points);
     MMatrix wInv = worldMat.inverse();
     const double envFinal = env;
+
+    if (useOpenCL && m_dlbGpu->deform(points, m_vtxCache.vertices, m_vtxCache.weightVersion,
+        Cs, worldMat, wInv, envFinal, thisMObject())) {
+        return iter.setAllPositions(points);
+    }
 
 #pragma omp parallel for schedule(static)
     for (int i = 0; i < (int)nV; ++i) {
