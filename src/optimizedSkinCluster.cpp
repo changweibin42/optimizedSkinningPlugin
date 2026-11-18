@@ -1,6 +1,6 @@
 #include "optimizedSkinCluster.h"
 #include "algorithms.h"
-#include "dlb_gpu.h"
+#include "skinning_gpu.h"
 #include "node_ids.h"
 #include "plugin_debug.h"
 
@@ -62,6 +62,7 @@ MObject OptimizedSkinCluster::aCorCompStrengthIn;   // 新增
 MObject OptimizedSkinCluster::aCorCompStrengthOut;  // 新增
 MObject OptimizedSkinCluster::aCorSigma;
 MObject OptimizedSkinCluster::aCorDebugLog;
+MObject OptimizedSkinCluster::aCorUseOpenCL;
 MObject OptimizedSkinCluster::aCorIncBudgetDiv;
 MObject OptimizedSkinCluster::aDisplayCoR;
 
@@ -97,7 +98,7 @@ MObject OptimizedSkinCluster::aMosScaleMode;
 // [DIAG] 诊断开关属性
 MObject OptimizedSkinCluster::aDiagFlags;
 
-OptimizedSkinCluster::OptimizedSkinCluster() : m_dlbGpu(std::make_unique<DlbGpu>()) {}
+OptimizedSkinCluster::OptimizedSkinCluster() : m_skinningGpu(std::make_unique<SkinningGpu>()) {}
 OptimizedSkinCluster::~OptimizedSkinCluster() {}
 void* OptimizedSkinCluster::creator() { return new OptimizedSkinCluster(); }
 
@@ -316,6 +317,14 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setNiceNameOverride("CoR Sigma (similarity width)");
     addAttribute(aCorSigma);
     attributeAffects(aCorSigma, MPxSkinCluster::outputGeom);
+
+    aCorUseOpenCL = nAttr.create("corUseOpenCL", "crcl", MFnNumericData::kBoolean, false, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    nAttr.setKeyable(false);
+    nAttr.setStorable(true);
+    nAttr.setNiceNameOverride("CoR Use OpenCL");
+    CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aCorUseOpenCL));
+    CHECK_MSTATUS_AND_RETURN_IT(attributeAffects(aCorUseOpenCL, MPxSkinCluster::outputGeom));
 
     aCorDebugLog = nAttr.create("corDebugLog", "crdl", MFnNumericData::kBoolean, false, &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
@@ -1643,6 +1652,7 @@ MStatus OptimizedSkinCluster::rebuildPaperCoR(
     next.centers = cor_paper::computeCenters(restPoints, next.weights, triangles, sigma);
     next.geometryIndex = geometryIndex;
     next.weightVersion = m_currentWeightVersion;
+    next.bindGeneration = m_paperCoR.bindGeneration + 1;
     next.sigma = sigma;
     next.valid = true;
     m_paperCoR = std::move(next);
@@ -1661,6 +1671,7 @@ MStatus OptimizedSkinCluster::deformCoR(
     };
 
     const double envelope = readEnvelopeFromNode();
+    const bool useOpenCL = block.inputValue(aCorUseOpenCL).asBool();
     MStatus status;
     const double sigma = block.inputValue(aCorSigma, &status).asDouble();
     if (!status) return reportFailure(status, "read corSigma");
@@ -1773,12 +1784,19 @@ MStatus OptimizedSkinCluster::deformCoR(
         const auto delta = outputPoint - inputPoint;
         maxDeltaSquared = std::max(maxDeltaSquared, delta * delta);
     };
+    bool gpuUsed = false;
+    SkinningGpu::CoRTiming timing;
     if (dense) {
         MPointArray original;
         if (debug) original = points;
+        gpuUsed = useOpenCL && m_skinningGpu->deformCoR(points, cache.weights, cache.centers,
+            cache.bindGeneration, bindToPose, worldMat, envelope, thisMObject(),
+            debug ? &timing : nullptr);
+        if (!gpuUsed) {
 #pragma omp parallel for schedule(static)
-        for (int i = 0; i < static_cast<int>(points.length()); ++i)
-            points[i] = deformPoint(points[i], static_cast<unsigned int>(i));
+            for (int i = 0; i < static_cast<int>(points.length()); ++i)
+                points[i] = deformPoint(points[i], static_cast<unsigned int>(i));
+        }
         if (debug) {
             for (unsigned int i = 0; i < points.length(); ++i) measure(original[i], points[i]);
         }
@@ -1803,10 +1821,18 @@ MStatus OptimizedSkinCluster::deformCoR(
         const auto bindCount = static_cast<size_t>(std::count(hasBind.begin(), hasBind.end(), true));
         char message[230];
         snprintf(message, sizeof(message),
-            "pose matrices=%zu/%zu bind matrices=%zu/%zu nonIdentity=%zu affected=%u envelope=%.3f maxDelta=%.8g",
+            "pose matrices=%zu/%zu bind matrices=%zu/%zu nonIdentity=%zu affected=%u envelope=%.3f maxDelta=%.8g backend=%s",
             poseCount, influenceCount, bindCount, influenceCount, posedCount, affected,
-            envelope, std::sqrt(maxDeltaSquared));
+            envelope, std::sqrt(maxDeltaSquared), gpuUsed ? "GPU" : "CPU");
         MGlobal::displayInfo(prefix + message);
+        if (gpuUsed) {
+            snprintf(message, sizeof(message), "GPU kernelMs=%.3f transferDispatchMs=%.3f",
+                timing.kernelMs, timing.openCLMs);
+            MGlobal::displayInfo(prefix + message);
+        }
+        else if (useOpenCL && !dense) {
+            MGlobal::displayInfo(prefix + "CPU used for a geometry component subset");
+        }
     }
     return MS::kSuccess;
 }
@@ -1829,7 +1855,7 @@ MStatus OptimizedSkinCluster::deformDLB(
     MMatrix wInv = worldMat.inverse();
     const double envFinal = env;
 
-    if (useOpenCL && m_dlbGpu->deform(points, m_vtxCache.vertices, m_vtxCache.weightVersion,
+    if (useOpenCL && m_skinningGpu->deformDLB(points, m_vtxCache.vertices, m_vtxCache.weightVersion,
         Cs, worldMat, wInv, envFinal, thisMObject())) {
         return iter.setAllPositions(points);
     }

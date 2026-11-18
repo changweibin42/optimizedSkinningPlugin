@@ -1,7 +1,8 @@
-#include "dlb_gpu.h"
-#include "dlb_gpu_kernel.h"
+#include "skinning_gpu.h"
+#include "skinning_gpu_kernel.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <iterator>
@@ -50,26 +51,29 @@ bool upload(cl_command_queue queue, const Buffer& buffer, const void* data, size
 
 } // namespace
 
-struct DlbGpu::State {
+struct SkinningGpu::State {
     std::mutex mutex;
     cl_context context = nullptr;
     cl_command_queue queue = nullptr;
     MAutoCLKernel kernel;
-    Buffer input, output, offsets, boneIds, weights, transforms;
+    Buffer input, output, offsets, boneIds, weights, transforms, centers;
 
-    std::vector<float> inputPoints, resultPoints, dualQuaternions;
+    std::vector<float> inputPoints, resultPoints, frameTransforms;
     unsigned long long cachedWeightVersion = 0;
     size_t cachedPointCount = 0;
     size_t cachedTransformCount = 0;
     bool weightsUploaded = false;
     std::optional<std::string> initializationError;
+    unsigned long long cachedCenterGeneration = 0;
+    MMatrix cachedCenterMatrix;
+    bool centersUploaded = false;
 
     ~State() {
         if (queue) clReleaseCommandQueue(queue);
         if (context) clReleaseContext(context);
     }
 
-    std::string initialize() {
+    std::string initialize(const char* kernelName, bool profiling) {
         if (!initializeOpenCL()) return "OpenCL loader unavailable";
 
         cl_uint platformCount = 0;
@@ -91,20 +95,23 @@ struct DlbGpu::State {
                 != CL_SUCCESS) continue;
 
             for (const auto device : devices) {
-                reason = initializeDevice(device);
+                reason = initializeDevice(device, platform, kernelName, profiling);
                 if (reason.empty()) return {};
             }
         }
         return reason;
     }
 
-    std::string initializeDevice(cl_device_id device) {
+    std::string initializeDevice(cl_device_id device, cl_platform_id platform,
+        const char* kernelName, bool profiling) {
         cl_int status;
-        const cl_context candidate = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &status);
+        const cl_context_properties properties[] = {
+            CL_CONTEXT_PLATFORM, reinterpret_cast<cl_context_properties>(platform), 0};
+        const cl_context candidate = clCreateContext(properties, 1, &device, nullptr, nullptr, &status);
         if (status != CL_SUCCESS) return "could not create OpenCL GPU context";
 
-        const char* source = dlbOpenCLSource;
-        const size_t sourceSize = sizeof(dlbOpenCLSource) - 1;
+        const char* source = skinningOpenCLSource;
+        const size_t sourceSize = sizeof(skinningOpenCLSource) - 1;
         const cl_program program = clCreateProgramWithSource(candidate, 1, &source, &sourceSize, &status);
         if (status != CL_SUCCESS) {
             clReleaseContext(candidate);
@@ -124,14 +131,15 @@ struct DlbGpu::State {
         }
 
         MAutoCLKernel candidateKernel;
-        candidateKernel.attach(clCreateKernel(program, "dlb_skin_cluster", &status));
+        candidateKernel.attach(clCreateKernel(program, kernelName, &status));
         clReleaseProgram(program);
         if (status != CL_SUCCESS) {
             clReleaseContext(candidate);
-            return "could not create DLB kernel";
+            return "could not create skinning kernel";
         }
 
-        const cl_command_queue candidateQueue = clCreateCommandQueue(candidate, device, 0, &status);
+        const cl_command_queue candidateQueue = clCreateCommandQueue(candidate, device,
+            profiling ? CL_QUEUE_PROFILING_ENABLE : 0, &status);
         if (status != CL_SUCCESS) {
             clReleaseContext(candidate);
             return "could not create OpenCL command queue";
@@ -142,7 +150,8 @@ struct DlbGpu::State {
         return {};
     }
 
-    bool uploadWeights(const VertexWeights& vertexWeights, unsigned long long version,
+    template<class WeightLists>
+    bool uploadWeights(const WeightLists& vertexWeights, unsigned long long version,
         size_t transformCount) {
         if (weightsUploaded && cachedWeightVersion == version &&
             cachedPointCount == vertexWeights.size() && cachedTransformCount == transformCount)
@@ -160,7 +169,7 @@ struct DlbGpu::State {
                     hostIds.size() >= (std::numeric_limits<std::uint32_t>::max)() ||
                     !std::isfinite(influence.second)) return false;
                 hostIds.push_back(influence.first);
-                hostWeights.push_back(influence.second);
+                hostWeights.push_back(static_cast<float>(influence.second));
             }
             hostOffsets.push_back(static_cast<std::uint32_t>(hostIds.size()));
         }
@@ -187,14 +196,13 @@ struct DlbGpu::State {
         return true;
     }
 
-    bool launch(cl_uint vertexCount, float envelope) {
+    bool launch(cl_uint vertexCount, float envelope, bool useCenters = false,
+        CoRTiming* timing = nullptr) {
         const size_t pointBytes = inputPoints.size() * sizeof(float);
-        const size_t transformBytes = dualQuaternions.size() * sizeof(float);
+        const size_t transformBytes = frameTransforms.size() * sizeof(float);
         if (!input.reserve(context, pointBytes, CL_MEM_READ_ONLY) ||
             !output.reserve(context, pointBytes, CL_MEM_WRITE_ONLY) ||
-            !transforms.reserve(context, transformBytes, CL_MEM_READ_ONLY) ||
-            !upload(queue, input, inputPoints.data(), pointBytes) ||
-            !upload(queue, transforms, dualQuaternions.data(), transformBytes)) return false;
+            !transforms.reserve(context, transformBytes, CL_MEM_READ_ONLY)) return false;
 
         const cl_mem args[] = {input.storage.get(), output.storage.get(), offsets.storage.get(),
             boneIds.storage.get(), weights.storage.get(), transforms.storage.get()};
@@ -205,18 +213,48 @@ struct DlbGpu::State {
         if (clSetKernelArg(kernel.get(), i++, sizeof(vertexCount), &vertexCount) != CL_SUCCESS ||
             clSetKernelArg(kernel.get(), i, sizeof(envelope), &envelope) != CL_SUCCESS) return false;
 
+        if (useCenters) {
+            const cl_mem centerData = centers.storage.get();
+            if (clSetKernelArg(kernel.get(), i + 1, sizeof(centerData), &centerData) != CL_SUCCESS)
+                return false;
+        }
+
+        const auto start = std::chrono::steady_clock::now();
+        const auto uploadFrame = [&](const Buffer& buffer, const void* data, size_t bytes) {
+            return clEnqueueWriteBuffer(queue, buffer.storage.get(), useCenters ? CL_FALSE : CL_TRUE,
+                0, bytes, data, 0, nullptr, nullptr) == CL_SUCCESS;
+        };
         const size_t global = vertexCount;
-        return clEnqueueNDRangeKernel(queue, kernel.get(), 1, nullptr, &global, nullptr,
-            0, nullptr, nullptr) == CL_SUCCESS &&
+        cl_event event = nullptr;
+        const bool done = uploadFrame(input, inputPoints.data(), pointBytes) &&
+            uploadFrame(transforms, frameTransforms.data(), transformBytes) &&
+            clEnqueueNDRangeKernel(queue, kernel.get(), 1, nullptr, &global, nullptr,
+                0, nullptr, timing ? &event : nullptr) == CL_SUCCESS &&
             clEnqueueReadBuffer(queue, output.storage.get(), CL_TRUE, 0, pointBytes,
                 resultPoints.data(), 0, nullptr, nullptr) == CL_SUCCESS;
+        // On a failed dispatch/readback, drain any nonblocking writes before
+        // returning ownership of the staging vectors to the next evaluation.
+        if (!done && useCenters) clFinish(queue);
+        if (done && timing) {
+            timing->openCLMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+            cl_ulong begin, end;
+            if (clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(begin),
+                &begin, nullptr) == CL_SUCCESS &&
+                clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(end),
+                    &end, nullptr) == CL_SUCCESS && end >= begin)
+                timing->kernelMs = (end - begin) * 1e-6;
+        }
+        if (event) clReleaseEvent(event);
+        return done;
     }
 };
 
-DlbGpu::DlbGpu() : state_(std::make_unique<State>()) {}
-DlbGpu::~DlbGpu() = default;
+SkinningGpu::SkinningGpu()
+    : corState_(std::make_unique<State>()), state_(std::make_unique<State>()) {}
+SkinningGpu::~SkinningGpu() = default;
 
-bool DlbGpu::deform(MPointArray& points, const VertexWeights& weights,
+bool SkinningGpu::deformDLB(MPointArray& points, const VertexWeights& weights,
     unsigned long long weightVersion, const std::vector<mathcore::RigidTransform>& transforms,
     const MMatrix& worldMatrix, const MMatrix& worldInverse, double envelope,
     const MObject& node) {
@@ -234,7 +272,7 @@ bool DlbGpu::deform(MPointArray& points, const VertexWeights& weights,
     if (!count || count != weights.size() || transforms.empty() ||
         !std::isfinite(envelope) || envelope <= 1e-6) return false;
 
-    if (!gpu.initializationError) gpu.initializationError = gpu.initialize();
+    if (!gpu.initializationError) gpu.initializationError = gpu.initialize("dlb_skin_cluster", false);
     if (!gpu.initializationError->empty()) {
         report(*gpu.initializationError);
         return false;
@@ -246,12 +284,12 @@ bool DlbGpu::deform(MPointArray& points, const VertexWeights& weights,
 
     gpu.inputPoints.resize(size_t(count) * 3);
     gpu.resultPoints.resize(gpu.inputPoints.size());
-    gpu.dualQuaternions.resize(transforms.size() * 8);
+    gpu.frameTransforms.resize(transforms.size() * 8);
     for (size_t i = 0; i < transforms.size(); ++i) {
         const auto dq = mathcore::dual_quat_from_C(transforms[i]);
         const double components[] = {dq.real.x, dq.real.y, dq.real.z, dq.real.w,
             dq.dual.x, dq.dual.y, dq.dual.z, dq.dual.w};
-        std::copy(std::begin(components), std::end(components), gpu.dualQuaternions.begin() + i * 8);
+        std::copy(std::begin(components), std::end(components), gpu.frameTransforms.begin() + i * 8);
     }
     for (unsigned int i = 0; i < count; ++i) {
         const MPoint world = points[i] * worldMatrix;
@@ -280,6 +318,100 @@ bool DlbGpu::deform(MPointArray& points, const VertexWeights& weights,
         const size_t k = size_t(i) * 3;
         points[i] = MPoint(gpu.resultPoints[k], gpu.resultPoints[k + 1],
             gpu.resultPoints[k + 2]) * worldInverse;
+    }
+    report({});
+    return true;
+}
+
+bool SkinningGpu::deformCoR(MPointArray& points, const std::vector<cor_paper::Weights>& weights,
+    const std::vector<mathcore::Vec3>& centers, unsigned long long bindGeneration,
+    const std::vector<mathcore::RigidTransform>& transforms, const MMatrix& worldMatrix,
+    double envelope, const MObject& node, CoRTiming* timing) {
+    State& gpu = *corState_;
+    const std::lock_guard<std::mutex> lock(gpu.mutex);
+    const auto report = [&](const std::string& reason) {
+        if (corStatus_ == reason) return;
+        corStatus_ = reason;
+        const MString prefix = MString("[CoR] ") + MFnDependencyNode(node).name() + ": ";
+        if (reason.empty()) MGlobal::displayInfo(prefix + "OpenCL GPU active");
+        else MGlobal::displayWarning(prefix + "using CPU (" + reason.c_str() + ")");
+    };
+
+    const unsigned int count = points.length();
+    if (!count || count != weights.size() || count != centers.size() || transforms.empty() ||
+        !std::isfinite(envelope) || envelope <= 1e-6 || worldMatrix.isSingular()) return false;
+
+    if (!gpu.initializationError) gpu.initializationError = gpu.initialize("cor_skin_cluster", true);
+    if (!gpu.initializationError->empty()) {
+        report(*gpu.initializationError);
+        return false;
+    }
+    if (!gpu.uploadWeights(weights, bindGeneration, transforms.size())) {
+        report("could not upload vertex weights");
+        return false;
+    }
+
+    // Shift the world origin to the mesh translation before converting to
+    // float. Cache centers in this shifted space as long as the bind data
+    // and the mesh's linear transform remain unchanged.
+    const mathcore::Vec3 origin{worldMatrix[3][0], worldMatrix[3][1], worldMatrix[3][2]};
+    MMatrix centeredWorld = worldMatrix;
+    centeredWorld[3][0] = centeredWorld[3][1] = centeredWorld[3][2] = 0.0;
+    gpu.inputPoints.resize(size_t(count) * 3);
+    gpu.resultPoints.resize(gpu.inputPoints.size());
+    const auto pack = [&](unsigned int i, const MPoint& point) {
+        const MPoint shifted = point * centeredWorld;
+        gpu.inputPoints[size_t(i) * 3] = static_cast<float>(shifted.x);
+        gpu.inputPoints[size_t(i) * 3 + 1] = static_cast<float>(shifted.y);
+        gpu.inputPoints[size_t(i) * 3 + 2] = static_cast<float>(shifted.z);
+    };
+
+    if (!gpu.centersUploaded || gpu.cachedCenterGeneration != bindGeneration ||
+        gpu.cachedCenterMatrix != centeredWorld) {
+        gpu.centersUploaded = false;
+        for (unsigned int i = 0; i < count; ++i) {
+            const auto& center = centers[i];
+            pack(i, MPoint(center.x, center.y, center.z));
+        }
+        const size_t bytes = gpu.inputPoints.size() * sizeof(float);
+        if (!gpu.centers.reserve(gpu.context, bytes, CL_MEM_READ_ONLY) ||
+            !upload(gpu.queue, gpu.centers, gpu.inputPoints.data(), bytes)) {
+            report("could not upload CoR centers");
+            return false;
+        }
+        gpu.cachedCenterGeneration = bindGeneration;
+        gpu.cachedCenterMatrix = centeredWorld;
+        gpu.centersUploaded = true;
+    }
+
+    gpu.frameTransforms.resize(transforms.size() * 8);
+    for (size_t i = 0; i < transforms.size(); ++i) {
+        const auto& transform = transforms[i];
+        const auto translation = mathcore::v3_add(transform.t,
+            mathcore::v3_sub(mathcore::q_rotate_v3(transform.q, origin), origin));
+        const double components[] = {transform.q.x, transform.q.y, transform.q.z, transform.q.w,
+            translation.x, translation.y, translation.z, 0.0};
+        std::copy(std::begin(components), std::end(components), gpu.frameTransforms.begin() + i * 8);
+    }
+    for (unsigned int i = 0; i < count; ++i) pack(i, points[i]);
+
+    const float gpuEnvelope = envelope >= 1.0 - 1e-6 ? 1.0f : static_cast<float>(envelope);
+    if (!gpu.launch(count, gpuEnvelope, true, timing)) {
+        report("OpenCL dispatch or readback failed");
+        return false;
+    }
+    if (!std::all_of(gpu.resultPoints.begin(), gpu.resultPoints.end(),
+        [](float value) { return std::isfinite(value); })) {
+        report("GPU result requires CPU precision");
+        return false;
+    }
+
+    const MMatrix inverse = centeredWorld.inverse();
+    for (unsigned int i = 0; i < count; ++i) {
+        if (weights[i].empty()) continue;
+        const size_t k = size_t(i) * 3;
+        points[i] = MPoint(gpu.resultPoints[k], gpu.resultPoints[k + 1],
+            gpu.resultPoints[k + 2]) * inverse;
     }
     report({});
     return true;

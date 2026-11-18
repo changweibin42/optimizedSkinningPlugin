@@ -1,0 +1,6 @@
+#pragma once
+
+constexpr char skinningOpenCLSource[] = R"DlbOpenCL(
+@DLB_OPENCL_SOURCE@
+@COR_OPENCL_SOURCE@
+)DlbOpenCL";

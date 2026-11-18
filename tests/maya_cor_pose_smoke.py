@@ -4,7 +4,7 @@ import maya.api.OpenMaya as om
 import maya.cmds as cmds
 
 
-def smoke_test():
+def smoke_test(check_opencl=False):
     """Check rest and rotated output through Maya with sparse weight and matrix indices."""
     nodes = []
     selection = cmds.ls(selection=True, long=True)
@@ -54,6 +54,20 @@ def smoke_test():
         assert_point(posed[3], expected, "rotating influence")
         assert (posed[3] - rest[3]).length() > 0.1
         assert (posed[2] - rest[2]).length() > 0.1
+
+        if check_opencl:
+            # This checks the evaluated result. Inspect the backend in the
+            # enabled CoR log to confirm Maya actually used the GPU.
+            cmds.setAttr(skin + ".corUseOpenCL", True)
+            gpu = mesh_fn.getPoints(om.MSpace.kObject)
+            for vertex in range(len(posed)):
+                assert_point(gpu[vertex], posed[vertex], "OpenCL vertex {}".format(vertex))
+            cmds.setAttr("{}.weightList[2].weights[2]".format(skin), 0.75)
+            cmds.setAttr("{}.weightList[2].weights[9]".format(skin), 0.25)
+            edited_gpu = mesh_fn.getPoints(om.MSpace.kObject)
+            cmds.setAttr(skin + ".corUseOpenCL", False)
+            edited_cpu = mesh_fn.getPoints(om.MSpace.kObject)
+            assert_point(edited_gpu[2], edited_cpu[2], "OpenCL after weight edit")
 
         cmds.setAttr(driver + ".rotateZ", 0)
         reset = mesh_fn.getPoints(om.MSpace.kObject)

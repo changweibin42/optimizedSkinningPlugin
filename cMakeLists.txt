@@ -19,7 +19,7 @@ set(SOURCE_FILES
     src/skinClusterData.cpp
     src/algorithms.cpp
     src/cor_paper.cpp
-    src/dlb_gpu.cpp
+    src/skinning_gpu.cpp
     src/ocd_math.cpp 
     src/optimizedSkinCluster.cpp
     src/optimizedSkinClusterCoR.cpp
@@ -39,9 +39,11 @@ set(LIBRARIES
 
 # Embed the kernel so the test plug-in can be loaded from the .mll alone.
 set(DLB_KERNEL_FILE "${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/kernel_dlb.cl")
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${DLB_KERNEL_FILE}")
+set(COR_KERNEL_FILE "${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/kernel_cor_paper.cl")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${DLB_KERNEL_FILE}" "${COR_KERNEL_FILE}")
 file(READ "${DLB_KERNEL_FILE}" DLB_OPENCL_SOURCE)
-configure_file(src/dlb_gpu_kernel.h.in dlb_gpu_kernel.h @ONLY)
+file(READ "${COR_KERNEL_FILE}" COR_OPENCL_SOURCE)
+configure_file(src/skinning_gpu_kernel.h.in skinning_gpu_kernel.h @ONLY)
 list(APPEND INCLUDE_DIRS "${CMAKE_CURRENT_BINARY_DIR}")
 
 build_plugin()

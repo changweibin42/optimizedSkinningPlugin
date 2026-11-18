@@ -23,7 +23,7 @@
 #include "ocd_math.h"
 #include "optimizedSkinClusterCoR.h"
 
-class DlbGpu;
+class SkinningGpu;
 
 class OptimizedSkinCluster : public MPxSkinCluster {
 public:
@@ -67,6 +67,7 @@ public:
     static MObject aCorCompStrengthOut;
     static MObject aCorSigma;
     static MObject aCorDebugLog;
+    static MObject aCorUseOpenCL;
     static MObject aDisplayCoR;
 
     // ---- MOS 可调参数 ----
@@ -161,7 +162,7 @@ private:
     MStatus deformCoR(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int);
     MStatus deformDLB(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int,
         bool useOpenCL = false);
-    std::unique_ptr<DlbGpu> m_dlbGpu;
+    std::unique_ptr<SkinningGpu> m_skinningGpu;
     MStatus deformDQSComp(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int);
     MStatus deformMOS(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int);
     MStatus deformCoRMosSecondary(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int);
@@ -206,6 +207,7 @@ private:
         bool valid = false;
         unsigned int geometryIndex = 0;
         unsigned long long weightVersion = 0;
+        unsigned long long bindGeneration = 0;
         double sigma = 0.0;
         std::vector<unsigned int> influenceIds;
         std::vector<cor_paper::Weights> weights;
