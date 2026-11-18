@@ -61,6 +61,7 @@ MObject OptimizedSkinCluster::aCorCompFalloff;    // 新增
 MObject OptimizedSkinCluster::aCorCompStrengthIn;   // 新增
 MObject OptimizedSkinCluster::aCorCompStrengthOut;  // 新增
 MObject OptimizedSkinCluster::aCorSigma;
+MObject OptimizedSkinCluster::aCorDebugLog;
 MObject OptimizedSkinCluster::aCorIncBudgetDiv;
 MObject OptimizedSkinCluster::aDisplayCoR;
 
@@ -315,6 +316,14 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setNiceNameOverride("CoR Sigma (similarity width)");
     addAttribute(aCorSigma);
     attributeAffects(aCorSigma, MPxSkinCluster::outputGeom);
+
+    aCorDebugLog = nAttr.create("corDebugLog", "crdl", MFnNumericData::kBoolean, false, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    nAttr.setStorable(false);
+    nAttr.setKeyable(false);
+    nAttr.setNiceNameOverride("CoR Debug Log");
+    CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aCorDebugLog));
+    CHECK_MSTATUS_AND_RETURN_IT(attributeAffects(aCorDebugLog, MPxSkinCluster::outputGeom));
 
     aDisplayCoR = nAttr.create("displayCoR", "dcr",
         MFnNumericData::kBoolean, 0, &status);
@@ -1544,20 +1553,24 @@ MStatus OptimizedSkinCluster::deform(
 // deformCoR
 // ================================================================
 MStatus OptimizedSkinCluster::rebuildPaperCoR(
-    MDataBlock& block, unsigned int geometryIndex, double sigma) {
+    MDataBlock& block, unsigned int geometryIndex, double sigma, const char*& stage) {
     MStatus status;
-    MPlug inputPlug(thisMObject(), MPxSkinCluster::input);
-    status = inputPlug.selectAncestorLogicalIndex(geometryIndex, MPxSkinCluster::input);
+    stage = "input geometry";
+    auto geometry = block.inputArrayValue(MPxSkinCluster::input, &status);
     if (!status) return status;
-    auto input = block.inputValue(inputPlug, &status);
+    status = geometry.jumpToElement(geometryIndex);
+    if (!status) return status;
+    auto input = geometry.inputValue(&status);
     if (!status) return status;
     const auto meshObject = input.child(MPxSkinCluster::inputGeom).asMesh();
     MFnMesh mesh(meshObject, &status);
     if (!status) return status;
 
+    stage = "rest mesh points";
     MPointArray positions;
     status = mesh.getPoints(positions, MSpace::kObject);
     if (!status) return status;
+    stage = "rest mesh triangles";
     MIntArray triangleCounts, indices;
     status = mesh.getTriangles(triangleCounts, indices);
     if (!status) return status;
@@ -1578,19 +1591,25 @@ MStatus OptimizedSkinCluster::rebuildPaperCoR(
         triangles.push_back(triangle);
     }
 
+    stage = "vertex weights";
     auto weightList = block.inputArrayValue(MPxSkinCluster::weightList, &status);
     if (!status) return status;
 
     PaperCoRCache next;
     next.weights.resize(restPoints.size());
     std::set<unsigned int> influenceIds;
-    for (unsigned int i = 0; i < next.weights.size(); ++i) {
-        // The geometry and influence arrays use sparse logical indices.
-        if (!weightList.jumpToElement(i)) continue;
+    const unsigned int rows = weightList.elementCount(&status);
+    if (!status) return status;
+    for (unsigned int row = 0; row < rows; ++row) {
+        status = weightList.jumpToArrayElement(row);
+        if (!status) return status;
+        const unsigned int vertexId = weightList.elementIndex(&status);
+        if (!status) return status;
+        if (vertexId >= next.weights.size()) continue;
         auto element = weightList.inputValue(&status);
         if (!status) return status;
         MArrayDataHandle influences(element.child(MPxSkinCluster::weights));
-        auto& vertex = next.weights[i];
+        auto& vertex = next.weights[vertexId];
         const unsigned int count = influences.elementCount();
         for (unsigned int j = 0; j < count; ++j) {
             status = influences.jumpToArrayElement(j);
@@ -1633,58 +1652,107 @@ MStatus OptimizedSkinCluster::rebuildPaperCoR(
 MStatus OptimizedSkinCluster::deformCoR(
     MDataBlock& block, MItGeometry& iter,
     const MMatrix& worldMat, unsigned int multiIndex) {
-    const double envelope = readEnvelopeFromNode();
+    const bool debug = optSkinDebugLog() || block.inputValue(aCorDebugLog).asBool();
+    const MString prefix = debug
+        ? MString("[CoR] ") + MFnDependencyNode(thisMObject()).name() + ": " : MString();
+    const auto reportFailure = [&](MStatus status, const char* stage) {
+        if (!status && debug) MGlobal::displayWarning(prefix + stage + " - " + status.errorString());
+        return status;
+    };
 
+    const double envelope = readEnvelopeFromNode();
     MStatus status;
     const double sigma = block.inputValue(aCorSigma, &status).asDouble();
-    if (!status) return status;
+    if (!status) return reportFailure(status, "read corSigma");
     const bool forceFull = block.inputValue(aForceFullCoR, &status).asBool();
-    if (!status) return status;
+    if (!status) return reportFailure(status, "read forceFullCoR");
 
     if (forceFull || !m_paperCoR.valid || m_paperCoR.geometryIndex != multiIndex ||
         m_paperCoR.weightVersion != m_currentWeightVersion || m_paperCoR.sigma != sigma) {
         m_paperCoR.valid = false;
-        status = rebuildPaperCoR(block, multiIndex, sigma);
-        if (!status) return status;
+        const char* stage = "bind cache";
+        status = rebuildPaperCoR(block, multiIndex, sigma, stage);
+        if (!status) return reportFailure(status, stage);
+        if (debug) {
+            const auto weighted = std::count_if(m_paperCoR.weights.begin(), m_paperCoR.weights.end(),
+                [](const auto& weights) { return !weights.empty(); });
+            char message[180];
+            snprintf(message, sizeof(message),
+                "bind geometry=%u vertices=%zu weighted=%zu influences=%zu sigma=%.4f",
+                multiIndex, m_paperCoR.centers.size(), static_cast<size_t>(weighted),
+                m_paperCoR.influenceIds.size(), sigma);
+            MGlobal::displayInfo(prefix + message);
+        }
     }
-    const auto& cache = m_paperCoR;
-    if (envelope <= 1e-6 || cache.influenceIds.empty()) return MS::kSuccess;
 
-    auto poses = block.inputArrayValue(MPxSkinCluster::matrix, &status);
-    if (!status) return status;
-    auto bindInverses = block.inputArrayValue(MPxSkinCluster::bindPreMatrix, &status);
-    if (!status) return status;
+    const auto& cache = m_paperCoR;
+    if (envelope <= 1e-6 || cache.influenceIds.empty()) {
+        if (debug) MGlobal::displayWarning(prefix + (cache.influenceIds.empty()
+            ? "no positive skin weights in the input geometry" : "envelope is zero"));
+        return MS::kSuccess;
+    }
+
+    const auto loadMatrices = [&](const MObject& attribute, std::vector<MMatrix>& matrices,
+        std::vector<bool>& present) -> MStatus {
+        MStatus readStatus;
+        auto values = block.inputArrayValue(attribute, &readStatus);
+        if (!readStatus) return readStatus;
+        const unsigned int count = values.elementCount(&readStatus);
+        if (!readStatus) return readStatus;
+        for (unsigned int entry = 0; entry < count; ++entry) {
+            readStatus = values.jumpToArrayElement(entry);
+            if (!readStatus) return readStatus;
+            const unsigned int id = values.elementIndex(&readStatus);
+            if (!readStatus) return readStatus;
+
+            const auto found = std::lower_bound(cache.influenceIds.begin(), cache.influenceIds.end(), id);
+            if (found == cache.influenceIds.end() || *found != id) continue;
+            auto value = values.inputValue(&readStatus);
+            if (!readStatus) return readStatus;
+            // SkinCluster stores matrix objects. Read them through the same
+            // Maya function set used by the DevKit skinCluster example.
+            MFnMatrixData data(value.data(), &readStatus);
+            if (!readStatus) return readStatus;
+            const size_t slot = found - cache.influenceIds.begin();
+            matrices[slot] = data.matrix(&readStatus);
+            if (!readStatus) return readStatus;
+            present[slot] = true;
+        }
+        return readStatus;
+    };
+
+    const size_t influenceCount = cache.influenceIds.size();
+    std::vector<MMatrix> poses(influenceCount), bindInverses(influenceCount);
+    std::vector<bool> hasPose(influenceCount), hasBind(influenceCount);
+    status = loadMatrices(MPxSkinCluster::matrix, poses, hasPose);
+    if (!status) return reportFailure(status, "read matrix");
+    status = loadMatrices(MPxSkinCluster::bindPreMatrix, bindInverses, hasBind);
+    if (!status) return reportFailure(status, "read bindPreMatrix");
 
     const mathcore::RigidTransform identity{{0.0, 0.0, 0.0, 1.0}, {0.0, 0.0, 0.0}};
-    std::vector<mathcore::RigidTransform> bindToPose(cache.influenceIds.size(), identity);
-    for (size_t i = 0; i < cache.influenceIds.size(); ++i) {
-        const unsigned int id = cache.influenceIds[i];
-        if (!poses.jumpToElement(id)) continue;
-        const MMatrix pose = poses.inputValue(&status).asMatrix();
-        if (!status) return status;
-        MMatrix bindInverse;
-        if (bindInverses.jumpToElement(id)) {
-            bindInverse = bindInverses.inputValue(&status).asMatrix();
-            if (!status) return status;
-        }
+    std::vector<mathcore::RigidTransform> bindToPose(influenceCount, identity);
+    size_t posedCount = 0;
+    for (size_t i = 0; i < influenceCount; ++i) {
+        if (!hasPose[i]) continue;
 
         // Maya uses row vectors, so inverse bind is applied before pose.
-        const MMatrix relative = bindInverse * pose;
+        const MMatrix relative = bindInverses[i] * poses[i];
         const MQuaternion q = MTransformationMatrix(relative).rotation();
         bindToPose[i] = {mathcore::q_normalize({q.x, q.y, q.z, q.w}),
             {relative[3][0], relative[3][1], relative[3][2]}};
+        if (debug && !relative.isEquivalent(MMatrix::identity, 1e-8)) ++posedCount;
     }
 
     MPointArray points;
     status = iter.allPositions(points);
-    if (!status) return status;
+    if (!status) return reportFailure(status, "read output geometry points");
     bool dense = points.length() == cache.centers.size();
     unsigned int sequentialIndex = 0;
     for (; dense && !iter.isDone(); iter.next())
         dense = iter.index() == static_cast<int>(sequentialIndex++);
     dense = dense && sequentialIndex == points.length();
     status = iter.reset();
-    if (!status) return status;
+    if (!status) return reportFailure(status, "reset geometry iterator");
 
     const MMatrix worldInverse = worldMat.inverse();
     const auto deformPoint = [&](const MPoint& p, unsigned int vertex) {
@@ -1699,17 +1767,46 @@ MStatus OptimizedSkinCluster::deformCoR(
         return MPoint(result.x, result.y, result.z) * worldInverse;
     };
 
+    double maxDeltaSquared = 0.0;
+    unsigned int affected = points.length();
+    const auto measure = [&](const MPoint& inputPoint, const MPoint& outputPoint) {
+        const auto delta = outputPoint - inputPoint;
+        maxDeltaSquared = std::max(maxDeltaSquared, delta * delta);
+    };
     if (dense) {
+        MPointArray original;
+        if (debug) original = points;
 #pragma omp parallel for schedule(static)
         for (int i = 0; i < static_cast<int>(points.length()); ++i)
             points[i] = deformPoint(points[i], static_cast<unsigned int>(i));
-        return iter.setAllPositions(points);
+        if (debug) {
+            for (unsigned int i = 0; i < points.length(); ++i) measure(original[i], points[i]);
+        }
+        status = iter.setAllPositions(points);
+        if (!status) return reportFailure(status, "write output geometry points");
+    }
+    else {
+        // Respect the iterator's vertex IDs for a deformer component subset.
+        affected = 0;
+        for (; !iter.isDone(); iter.next()) {
+            const MPoint inputPoint = iter.position();
+            const MPoint outputPoint = deformPoint(inputPoint, static_cast<unsigned int>(iter.index()));
+            status = iter.setPosition(outputPoint);
+            if (!status) return reportFailure(status, "write output component");
+            if (debug) measure(inputPoint, outputPoint);
+            ++affected;
+        }
     }
 
-    // Respect the iterator's vertex IDs when the deformer affects a component subset.
-    for (; !iter.isDone(); iter.next()) {
-        status = iter.setPosition(deformPoint(iter.position(), static_cast<unsigned int>(iter.index())));
-        if (!status) return status;
+    if (debug) {
+        const auto poseCount = static_cast<size_t>(std::count(hasPose.begin(), hasPose.end(), true));
+        const auto bindCount = static_cast<size_t>(std::count(hasBind.begin(), hasBind.end(), true));
+        char message[230];
+        snprintf(message, sizeof(message),
+            "pose matrices=%zu/%zu bind matrices=%zu/%zu nonIdentity=%zu affected=%u envelope=%.3f maxDelta=%.8g",
+            poseCount, influenceCount, bindCount, influenceCount, posedCount, affected,
+            envelope, std::sqrt(maxDeltaSquared));
+        MGlobal::displayInfo(prefix + message);
     }
     return MS::kSuccess;
 }

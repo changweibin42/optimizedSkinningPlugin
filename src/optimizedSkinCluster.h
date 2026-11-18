@@ -66,6 +66,7 @@ public:
     static MObject aCorCompStrengthIn;
     static MObject aCorCompStrengthOut;
     static MObject aCorSigma;
+    static MObject aCorDebugLog;
     static MObject aDisplayCoR;
 
     // ---- MOS 可调参数 ----
@@ -212,7 +213,8 @@ private:
     };
     PaperCoRCache m_paperCoR;
 
-    MStatus rebuildPaperCoR(MDataBlock& block, unsigned int geometryIndex, double sigma);
+    MStatus rebuildPaperCoR(MDataBlock& block, unsigned int geometryIndex, double sigma,
+        const char*& stage);
 
     bool computeCoRCache(MDataBlock& block, unsigned int numVertices);
     void updateCoRCacheIncremental(MDataBlock& block,
