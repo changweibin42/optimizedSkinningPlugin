@@ -22,6 +22,7 @@
 #include "cor_paper.h"
 #include "ddm_v4.h"
 #include "ocd_math.h"
+#include "mos_math.h"
 #include "optimizedSkinClusterCoR.h"
 
 class DlbGpu;
@@ -109,7 +110,7 @@ public:
     bool getCoRData(std::vector<mathcore::Vec3>& out) const;
 
     struct MosParams {
-        double influenceRadius = 0.6;
+        double influenceRadius = 1.0;
         int    curveMode = 0;
         bool   endLock = true;
         int    curveSamples = 1024;
@@ -285,6 +286,7 @@ private:
     struct MosCurve {
         std::vector<mathcore::Vec3> cvs_rest;
         std::vector<unsigned int>  cvs_bone;
+        std::vector<ocd_math::Mat3> bindFrames;
         /// 每个控制点在 chain 上的归一化骨骼参数 u_j ∈ [0,1]，与 cvs_rest 等长。
         /// 第 i 段骨骼内相对位置 r 的控制点取 u = (i + r) / 段总数，弯曲关节处恰为 0.5。
         /// 该值将作为 B-spline 内节点使用，使线性精度 Σ N_j(τ)·u_j = τ 成立，
@@ -300,6 +302,7 @@ private:
     };
 
     struct MosPerCurveBind {
+        mos_math::Basis basis;
         double tau = 0.0;                        ///< 顶点在曲线上的 B-spline 参数
         mathcore::Vec3 O = { 0.0, 0.0, 0.0 };    ///< EQ.9 解出的单偏移向量
         double w_c = 0.0;                        ///< 曲线对顶点的混合权重
@@ -312,6 +315,9 @@ private:
 
     struct MosCache {
         bool valid = false;
+        bool direct = false;
+        unsigned int geometryIndex = 0;
+        MMatrix bindSpace;
         unsigned int numVertices = 0;
         unsigned int n_curves = 0;
         double avg_bone_length = 1.0;
@@ -325,7 +331,8 @@ private:
 
     /// 构建 MOS 全量缓存；失败时调用方回退 deformDLB
     bool computeMosCache(MDataBlock& block, unsigned int numVertices,
-        const MosParams& params);
+        const MosParams& params, const MMatrix* bindSpace = nullptr,
+        unsigned int geometryIndex = 0);
 
     /// 控制点级 bulge / centerSlide 修正（专利 US9418465B2）。
     ///

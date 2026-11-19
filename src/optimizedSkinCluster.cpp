@@ -396,7 +396,7 @@ MStatus OptimizedSkinCluster::initialize() {
     // MOS 可调参数
     // ================================================================
     aMosInfluenceRadius = nAttr.create("mosInfluenceRadius", "mosR",
-        MFnNumericData::kDouble, 0.6, &status);
+        MFnNumericData::kDouble, 1.0, &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
     nAttr.setMin(0.0);
     nAttr.setSoftMax(5.0);
@@ -443,6 +443,7 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setStorable(true);
     nAttr.setNiceNameOverride("MOS Debug");
     addAttribute(aMosDebugLog);
+    attributeAffects(aMosDebugLog, MPxSkinCluster::outputGeom);
 
     // ---- Bulge 组 ----
     aMosInBulgeWeight = nAttr.create("mosInBulgeWeight", "mosIbw",
@@ -696,6 +697,12 @@ MStatus OptimizedSkinCluster::setDependentsDirty(
     if (attr == MPxSkinCluster::input || attr == MPxSkinCluster::inputGeom) {
         m_paperCoR.valid = false;
         m_ddmV4.valid = false;
+        if (m_mosCache.direct) m_mosCache.valid = false;
+    }
+
+    if (attr == MPxSkinCluster::bindPreMatrix && m_mosCache.direct) {
+        m_mosCache.valid = false;
+        m_boneInfo.valid = false;
     }
 
     if (attr == aDiagFlags) {
@@ -753,6 +760,8 @@ MStatus OptimizedSkinCluster::setDependentsDirty(
         attr == aMosScaleMode ||
         attr == aCorMosSecondaryWeight) 
     {
+        if (m_mosCache.direct && attr != aMosCurveMode && attr != aMosCurveSamples)
+            return MS::kSuccess;
         m_mosCache.valid = false;
 
         if (optSkinDebugLog()) {
@@ -806,11 +815,13 @@ MStatus OptimizedSkinCluster::preEvaluation(const MDGContext& context,
     if (evaluationNode.dirtyPlugExists(MPxSkinCluster::weightList) ||
         evaluationNode.dirtyPlugExists(MPxSkinCluster::weights)) {
         m_vtxCache.valid = false;
+        if (m_mosCache.direct) m_mosCache.valid = false;
         ++m_currentWeightVersion;
     }
     if (evaluationNode.dirtyPlugExists(MPxSkinCluster::inputGeom)) {
         m_paperCoR.valid = false;
         m_ddmV4.valid = false;
+        if (m_mosCache.direct) m_mosCache.valid = false;
     }
     return MPxSkinCluster::preEvaluation(context, evaluationNode);
 }
@@ -2264,7 +2275,9 @@ bool OptimizedSkinCluster::MosParams::nearlyEqual(const MosParams& rhs) const {
 
 bool OptimizedSkinCluster::computeMosCache(
     MDataBlock& block, unsigned int numVertices,
-    const MosParams& params) {
+    const MosParams& params, const MMatrix* bindSpace, unsigned int geometryIndex) {
+    const bool direct = bindSpace != nullptr;
+    m_mosCache.valid = false;
 
     // [DIAG] 读诊断开关（wc_unity 影响 bind 时 w_c）
     int diagFlags = 0;
@@ -2288,7 +2301,8 @@ bool OptimizedSkinCluster::computeMosCache(
     MStatus status;
     MArrayDataHandle inArr = block.inputArrayValue(MPxSkinCluster::input, &status);
     if (!status) return false;
-    inArr.jumpToArrayElement(0);
+    status = direct ? inArr.jumpToElement(geometryIndex) : inArr.jumpToArrayElement(0);
+    if (!status) return false;
     MDataHandle inData = inArr.inputValue(&status);
     if (!status) return false;
     MObject meshObj = inData.child(MPxSkinCluster::inputGeom).asMesh();
@@ -2296,8 +2310,11 @@ bool OptimizedSkinCluster::computeMosCache(
 
     MFnMesh meshFn(meshObj);
     MPointArray points;
-    meshFn.getPoints(points, MSpace::kWorld);
-    if (points.length() < (int)numVertices) return false;
+    status = meshFn.getPoints(points, direct ? MSpace::kObject : MSpace::kWorld);
+    if (!status || points.length() < numVertices) return false;
+    if (direct) {
+        for (unsigned int i = 0; i < points.length(); ++i) points[i] *= *bindSpace;
+    }
 
     MPlug matPlug(thisMObject(), MPxSkinCluster::matrix);
     std::vector<MObject> joints;
@@ -2397,6 +2414,13 @@ bool OptimizedSkinCluster::computeMosCache(
         bone_len[n_bones - 1] = bone_len[n_bones - 2];
     }
 
+    std::vector<mathcore::RigidTransform> bindInverses, relative;
+    std::vector<mathcore::Quat> poseRotations;
+    if (direct && !readBoneTransforms(block, bindInverses, relative, poseRotations)) return false;
+    if (direct && std::any_of(chain.begin(), chain.end(), [&](unsigned int index) {
+        return index >= bindInverses.size();
+    })) return false;
+
     m_mosCache.curves.clear();
 
     auto push_cv = [](MosCurve& c, const mathcore::Vec3& p,
@@ -2413,6 +2437,12 @@ bool OptimizedSkinCluster::computeMosCache(
         for (int i = 1; i < n_cv_local; ++i)
             if (c.cvs_u[i] < c.cvs_u[i - 1] - 1e-12) return false;
         c.chain_bones = chain;
+        if (direct) {
+            for (const auto bone : c.cvs_bone) {
+                c.bindFrames.push_back(ocd_math::mat3_from_quat(
+                    mathcore::q_inverse(bindInverses[bone].q)));
+            }
+        }
         c.degree = ocd_math::effective_degree(n_cv_local, 3);
         if (c.degree < 1) return false;
 
@@ -2440,8 +2470,9 @@ bool OptimizedSkinCluster::computeMosCache(
 
     if (params.curveMode == 0) {
         MosCurve c;
-        const double u_den = (n_bones > 1) ? double(n_bones - 1) : 1.0;
-        for (int i = 0; i + 1 < n_bones; ++i) {
+        const int segmentCount = direct ? n_bones : n_bones - 1;
+        const double u_den = segmentCount;
+        for (int i = 0; i < segmentCount; ++i) {
             const unsigned int B_i = chain[i];
             const mathcore::Vec3 start = bind_jp[B_i];
             const mathcore::Vec3 dir = bone_dir[i];
@@ -2457,7 +2488,7 @@ bool OptimizedSkinCluster::computeMosCache(
                 mathcore::v3_scale(dir, L * 0.90)), B_i, (i + 0.90) / u_den);
         }
 
-        if (params.endLock && c.cvs_rest.size() >= 4) {
+        if (!direct && params.endLock && c.cvs_rest.size() >= 4) {
             c.cvs_bone.back() = chain[n_bones - 2];
         }
         c.bend_joint_idx = -1;
@@ -2490,7 +2521,7 @@ bool OptimizedSkinCluster::computeMosCache(
             push_cv(c, mathcore::v3_add(joint,
                 mathcore::v3_scale(dir_child, L_child * 0.5)), B_child, 0.75);
 
-            if (params.endLock && j + 1 == n_bones && c.cvs_rest.size() >= 4) {
+            if (!direct && params.endLock && j + 1 == n_bones && c.cvs_rest.size() >= 4) {
                 c.cvs_bone.back() = B_parent;
             }
 
@@ -2592,7 +2623,18 @@ bool OptimizedSkinCluster::computeMosCache(
             const double L_bone = m_mosCache.avg_bone_length;
             double w_c = 0.0;
 
-            if (params.curveMode == 0) {
+            if (direct && params.curveMode == 0) {
+                if (vi < static_cast<int>(m_vtxCache.vertices.size())) {
+                    double total = 0.0;
+                    for (const auto& weight : m_vtxCache.vertices[vi]) {
+                        total += weight.second;
+                        if (std::find(chain.begin(), chain.end(), weight.first) != chain.end())
+                            w_c += weight.second;
+                    }
+                    if (total > 0.0) w_c /= total;
+                }
+            }
+            else if (params.curveMode == 0) {
                 const double x_wc = d_curve / std::max(1e-9, L_bone);
                 w_c = std::exp(-x_wc * x_wc);
             }
@@ -2621,6 +2663,11 @@ bool OptimizedSkinCluster::computeMosCache(
             MosPerCurveBind pc;
             pc.tau = t;
             pc.O = O_i;
+            if (direct && w_c > 0.0) {
+                pc.basis = mos_math::sampleBasis(cv.knots, cv.degree, t);
+                if (!mos_math::bindOffset(pv, cv.cvs_rest, cv.bindFrames, pc.basis, pc.O))
+                    w_c = 0.0;
+            }
             pc.w_c = w_c;
             pc.vertex_joint = vj;
             vb.per_curve[c] = pc;
@@ -2630,6 +2677,9 @@ bool OptimizedSkinCluster::computeMosCache(
     }
 
     m_mosCache.numVertices = numVertices;
+    m_mosCache.direct = direct;
+    m_mosCache.geometryIndex = geometryIndex;
+    if (direct) m_mosCache.bindSpace = *bindSpace;
     m_mosCache.valid = true;
 
     auto tEnd = std::chrono::high_resolution_clock::now();
@@ -2657,899 +2707,188 @@ bool OptimizedSkinCluster::computeMosCache(
 
 MStatus OptimizedSkinCluster::deformMOS(
     MDataBlock& block, MItGeometry& iter,
-    const MMatrix& worldMat, unsigned int /*multiIndex*/) {
-
-    // [DIAG] 读诊断开关
-    int diagFlags = 0;
-    {
-        MStatus dfStatus;
-        MDataHandle dfh = block.inputValue(aDiagFlags, &dfStatus);
-        if (dfStatus) diagFlags = dfh.asInt();
-    }
-
-    const unsigned int nV = iter.count();
-
-    MosParams curParams = readMosParams(block);
-    if (!m_mosCache.valid || m_mosCache.numVertices != nV ||
-        !m_mosCache.params.nearlyEqual(curParams)) {
-        if (!computeMosCache(block, nV, curParams))
-            return deformDLB(block, iter, worldMat, 0);
-    }
-
-    const double env = readEnvelopeFromNode();
-    std::vector<mathcore::RigidTransform> rest, Cs;
-    std::vector<mathcore::Quat> poseQ;
-    if (!readBoneTransforms(block, rest, Cs, poseQ)) return MS::kSuccess;
-
-    const int n_curves = (int)m_mosCache.curves.size();
-    if (n_curves == 0) return deformDLB(block, iter, worldMat, 0);
-
-    const MosParams& P = m_mosCache.params;
-
-    // ============================================================
-    // 每条曲线的弯曲关节
-    // ============================================================
-    std::vector<int> curve_bend_idx(n_curves, -1);
-    for (int c = 0; c < n_curves; ++c) {
-        const auto& cv = m_mosCache.curves[c];
-        if (cv.bend_joint_idx >= 0) {
-            curve_bend_idx[c] = cv.bend_joint_idx;
-        }
-        else {
-            const int nB = (int)cv.chain_bones.size();
-            int best_j = -1;
-            double best_angle = 0.0;
-            for (int j = 1; j < nB; ++j) {
-                const unsigned int bp = cv.chain_bones[j - 1];
-                const unsigned int bc = cv.chain_bones[j];
-                if (bp >= Cs.size() || bc >= Cs.size()) continue;
-                mathcore::Quat q_rel = mathcore::q_mul(
-                    Cs[bc].q, mathcore::q_inverse(Cs[bp].q));
-                double cos_half = std::abs(q_rel.w);
-                if (cos_half > 1.0) cos_half = 1.0;
-                double angle = 2.0 * std::acos(cos_half);
-                if (angle > best_angle) { best_angle = angle; best_j = j; }
-            }
-            curve_bend_idx[c] = best_j;
+    const MMatrix& worldMat, unsigned int multiIndex) {
+    using namespace mathcore;
+    const unsigned int count = iter.count();
+    const MosParams params = readMosParams(block);
+    const bool debug = optSkinDebugLog() || params.debugLog;
+    if (!m_mosCache.valid || !m_mosCache.direct || m_mosCache.geometryIndex != multiIndex ||
+        !m_mosCache.bindSpace.isEquivalent(worldMat, 1e-12) || m_mosCache.numVertices != count ||
+        m_mosCache.params.curveMode != params.curveMode ||
+        m_mosCache.params.curveSamples != params.curveSamples) {
+        if (!computeMosCache(block, count, params, &worldMat, multiIndex)) {
+            if (debug) MGlobal::displayWarning("[MOS] No usable curve binding; using DLB.");
+            return deformDLB(block, iter, worldMat, multiIndex);
         }
     }
 
-    // ============================================================
-    // curve_tau_bend / curve_bend_angle
-    // ============================================================
-    std::vector<double> curve_tau_bend(n_curves, 0.5);
-    std::vector<double> curve_bend_angle(n_curves, 0.0);
+    std::vector<RigidTransform> bindInverses, transforms;
+    std::vector<Quat> poseRotations;
+    if (!readBoneTransforms(block, bindInverses, transforms, poseRotations)) return MS::kFailure;
 
-    for (int c = 0; c < n_curves; ++c) {
-        const auto& cv = m_mosCache.curves[c];
-        const int bj = curve_bend_idx[c];
-        if (bj < 1 || bj >= (int)cv.chain_bones.size()) continue;
+    struct PoseControl {
+        Vec3 center;
+        ocd_math::Mat3 frame;
+        mos_math::BendControl bend;
+    };
+    std::vector<std::vector<PoseControl>> poseCurves(m_mosCache.curves.size());
+    const auto& pivots = m_boneInfo.jointPosRest;
+    const bool secondary = params.inBulgeWeight != 0.0 || params.outBulgeWeight != 0.0 ||
+        params.sideBulgeWeight != 0.0 || params.slideInWeight_prev != 0.0 ||
+        params.slideInWeight_next != 0.0 || params.slideOutWeight_prev != 0.0 ||
+        params.slideOutWeight_next != 0.0 || params.slideOrthoInWeight_prev != 0.0 ||
+        params.slideOrthoInWeight_next != 0.0 || params.slideOrthoOutWeight_prev != 0.0 ||
+        params.slideOrthoOutWeight_next != 0.0 || params.centerSlideInWeight != 0.0 ||
+        params.centerSlideOutWeight != 0.0;
 
-        const unsigned int bp = cv.chain_bones[bj - 1];
-        const unsigned int bc = cv.chain_bones[bj];
+    for (size_t c = 0; c < m_mosCache.curves.size(); ++c) {
+        const auto& curve = m_mosCache.curves[c];
+        auto& controls = poseCurves[c];
+        controls.reserve(curve.cvs_rest.size());
+        for (size_t j = 0; j < curve.cvs_rest.size(); ++j) {
+            const auto bone = curve.cvs_bone[j];
+            const auto& restPoint = curve.cvs_rest[j];
+            PoseControl control{apply_transform(transforms[bone], restPoint),
+                ocd_math::mat3_from_quat(transforms[bone].q) * curve.bindFrames[j], {}};
+            if (secondary) {
+                const auto& chain = curve.chain_bones;
+                const size_t begin = curve.bend_joint_idx > 0 ? curve.bend_joint_idx : 1;
+                const size_t end = curve.bend_joint_idx > 0 ? begin + 1 : chain.size();
+                double bestDistance = 1.0;
+                for (size_t k = begin; k < end; ++k) {
+                    const auto parent = chain[k - 1];
+                    const auto child = chain[k];
+                    const bool incoming = bone == parent;
+                    if (!incoming && bone != child) continue;
+                    const auto segment = v3_sub(pivots[child], pivots[parent]);
+                    const double length = v3_len(segment);
+                    if (length < 1e-8) continue;
+                    const double distance = v3_len(v3_sub(restPoint, pivots[child])) /
+                        (0.85 * length);
+                    if (distance >= bestDistance) continue;
 
-        if (bc < m_boneInfo.jointPosRest.size()) {
-            const mathcore::Vec3 joint_bind = m_boneInfo.jointPosRest[bc];
-            double t_best = 0.5;
-            double d_best = 1e30;
-            const int N_SAMPLE_T = 64;
-            for (int i = 0; i <= N_SAMPLE_T; ++i) {
-                const double t = (double)i / N_SAMPLE_T;
-                const mathcore::Vec3 p = ocd_math::bspline_eval(
-                    cv.cvs_rest, cv.knots, cv.degree, t);
-                const double d = mathcore::v3_len(
-                    mathcore::v3_sub(p, joint_bind));
-                if (d < d_best) { d_best = d; t_best = t; }
-            }
-            curve_tau_bend[c] = t_best;
-        }
-        else {
-            curve_tau_bend[c] = 0.5;
-        }
-
-        if (bp < Cs.size() && bc < Cs.size()) {
-            mathcore::Quat q_rel = mathcore::q_mul(
-                Cs[bc].q, mathcore::q_inverse(Cs[bp].q));
-
-            mathcore::Vec3 axis_bind = mathcore::Vec3{ 0.0, 1.0, 0.0 };
-            if (bc < m_boneInfo.boneDirRest.size()) {
-                axis_bind = m_boneInfo.boneDirRest[bc];
-            }
-
-            mathcore::Quat R_swing, R_twist;
-            mathcore::Vec3 axis_cur;
-            double twist_angle = 0.0;
-            ocd_math::decompose_swing_twist(
-                q_rel, axis_bind, R_swing, R_twist, axis_cur, twist_angle);
-
-            double cos_half = std::abs(R_swing.w);
-            if (cos_half > 1.0) cos_half = 1.0;
-            const double angle = 2.0 * std::acos(cos_half);
-            curve_bend_angle[c] =
-                std::min(angle / 3.14159265358979323846, 1.0);
-        }
-    }
-
-    if (optSkinDebugLog() || P.debugLog) {
-        char buf[256];
-        for (int c = 0; c < n_curves; ++c) {
-            snprintf(buf, sizeof(buf),
-                "[MOS] curve[%d]: bend_idx=%d tau_bend=%.4f angle=%.3f",
-                c, curve_bend_idx[c],
-                curve_tau_bend[c], curve_bend_angle[c]);
-            MGlobal::displayInfo(MString(buf));
-        }
-    }
-
-    // ============================================================
-    // 每个控制点对弯曲关节的从属权重
-    // ============================================================
-    std::vector<std::vector<double>> all_cv_bend_weight(n_curves);
-    for (int c = 0; c < n_curves; ++c) {
-        const auto& cv = m_mosCache.curves[c];
-        const int n_cv = (int)cv.cvs_rest.size();
-        all_cv_bend_weight[c].assign(n_cv, 0.0);
-
-        const int bj = curve_bend_idx[c];
-        if (bj < 1 || bj >= (int)cv.chain_bones.size()) continue;
-
-        const unsigned int bc = cv.chain_bones[bj];
-        if (bc >= m_boneInfo.jointPosRest.size()) continue;
-
-        const mathcore::Vec3 joint_bind = m_boneInfo.jointPosRest[bc];
-        const double half = 0.5 * m_mosCache.avg_bone_length;
-        const double inv_half = 1.0 / std::max(1e-9, half);
-
-        for (int j = 0; j < n_cv; ++j) {
-            const double d = mathcore::v3_len(
-                mathcore::v3_sub(cv.cvs_rest[j], joint_bind));
-            const double x = d * inv_half;
-            all_cv_bend_weight[c][j] = std::exp(-x * x);
-        }
-    }
-
-    // ============================================================
-    // all_p_j / all_F_j 预计算
-    // ============================================================
-    std::vector<std::vector<mathcore::Vec3>> all_p_j(n_curves);
-    std::vector<std::vector<ocd_math::Mat3>> all_F_j(n_curves);
-
-    for (int c = 0; c < n_curves; ++c) {
-        const auto& cv = m_mosCache.curves[c];
-        const int n_cv = (int)cv.cvs_rest.size();
-        const int nB = (int)cv.chain_bones.size();
-        all_p_j[c].resize(n_cv);
-        all_F_j[c].resize(n_cv);
-
-        double seg_begin = 0.0;
-        double seg_scale = (nB > 1) ? double(nB - 1) : 1.0;
-        if (cv.bend_joint_idx >= 1 && cv.bend_joint_idx < nB) {
-            seg_begin = double(cv.bend_joint_idx - 1);
-            seg_scale = 2.0;
-        }
-
-        for (int j = 0; j < n_cv; ++j) {
-            const unsigned int bone = cv.cvs_bone[j];
-            if (bone < (unsigned int)Cs.size()) {
-                all_p_j[c][j] = mathcore::apply_transform(Cs[bone], cv.cvs_rest[j]);
-            }
-            else {
-                all_p_j[c][j] = cv.cvs_rest[j];
-            }
-
-            const double u = (j < (int)cv.cvs_u.size()) ? cv.cvs_u[j] : 0.0;
-            const double t_global = seg_begin + u * seg_scale;
-
-            ocd_math::Mat3 R_acc;
-            for (int ii = 0; ii < 9; ++ii) R_acc.m[ii] = 0.0;
-            double w_sum = 0.0;
-            for (int k = 0; k < nB; ++k) {
-                const double w = 1.0 - std::abs(t_global - (double(k) + 0.5));
-                if (w <= 1e-9) continue;
-                const unsigned int b = cv.chain_bones[k];
-                if (b >= (unsigned int)Cs.size()) continue;
-                const ocd_math::Mat3 R_b = ocd_math::mat3_from_quat(Cs[b].q);
-                for (int ii = 0; ii < 9; ++ii) R_acc.m[ii] += R_b.m[ii] * w;
-                w_sum += w;
-            }
-
-            if (w_sum > 1e-9) {
-                const double inv = 1.0 / w_sum;
-                for (int ii = 0; ii < 9; ++ii) R_acc.m[ii] *= inv;
-                all_F_j[c][j] = ocd_math::polar_rotation(R_acc);
-            }
-            else if (bone < (unsigned int)Cs.size()) {
-                all_F_j[c][j] = ocd_math::mat3_from_quat(Cs[bone].q);
-            }
-            else {
-                all_F_j[c][j] = ocd_math::Mat3::identity();
-            }
-
-            // [DIAG-FJ-HARD] F_j 改用与 p_j 同源的单骨骼硬分配旋转
-            if (diagFlags & 1) {
-                if (bone < (unsigned int)Cs.size())
-                    all_F_j[c][j] = ocd_math::mat3_from_quat(Cs[bone].q);
-                else
-                    all_F_j[c][j] = ocd_math::Mat3::identity();
-            }
-        }
-    }
-
-    // ============================================================
-    // Scale 主动控制
-    // ============================================================
-    if (P.scaleWeight > 1e-9 && P.scaleMode != 0) {
-        std::vector<mathcore::Vec3> L0, L1, L2;
-        const bool haveLinear = readBoneLinearParts(block, worldMat, L0, L1, L2);
-        if (haveLinear) {
-            for (int c = 0; c < n_curves; ++c) {
-                const auto& cv = m_mosCache.curves[c];
-                const int n_cv = (int)cv.cvs_rest.size();
-
-                for (int j = 0; j < n_cv; ++j) {
-                    const unsigned int bone = cv.cvs_bone[j];
-                    if (bone >= (unsigned int)L0.size()) continue;
-
-                    if (P.scaleMode == 1) {
-                        mathcore::Vec3 a_bind = { 0.0, 1.0, 0.0 };
-                        if (bone < m_boneInfo.boneDirRest.size()) {
-                            a_bind = m_boneInfo.boneDirRest[bone];
+                    const auto axis = v3_scale(segment, 1.0 / length);
+                    const auto outgoingBind = k + 1 < chain.size()
+                        ? v3_norm(v3_sub(pivots[chain[k + 1]], pivots[child])) : axis;
+                    const auto incomingPose = q_rotate_v3(transforms[parent].q, axis);
+                    const auto outgoingPose = q_rotate_v3(transforms[child].q, outgoingBind);
+                    const auto normal = v3_cross(incomingPose, outgoingPose);
+                    const double sine = v3_len(normal);
+                    if (sine < 1e-8) continue;
+                    const double bindAngle = std::acos(std::clamp(v3_dot(axis, outgoingBind), -1.0, 1.0));
+                    const double angle = std::atan2(sine, v3_dot(incomingPose, outgoingPose));
+                    const double bend = std::abs(angle - bindAngle) / 3.14159265358979323846;
+                    const auto planeNormal = v3_scale(normal, 1.0 / sine);
+                    const auto localAxis = incoming ? incomingPose : outgoingPose;
+                    auto inward = v3_cross(planeNormal, localAxis);
+                    auto localNormal = planeNormal;
+                    if (params.useManualInVector) {
+                        const auto manual = q_rotate_v3(transforms[bone].q, params.manualInVector);
+                        const auto projected = v3_norm(v3_sub(manual, v3_scale(localAxis, v3_dot(manual, localAxis))));
+                        if (v3_len(projected) > 0.0) {
+                            inward = projected;
+                            localNormal = v3_cross(localAxis, inward);
                         }
-                        const mathcore::Vec3 La = mathcore::v3_add(
-                            mathcore::v3_add(
-                                mathcore::v3_scale(L0[bone], a_bind.x),
-                                mathcore::v3_scale(L1[bone], a_bind.y)),
-                            mathcore::v3_scale(L2[bone], a_bind.z));
-                        const double s_axis = mathcore::v3_len(La);
-                        if (s_axis < 1e-9) continue;
-                        const mathcore::Vec3 axis_cur = all_F_j[c][j].apply(a_bind);
-                        if (mathcore::v3_len(axis_cur) < 1e-9) continue;
-                        const double s_pow = std::pow(s_axis, P.scaleWeight);
-                        const ocd_math::Mat3 S =
-                            ocd_math::mat3_axis_scale(axis_cur, s_pow);
-                        all_F_j[c][j] = S * all_F_j[c][j];
                     }
-                    else if (P.scaleMode == 2) {
-                        const double sx = mathcore::v3_len(L0[bone]);
-                        const double sy = mathcore::v3_len(L1[bone]);
-                        const double sz = mathcore::v3_len(L2[bone]);
-                        const ocd_math::Mat3 S = ocd_math::mat3_anisotropic_scale(
-                            std::pow(std::max(sx, 1e-9), P.scaleWeight),
-                            std::pow(std::max(sy, 1e-9), P.scaleWeight),
-                            std::pow(std::max(sz, 1e-9), P.scaleWeight));
-                        all_F_j[c][j] = S * all_F_j[c][j];
-                    }
+                    const double falloff = 1.0 - distance * distance * (3.0 - 2.0 * distance);
+                    control.bend = {localAxis, inward, localNormal, bend * falloff, length, incoming};
+                    bestDistance = distance;
                 }
             }
+            controls.push_back(control);
         }
     }
 
-    MPointArray points;
-    iter.allPositions(points);
-    const MMatrix wInv = worldMat.inverse();
-
-    const bool hasInBulge = (std::abs(P.inBulgeWeight) > 1e-9);
-    const bool hasOutBulge = (std::abs(P.outBulgeWeight) > 1e-9);
-    const bool hasSideBulge = (std::abs(P.sideBulgeWeight) > 1e-9);
-    const bool hasCenterSlide =
-        (std::abs(P.centerSlideInWeight) > 1e-9 ||
-            std::abs(P.centerSlideOutWeight) > 1e-9);
-    const bool hasInSlide = (std::abs(P.slideInWeight_prev) > 1e-9 ||
-        std::abs(P.slideInWeight_next) > 1e-9);
-    const bool hasOutSlide = (std::abs(P.slideOutWeight_prev) > 1e-9 ||
-        std::abs(P.slideOutWeight_next) > 1e-9);
-    const bool hasInOrthoSlide = (std::abs(P.slideOrthoInWeight_prev) > 1e-9 ||
-        std::abs(P.slideOrthoInWeight_next) > 1e-9);
-    const bool hasOutOrthoSlide = (std::abs(P.slideOrthoOutWeight_prev) > 1e-9 ||
-        std::abs(P.slideOrthoOutWeight_next) > 1e-9);
-    const bool hasAnySlide = hasInSlide || hasOutSlide ||
-        hasInOrthoSlide || hasOutOrthoSlide || hasCenterSlide;
-
-    double g_cvdisp_sum = 0.0;
-    double g_cvdisp_max = 0.0;
-    int    g_cvdisp_count = 0;
-    double g_bind_max_diff = 0.0;
-    int    g_bind_max_idx = -1;
-
-    bool is_bind_pose = true;
-    for (size_t i = 0; i < Cs.size(); ++i) {
-        if (std::abs(Cs[i].q.w) < 0.9999 ||
-            std::abs(Cs[i].q.x) > 1e-3 ||
-            std::abs(Cs[i].q.y) > 1e-3 ||
-            std::abs(Cs[i].q.z) > 1e-3) {
-            is_bind_pose = false;
-            break;
-        }
-    }
-
-#pragma omp parallel
-    {
-        std::vector<mathcore::Vec3> offset_cvs;
-        double l_cvdisp_sum = 0.0;
-        double l_cvdisp_max = 0.0;
-        int    l_cvdisp_count = 0;
-
-#pragma omp for schedule(static)
-        for (int vi = 0; vi < (int)nV; ++vi) {
-            const auto& vb = m_mosCache.verts[vi];
-
-            MPoint ptW = points[vi] * worldMat;
-            const mathcore::Vec3 origPos = { ptW.x, ptW.y, ptW.z };
-
-            // LBS 兜底
-            mathcore::Vec3 lbs_result = origPos;
-            if (vi < (int)m_vtxCache.vertices.size() &&
-                !m_vtxCache.vertices[vi].empty()) {
-                mathcore::Vec3 acc = { 0.0, 0.0, 0.0 };
-                double w_tot = 0.0;
-                for (const auto& kv : m_vtxCache.vertices[vi]) {
-                    const unsigned int b = kv.first;
-                    const double w = (double)kv.second;
-                    if (b >= (unsigned int)Cs.size()) continue;
-                    acc = mathcore::v3_add(acc,
-                        mathcore::v3_scale(
-                            mathcore::apply_transform(Cs[b], origPos), w));
-                    w_tot += w;
-                }
-                if (w_tot > 1e-9)
-                    lbs_result = mathcore::v3_scale(acc, 1.0 / w_tot);
-            }
-
-            mathcore::Vec3 def = lbs_result;
-            if (!vb.per_curve.empty()) {
-                mathcore::Vec3 blended = { 0.0, 0.0, 0.0 };
-                double w_total = 0.0;
-
-                for (int c = 0; c < n_curves; ++c) {
-                    const auto& cv = m_mosCache.curves[c];
-                    const auto& pc = vb.per_curve[c];
-                    if (pc.w_c <= 0.0) continue;
-
-                    const int n_cv_local = (int)cv.cvs_rest.size();
-                    offset_cvs.resize(n_cv_local);
-
-                    double expand_scale = 1.0;
-                    if (!(diagFlags & 8) &&
-                        pc.w_c > 1e-4 && pc.w_c < 1.0 - 1e-4) {
-                        const double w_edge = 4.0 * pc.w_c * (1.0 - pc.w_c);
-                        expand_scale = 1.0 + 0.3 * w_edge * curve_bend_angle[c];
-                    }
-
-                    mathcore::Vec3 side_normal_exp = { 0.0, 0.0, 0.0 };
-                    bool has_side_normal_exp = false;
-                    if (expand_scale > 1.0) {
-                        const int bj_sn = curve_bend_idx[c];
-                        const int nB_sn = (int)cv.chain_bones.size();
-                        if (bj_sn >= 1 && bj_sn + 1 < nB_sn) {
-                            const unsigned int bp_sn = cv.chain_bones[bj_sn - 1];
-                            const unsigned int bc_sn = cv.chain_bones[bj_sn];
-                            const unsigned int bn_sn = cv.chain_bones[bj_sn + 1];
-                            if (bp_sn < rest.size() && bc_sn < rest.size() && bn_sn < rest.size() &&
-                                bp_sn < Cs.size() && bc_sn < Cs.size() && bn_sn < Cs.size()) {
-                                const mathcore::Vec3 bp_cur_sn = mathcore::apply_transform(Cs[bp_sn], rest[bp_sn].t);
-                                const mathcore::Vec3 bc_cur_sn = mathcore::apply_transform(Cs[bc_sn], rest[bc_sn].t);
-                                const mathcore::Vec3 bn_cur_sn = mathcore::apply_transform(Cs[bn_sn], rest[bn_sn].t);
-                                const mathcore::Vec3 ax_prev_sn = mathcore::v3_sub(bc_cur_sn, bp_cur_sn);
-                                const mathcore::Vec3 ax_next_sn = mathcore::v3_sub(bn_cur_sn, bc_cur_sn);
-                                mathcore::Vec3 sn = mathcore::v3_cross(ax_prev_sn, ax_next_sn);
-                                const double sn_len = mathcore::v3_len(sn);
-                                if (sn_len > 1e-6) {
-                                    side_normal_exp = mathcore::v3_scale(sn, 1.0 / sn_len);
-                                    has_side_normal_exp = true;
-                                }
-                            }
-                        }
-                    }
-
-                    for (int j = 0; j < n_cv_local; ++j) {
-                        const mathcore::Vec3 p_j = all_p_j[c][j];
-                        mathcore::Vec3 F_O = all_F_j[c][j].apply(pc.O);
-
-                        if (expand_scale > 1.0) {
-                            if (has_side_normal_exp) {
-                                const double side_comp = mathcore::v3_dot(F_O, side_normal_exp);
-                                const mathcore::Vec3 side_part = mathcore::v3_scale(side_normal_exp, side_comp);
-                                const mathcore::Vec3 plane_part = mathcore::v3_sub(F_O, side_part);
-                                F_O = mathcore::v3_add(
-                                    mathcore::v3_scale(plane_part, expand_scale),
-                                    side_part);
-                            }
-                            else {
-                                F_O = mathcore::v3_scale(F_O, expand_scale);
-                            }
-                        }
-
-                        offset_cvs[j] = mathcore::v3_add(p_j, F_O);
-                    }
-
-                    double t = pc.tau;
-                    if (t < 0.0) t = 0.0;
-                    if (t > 1.0 - 1e-12) t = 1.0 - 1e-12;
-
-                    const mathcore::Vec3 curve_mos = ocd_math::bspline_eval(
-                        offset_cvs, cv.knots, cv.degree, t);
-
-                    mathcore::Vec3 curve_mos_final = curve_mos;
-                    if ((hasInBulge || hasOutBulge || hasSideBulge || hasAnySlide) &&
-                        curve_bend_angle[c] > 1e-6 &&
-                        curve_bend_idx[c] >= 1 &&
-                        curve_bend_idx[c] < (int)cv.chain_bones.size() &&
-                        vi < (int)m_vtxCache.vertices.size() &&
-                        !m_vtxCache.vertices[vi].empty()) {
-
-                            {
-                            mathcore::Quat q_mix = { 0.0, 0.0, 0.0, 0.0 };
-                            double wsum = 0.0;
-                            for (const auto& kv : m_vtxCache.vertices[vi]) {
-                                const unsigned int b = kv.first;
-                                const double w = (double)kv.second;
-                                if (b >= (unsigned int)Cs.size() || w <= 1e-9) continue;
-                                q_mix.x += Cs[b].q.x * w;
-                                q_mix.y += Cs[b].q.y * w;
-                                q_mix.z += Cs[b].q.z * w;
-                                q_mix.w += Cs[b].q.w * w;
-                                wsum += w;
-                            }
-
-                            if (wsum > 1e-9) {
-                                q_mix = mathcore::q_normalize(q_mix);
-
-                                const int bj = curve_bend_idx[c];
-                                const int nB = (int)cv.chain_bones.size();
-                                const unsigned int bp_idx = cv.chain_bones[bj - 1];
-                                const unsigned int bc_idx = cv.chain_bones[bj];
-                                const unsigned int bn_idx = (bj + 1 < nB)
-                                    ? cv.chain_bones[bj + 1] : bc_idx;
-
-                                mathcore::Vec3 bp_cur = { 0.0, 0.0, 0.0 };
-                                mathcore::Vec3 bc_cur = { 0.0, 0.0, 0.0 };
-                                mathcore::Vec3 bn_cur = { 0.0, 0.0, 0.0 };
-                                if (bp_idx < rest.size() && bp_idx < Cs.size())
-                                    bp_cur = mathcore::apply_transform(
-                                        Cs[bp_idx], rest[bp_idx].t);
-                                if (bc_idx < rest.size() && bc_idx < Cs.size())
-                                    bc_cur = mathcore::apply_transform(
-                                        Cs[bc_idx], rest[bc_idx].t);
-                                if (bn_idx < rest.size() && bn_idx < Cs.size() &&
-                                    bn_idx != bc_idx)
-                                    bn_cur = mathcore::apply_transform(
-                                        Cs[bn_idx], rest[bn_idx].t);
-                                else
-                                    bn_cur = bc_cur;
-
-                                mathcore::Vec3 bone_axis_prev_cur =
-                                    mathcore::v3_sub(bc_cur, bp_cur);
-                                const double len_prev =
-                                    mathcore::v3_len(bone_axis_prev_cur);
-                                if (len_prev > 1e-9)
-                                    bone_axis_prev_cur = mathcore::v3_scale(
-                                        bone_axis_prev_cur, 1.0 / len_prev);
-                                else
-                                    bone_axis_prev_cur = mathcore::Vec3{ 0.0, 1.0, 0.0 };
-
-                                mathcore::Vec3 bone_axis_next_cur =
-                                    mathcore::v3_sub(bn_cur, bc_cur);
-                                const double len_next =
-                                    mathcore::v3_len(bone_axis_next_cur);
-                                if (len_next > 1e-9)
-                                    bone_axis_next_cur = mathcore::v3_scale(
-                                        bone_axis_next_cur, 1.0 / len_next);
-                                else
-                                    bone_axis_next_cur = mathcore::Vec3{ 0.0, 1.0, 0.0 };
-
-                                mathcore::Vec3 in_dir_cur = { 0.0, 0.0, 0.0 };
-                                {
-                                    mathcore::Vec3 b = mathcore::v3_sub(
-                                        bone_axis_next_cur, bone_axis_prev_cur);
-                                    if (mathcore::v3_len(b) > 1e-6)
-                                        in_dir_cur = mathcore::v3_norm(b);
-                                }
-
-                                mathcore::Vec3 radial_cur;
-                                {
-                                    bool used_manual = false;
-                                    if (P.useManualInVector) {
-                                        const mathcore::Vec3 mv = P.manualInVector;
-                                        const double mv_len = mathcore::v3_len(mv);
-                                        if (mv_len > 1e-9) {
-                                            const mathcore::Vec3 mv_n =
-                                                mathcore::v3_scale(mv, 1.0 / mv_len);
-                                            const mathcore::Vec3 mv_cur =
-                                                mathcore::q_rotate_v3(q_mix, mv_n);
-                                            const double o_len = mathcore::v3_len(pc.O);
-                                            radial_cur = mathcore::v3_scale(mv_cur, o_len);
-                                            used_manual = true;
-                                        }
-                                    }
-                                    if (!used_manual) {
-                                        radial_cur = mathcore::q_rotate_v3(q_mix, pc.O);
-                                    }
-
-                                    {
-                                        const double radial_len_orig =
-                                            mathcore::v3_len(radial_cur);
-                                        if (radial_len_orig > 1e-9) {
-                                            mathcore::Vec3 bone_axis_mix_cur =
-                                            { 0.0, 0.0, 0.0 };
-                                            double axis_w = 0.0;
-                                            for (const auto& kv : m_vtxCache.vertices[vi]) {
-                                                const unsigned int b = kv.first;
-                                                const double w = (double)kv.second;
-                                                if (b >= (unsigned int)Cs.size()) continue;
-                                                if (b >= m_boneInfo.boneDirRest.size())
-                                                    continue;
-                                                if (w <= 1e-9) continue;
-                                                const mathcore::Vec3 ba =
-                                                    mathcore::q_rotate_v3(
-                                                        Cs[b].q,
-                                                        m_boneInfo.boneDirRest[b]);
-                                                bone_axis_mix_cur = mathcore::v3_add(
-                                                    bone_axis_mix_cur,
-                                                    mathcore::v3_scale(ba, w));
-                                                axis_w += w;
-                                            }
-                                            if (axis_w > 1e-9) {
-                                                bone_axis_mix_cur = mathcore::v3_norm(
-                                                    mathcore::v3_scale(
-                                                        bone_axis_mix_cur,
-                                                        1.0 / axis_w));
-
-                                                const double axial_comp =
-                                                    mathcore::v3_dot(
-                                                        radial_cur,
-                                                        bone_axis_mix_cur);
-                                                const mathcore::Vec3 radial_perp =
-                                                    mathcore::v3_sub(
-                                                        radial_cur,
-                                                        mathcore::v3_scale(
-                                                            bone_axis_mix_cur,
-                                                            axial_comp));
-                                                const double perp_len =
-                                                    mathcore::v3_len(radial_perp);
-
-                                                if (perp_len > 1e-6) {
-                                                    radial_cur = mathcore::v3_scale(
-                                                        radial_perp,
-                                                        radial_len_orig / perp_len);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                const double in_len = mathcore::v3_len(in_dir_cur);
-                                const double pc_o_len = mathcore::v3_len(pc.O);
-                                const double radial_len = mathcore::v3_len(radial_cur);
-
-                                const double base = curve_bend_angle[c];
-
-                                if (hasInBulge || hasOutBulge || hasSideBulge) {
-                                    mathcore::Vec3 total_bulge = { 0.0, 0.0, 0.0 };
-
-                                    if (in_len > 1e-9 && pc_o_len > 1e-9) {
-                                        const double cos_side =
-                                            mathcore::v3_dot(pc.O, in_dir_cur) / pc_o_len;
-
-                                        double t_norm = (cos_side + 0.5) / 1.0;
-                                        if (t_norm < 0.0) t_norm = 0.0;
-                                        if (t_norm > 1.0) t_norm = 1.0;
-                                        const double smooth_w =
-                                            t_norm * t_norm * (3.0 - 2.0 * t_norm);
-
-                                        const double w_out = smooth_w;
-                                        const double w_in = 1.0 - smooth_w;
-
-                                        if (hasInBulge && w_in > 1e-9) {
-                                            total_bulge = mathcore::v3_add(
-                                                total_bulge,
-                                                mathcore::v3_scale(in_dir_cur,
-                                                    -P.inBulgeWeight * base * w_in));
-                                        }
-                                        if (hasOutBulge && w_out > 1e-9) {
-                                            total_bulge = mathcore::v3_add(
-                                                total_bulge,
-                                                mathcore::v3_scale(in_dir_cur,
-                                                    P.outBulgeWeight * base * w_out));
-                                        }
-
-                                        if (hasSideBulge && radial_len > 1e-9) {
-                                            mathcore::Vec3 side_normal = mathcore::v3_cross(
-                                                bone_axis_prev_cur, bone_axis_next_cur);
-                                            const double sn_len =
-                                                mathcore::v3_len(side_normal);
-                                            if (sn_len > 1e-6) {
-                                                side_normal = mathcore::v3_scale(
-                                                    side_normal, 1.0 / sn_len);
-
-                                                const double cos_side_axis =
-                                                    mathcore::v3_dot(radial_cur,
-                                                        side_normal) / radial_len;
-
-                                                const double abs_cos = std::abs(cos_side_axis);
-                                                const double w_side =
-                                                    abs_cos * abs_cos * (3.0 - 2.0 * abs_cos);
-
-                                                if (w_side > 1e-9 && abs_cos > 1e-9) {
-                                                    const mathcore::Vec3 side_dir_out =
-                                                        mathcore::v3_scale(side_normal,
-                                                            (cos_side_axis > 0.0) ? 1.0 : -1.0);
-                                                    total_bulge = mathcore::v3_add(
-                                                        total_bulge,
-                                                        mathcore::v3_scale(side_dir_out,
-                                                            P.sideBulgeWeight * base * w_side));
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    curve_mos_final = mathcore::v3_add(
-                                        curve_mos_final, total_bulge);
-                                }
-
-                                if (hasAnySlide) {
-                                    mathcore::Vec3 total_slide = { 0.0, 0.0, 0.0 };
-
-                                    if (in_len > 1e-9 && pc_o_len > 1e-9 &&
-                                        radial_len > 1e-9) {
-
-                                        const double cos_side_slide =
-                                            mathcore::v3_dot(pc.O, in_dir_cur) / pc_o_len;
-                                        double t_side_slide = (cos_side_slide + 0.5) / 1.0;
-                                        if (t_side_slide < 0.0) t_side_slide = 0.0;
-                                        if (t_side_slide > 1.0) t_side_slide = 1.0;
-                                        const double smooth_side_slide =
-                                            t_side_slide * t_side_slide * (3.0 - 2.0 * t_side_slide);
-                                        const double w_in_slide = 1.0 - smooth_side_slide;
-                                        const double w_out_slide = smooth_side_slide;
-
-                                        const double tau_dist_slide =
-                                            pc.tau - curve_tau_bend[c];
-                                        double t_prev = -tau_dist_slide / 0.25;
-                                        if (t_prev < 0.0) t_prev = 0.0;
-                                        if (t_prev > 1.0) t_prev = 1.0;
-                                        const double w_prev_slide =
-                                            t_prev * t_prev * (3.0 - 2.0 * t_prev);
-                                        double t_next = tau_dist_slide / 0.25;
-                                        if (t_next < 0.0) t_next = 0.0;
-                                        if (t_next > 1.0) t_next = 1.0;
-                                        const double w_next_slide =
-                                            t_next * t_next * (3.0 - 2.0 * t_next);
-
-                                        const mathcore::Vec3 radial_dir_slide =
-                                            mathcore::v3_scale(radial_cur, 1.0 / radial_len);
-
-                                        if (w_in_slide > 1e-9) {
-                                            if (std::abs(P.slideInWeight_prev) > 1e-9 &&
-                                                w_prev_slide > 1e-9) {
-                                                total_slide = mathcore::v3_add(
-                                                    total_slide,
-                                                    mathcore::v3_scale(bone_axis_prev_cur,
-                                                        P.slideInWeight_prev * base *
-                                                        w_in_slide * w_prev_slide));
-                                            }
-                                            if (std::abs(P.slideInWeight_next) > 1e-9 &&
-                                                w_next_slide > 1e-9) {
-                                                total_slide = mathcore::v3_add(
-                                                    total_slide,
-                                                    mathcore::v3_scale(bone_axis_next_cur,
-                                                        -P.slideInWeight_next * base *
-                                                        w_in_slide * w_next_slide));
-                                            }
-                                        }
-
-                                        if (w_out_slide > 1e-9) {
-                                            if (std::abs(P.slideOutWeight_prev) > 1e-9 &&
-                                                w_prev_slide > 1e-9) {
-                                                total_slide = mathcore::v3_add(
-                                                    total_slide,
-                                                    mathcore::v3_scale(bone_axis_prev_cur,
-                                                        -P.slideOutWeight_prev * base *
-                                                        w_out_slide * w_prev_slide));
-                                            }
-                                            if (std::abs(P.slideOutWeight_next) > 1e-9 &&
-                                                w_next_slide > 1e-9) {
-                                                total_slide = mathcore::v3_add(
-                                                    total_slide,
-                                                    mathcore::v3_scale(bone_axis_next_cur,
-                                                        P.slideOutWeight_next * base *
-                                                        w_out_slide * w_next_slide));
-                                            }
-                                        }
-
-                                        if (w_in_slide > 1e-9) {
-                                            if (std::abs(P.slideOrthoInWeight_prev) > 1e-9 &&
-                                                w_prev_slide > 1e-9) {
-                                                total_slide = mathcore::v3_add(
-                                                    total_slide,
-                                                    mathcore::v3_scale(radial_dir_slide,
-                                                        -P.slideOrthoInWeight_prev * base *
-                                                        w_in_slide * w_prev_slide));
-                                            }
-                                            if (std::abs(P.slideOrthoInWeight_next) > 1e-9 &&
-                                                w_next_slide > 1e-9) {
-                                                total_slide = mathcore::v3_add(
-                                                    total_slide,
-                                                    mathcore::v3_scale(radial_dir_slide,
-                                                        -P.slideOrthoInWeight_next * base *
-                                                        w_in_slide * w_next_slide));
-                                            }
-                                        }
-
-                                        if (w_out_slide > 1e-9) {
-                                            if (std::abs(P.slideOrthoOutWeight_prev) > 1e-9 &&
-                                                w_prev_slide > 1e-9) {
-                                                total_slide = mathcore::v3_add(
-                                                    total_slide,
-                                                    mathcore::v3_scale(radial_dir_slide,
-                                                        P.slideOrthoOutWeight_prev * base *
-                                                        w_out_slide * w_prev_slide));
-                                            }
-                                            if (std::abs(P.slideOrthoOutWeight_next) > 1e-9 &&
-                                                w_next_slide > 1e-9) {
-                                                total_slide = mathcore::v3_add(
-                                                    total_slide,
-                                                    mathcore::v3_scale(radial_dir_slide,
-                                                        P.slideOrthoOutWeight_next * base *
-                                                        w_out_slide * w_next_slide));
-                                            }
-                                        }
-
-                                        if (hasCenterSlide) {
-                                            const mathcore::Vec3 rel_v =
-                                                mathcore::v3_sub(origPos, bc_cur);
-                                            const double side_v =
-                                                mathcore::v3_dot(rel_v, in_dir_cur);
-
-                                            if (side_v > 0.0) {
-                                                total_slide = mathcore::v3_add(
-                                                    total_slide,
-                                                    mathcore::v3_scale(in_dir_cur,
-                                                        P.centerSlideInWeight * base));
-                                            }
-                                            else {
-                                                total_slide = mathcore::v3_add(
-                                                    total_slide,
-                                                    mathcore::v3_scale(in_dir_cur,
-                                                        -P.centerSlideOutWeight * base));
-                                            }
-                                        }
-                                    }
-
-                                    curve_mos_final = mathcore::v3_add(
-                                        curve_mos_final, total_slide);
-                                }
-                            }
-                        }
-                    }
-
-                    blended = mathcore::v3_add(blended,
-                        mathcore::v3_scale(curve_mos_final, pc.w_c));
-                    w_total += pc.w_c;
-                }
-
-                if (w_total > 1e-6) {
-                    const mathcore::Vec3 mos =
-                        mathcore::v3_scale(blended, 1.0 / w_total);
-                    double w = w_total * P.influenceRadius;
-                    if (w > 1.0) w = 1.0;
-
-                    // [DIAG-W-LINEAR] 关闭 pow(0.5) 非线性抬升
-                    if (diagFlags & 2) {
-                        // 保留 clamp(1)，不做 pow 抬升
+    if (params.scaleWeight > 1e-9 && params.scaleMode != 0) {
+        std::vector<Vec3> x, y, z;
+        if (readBoneLinearParts(block, worldMat, x, y, z)) {
+            for (size_t c = 0; c < poseCurves.size(); ++c) {
+                auto& controls = poseCurves[c];
+                const auto& curve = m_mosCache.curves[c];
+                for (size_t j = 0; j < controls.size(); ++j) {
+                    const auto bone = curve.cvs_bone[j];
+                    if (bone >= x.size()) continue;
+                    auto& control = controls[j];
+                    const auto scale = [&](double value) {
+                        return std::pow(std::max(1e-9, value), params.scaleWeight);
+                    };
+                    if (params.scaleMode == 1) {
+                        const auto axis = m_boneInfo.boneDirRest[bone];
+                        const auto mapped = v3_add(v3_scale(x[bone], axis.x),
+                            v3_add(v3_scale(y[bone], axis.y), v3_scale(z[bone], axis.z)));
+                        control.frame = ocd_math::mat3_axis_scale(q_rotate_v3(transforms[bone].q, axis),
+                            scale(v3_len(mapped))) * control.frame;
                     }
                     else {
-                        const double w_curve_power = 0.5;
-                        w = std::pow(w, w_curve_power);
-                    }
-
-                    def = mathcore::v3_add(
-                        mathcore::v3_scale(lbs_result, 1.0 - w),
-                        mathcore::v3_scale(mos, w));
-                }
-            }
-
-            if (is_bind_pose) {
-                const double dx = def.x - origPos.x;
-                const double dy = def.y - origPos.y;
-                const double dz = def.z - origPos.z;
-                const double d = std::sqrt(dx * dx + dy * dy + dz * dz);
-#pragma omp critical(mosbindcheck)
-                {
-                    if (d > g_bind_max_diff) {
-                        g_bind_max_diff = d;
-                        g_bind_max_idx = vi;
+                        control.frame = ocd_math::mat3_anisotropic_scale(scale(v3_len(x[bone])),
+                            scale(v3_len(y[bone])), scale(v3_len(z[bone]))) * control.frame;
                     }
                 }
             }
-
-            const mathcore::Vec3 bl = applyEnvelope(origPos, def, env);
-            MPoint out(bl.x, bl.y, bl.z);
-            out *= wInv;
-            points[vi] = out;
-        }
-
-#pragma omp critical
-        {
-            g_cvdisp_sum += l_cvdisp_sum;
-            g_cvdisp_count += l_cvdisp_count;
-            if (l_cvdisp_max > g_cvdisp_max) g_cvdisp_max = l_cvdisp_max;
         }
     }
 
-    iter.setAllPositions(points);
-
-    {
-        static std::vector<double> s_last_angles;
-        static unsigned int s_frame_count = 0;
-        bool changed = (s_last_angles.size() != (size_t)n_curves);
-        if (!changed) {
-            for (int c = 0; c < n_curves; ++c) {
-                if (std::abs(s_last_angles[c] - curve_bend_angle[c]) > 0.005) {
-                    changed = true;
-                    break;
-                }
+    const mos_math::Secondary incoming{params.inBulgeWeight, params.outBulgeWeight, params.sideBulgeWeight,
+        params.slideInWeight_prev, params.slideOutWeight_prev, params.slideOrthoInWeight_prev,
+        params.slideOrthoOutWeight_prev, params.centerSlideInWeight, params.centerSlideOutWeight};
+    const mos_math::Secondary outgoing{params.inBulgeWeight, params.outBulgeWeight, params.sideBulgeWeight,
+        params.slideInWeight_next, params.slideOutWeight_next, params.slideOrthoInWeight_next,
+        params.slideOrthoOutWeight_next, params.centerSlideInWeight, params.centerSlideOutWeight};
+    const double envelope = readEnvelopeFromNode();
+    const auto worldInverse = worldMat.inverse();
+    const auto deformPoint = [&](const MPoint& point, unsigned int vertex) {
+        if (vertex >= m_mosCache.verts.size() || vertex >= m_vtxCache.vertices.size()) return point;
+        const auto& weights = m_vtxCache.vertices[vertex];
+        if (weights.empty()) return point;
+        const MPoint world = point * worldMat;
+        const Vec3 original{world.x, world.y, world.z};
+        Vec3 sampled{};
+        double coverage = 0.0;
+        const auto& bind = m_mosCache.verts[vertex].per_curve;
+        for (size_t c = 0; c < bind.size(); ++c) {
+            const auto& attachment = bind[c];
+            if (attachment.w_c <= 0.0) continue;
+            Vec3 value{};
+            for (int k = 0; k < attachment.basis.count; ++k) {
+                const auto& control = poseCurves[c][attachment.basis.first + k];
+                const auto sample = mos_math::sampleControl(control.center, control.frame, attachment.O,
+                    control.bend, control.bend.incoming ? incoming : outgoing);
+                value = v3_add(value, v3_scale(sample, attachment.basis.weights[k]));
             }
+            sampled = v3_add(sampled, v3_scale(value, attachment.w_c));
+            coverage += attachment.w_c;
         }
-        const bool periodic = (s_frame_count++ % 60 == 0);
-        if ((changed || periodic) && (optSkinDebugLog() || P.debugLog)) {
-            char buf[256];
-            for (int c = 0; c < n_curves; ++c) {
-                snprintf(buf, sizeof(buf),
-                    "[MOS] curve[%d]: bend_idx=%d tau_bend=%.4f angle=%.3f",
-                    c, curve_bend_idx[c],
-                    curve_tau_bend[c], curve_bend_angle[c]);
-                MGlobal::displayInfo(MString(buf));
+        const double mix = std::clamp(coverage * params.influenceRadius, 0.0, 1.0);
+        Vec3 result = coverage > 0.0 ? v3_scale(sampled, mix / coverage) : Vec3{};
+        if (mix < 1.0) {
+            Vec3 fallback{};
+            double total = 0.0;
+            for (const auto& weight : weights) {
+                if (weight.first >= transforms.size()) continue;
+                fallback = v3_add(fallback, v3_scale(apply_transform(transforms[weight.first], original),
+                    weight.second));
+                total += weight.second;
             }
-            s_last_angles.resize(n_curves);
-            for (int c = 0; c < n_curves; ++c) s_last_angles[c] = curve_bend_angle[c];
+            result = v3_add(result, v3_scale(total > 0.0 ? v3_scale(fallback, 1.0 / total) : original,
+                1.0 - mix));
         }
-    }
+        result = applyEnvelope(original, result, envelope);
+        return MPoint(result.x, result.y, result.z) * worldInverse;
+    };
 
-    if (is_bind_pose && (optSkinDebugLog() || P.debugLog)) {
-        char buf[320];
-        const char* verdict = (g_bind_max_diff < 1e-9) ? "PASS"
-            : (g_bind_max_diff < 1e-6) ? "WARN"
-            : "FAIL";
-        snprintf(buf, sizeof(buf),
-            "[MOS] bind-exact: %s  maxDiff=%.3e at vtx %d  (threshold 1e-9)",
-            verdict, g_bind_max_diff, g_bind_max_idx);
-        MGlobal::displayInfo(MString(buf));
-    }
-
-    {
-        static double s_last_max_angle = -1.0;
-        static unsigned int s_frame_count2 = 0;
-        double max_angle = 0.0;
-        for (int c = 0; c < n_curves; ++c)
-            if (curve_bend_angle[c] > max_angle) max_angle = curve_bend_angle[c];
-        const bool changed = (std::abs(s_last_max_angle - max_angle) > 0.005);
-        const bool periodic = (s_frame_count2++ % 120 == 0);
-
-        if ((changed || periodic) && (optSkinDebugLog() || P.debugLog)) {
-            char buf[320];
-            snprintf(buf, sizeof(buf),
-                "[MOS] deform: nV=%u curves=%d mode=%d  cvDisp: count=%d avg=%.5f max=%.5f (Bw=%.2f, IBw=%.2f, SBw=%.2f, IR=%.2f)",
-                nV, n_curves, P.curveMode,
-                g_cvdisp_count, g_cvdisp_sum / std::max(1, g_cvdisp_count), g_cvdisp_max,
-                P.inBulgeWeight, P.outBulgeWeight, P.sideBulgeWeight,
-                P.influenceRadius);
-            MGlobal::displayInfo(MString(buf));
-
-            if (is_bind_pose) {
-                const char* verdict = (g_bind_max_diff < 1e-9) ? "PASS"
-                    : (g_bind_max_diff < 1e-6) ? "WARN"
-                    : "FAIL";
-                snprintf(buf, sizeof(buf),
-                    "[MOS] bind-exact: %s  maxDiff=%.3e at vtx %d  (threshold 1e-9)",
-                    verdict, g_bind_max_diff, g_bind_max_idx);
-                MGlobal::displayInfo(MString(buf));
-            }
-
-            s_last_max_angle = max_angle;
-        }
-    }
-
-    return MS::kSuccess;
+    MPointArray points;
+    MStatus status = iter.allPositions(points);
+    if (!status) return status;
+    std::vector<unsigned int> vertexIndices;
+    vertexIndices.reserve(points.length());
+    for (; !iter.isDone(); iter.next()) vertexIndices.push_back(iter.index());
+    if (vertexIndices.size() != points.length()) return MS::kFailure;
+#pragma omp parallel for schedule(static)
+    for (int row = 0; row < static_cast<int>(points.length()); ++row)
+        points[row] = deformPoint(points[row], vertexIndices[row]);
+    status = iter.reset();
+    if (!status) return status;
+    return iter.setAllPositions(points);
 }
 
 // ================================================================
@@ -3714,7 +3053,7 @@ MStatus OptimizedSkinCluster::deformCoRMosSecondary(
     }
 
     // ---- C. MOS cache 构建 ----
-    if (!m_mosCache.valid || m_mosCache.numVertices != nV ||
+    if (!m_mosCache.valid || m_mosCache.direct || m_mosCache.numVertices != nV ||
         !m_mosCache.params.nearlyEqual(P)) {
         if (!computeMosCache(block, nV, P))
             return deformCoR(block, iter, worldMat, 0);   // MOS cache 失败退纯 CoR
