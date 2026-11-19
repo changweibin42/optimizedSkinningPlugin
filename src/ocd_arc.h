@@ -183,8 +183,6 @@ inline bool sample(const Pose& pose, const Bind& bind, const mos_math::Secondary
 struct LocalRegion {
     Pose anchorPose{};
     Pose coveragePose{};
-    double startBefore = 0.0;
-    double startAfter = 0.0;
     double endBefore = 0.0;
     double endAfter = 0.0;
     double radius = 0.0;
@@ -194,9 +192,9 @@ inline LocalRegion localRegion(const Pose& pose, double radius) {
     if (radius <= 1e-8) return {};
     LocalRegion region{pose, pose};
     region.radius = radius;
-    const double deep = deepFalloff(pose.angle);
-    const double clearance = 1.14 * std::min(std::tan(0.5 * pose.angle), 4.0) + 1.0;
-    const double wanted = radius * (2.35 + 0.50 * deep * std::max(0.0, clearance - 2.35));
+    // Use the right-angle tangent anchors for both the curve solve and
+    // the blend. A deeper miter must fit between the same anchors.
+    const double wanted = 2.35 * radius;
     region.anchorPose.before = std::min(wanted, 0.80 * pose.before);
     region.anchorPose.after = std::min(wanted, 0.80 * pose.after);
     // Geometry uses the live angle. Coverage uses the same bind footprint
@@ -207,10 +205,8 @@ inline LocalRegion localRegion(const Pose& pose, double radius) {
         region.coveragePose = buildPose(pose.pivot, pose.bindAxis, pose.parent,
             q_mul(unwind, pose.child), pose.before, pose.after, pose.pivotDelta);
     }
-    region.startBefore = std::min(2.35 * radius, 0.80 * pose.before);
-    region.startAfter = std::min(2.35 * radius, 0.80 * pose.after);
-    region.endBefore = std::min(0.96 * pose.before, region.startBefore + 1.25 * radius);
-    region.endAfter = std::min(0.96 * pose.after, region.startAfter + 1.25 * radius);
+    region.endBefore = std::min(0.96 * pose.before, region.anchorPose.before + 1.25 * radius);
+    region.endAfter = std::min(0.96 * pose.after, region.anchorPose.after + 1.25 * radius);
     return region;
 }
 
@@ -218,7 +214,7 @@ inline mos_math::GuideSample sampleLocal(const Pose& pose, const LocalRegion& re
     const Bind& bind, const mos_math::Secondary& before, const mos_math::Secondary& after,
     const Vec3& manualIn) {
     const double axial = bind.fraction * (pose.before + pose.after) - pose.before;
-    const double start = axial < 0.0 ? region.startBefore : region.startAfter;
+    const double start = axial < 0.0 ? region.anchorPose.before : region.anchorPose.after;
     const double end = axial < 0.0 ? region.endBefore : region.endAfter;
     const double distance = std::abs(axial);
     const double span = axial < 0.0 ? pose.before : pose.after;

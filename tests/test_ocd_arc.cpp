@@ -209,7 +209,7 @@ void checkDeepArcSpacing(double bendDegrees, double span) {
     const auto rotation = q_axis_angle({0, 0, 1}, bendDegrees * pi / 180.0);
     const auto pose = buildPose({}, xAxis, identity, rotation, span, span);
     const auto region = localRegion(pose, 1.0);
-    const double anchor = region.startBefore;
+    const double anchor = region.anchorPose.before;
     const double step = anchor / 200.0;
     for (int side = 0; side < 24; ++side) {
         const double azimuth = 2.0 * pi * side / 24.0;
@@ -230,21 +230,6 @@ void checkDeepArcSpacing(double bendDegrees, double span) {
     }
 }
 
-void checkInnerElbowThickness(double degrees) {
-    const double angle = degrees * pi / 180.0;
-    constexpr double span = 6.0;
-    const auto rotation = q_axis_angle({0, 0, 1}, angle);
-    const auto pose = buildPose({}, xAxis, identity, rotation, span, span);
-    const auto region = localRegion(pose, 1.0);
-    const auto bind = bindVertex({0, 1, 0}, {}, xAxis, span, span);
-    const auto elbow = sampleLocal(pose, region, bind, {}, {}, {});
-    const double c = std::cos(0.5 * angle), s = std::sin(0.5 * angle);
-    const Vec3 bisector{-s, c, 0};
-    const double projectedThickness = c * v3_dot(elbow.position, bisector);
-    require(elbow.coverage > 0.999 && projectedThickness > 0.73 && projectedThickness < 1.20,
-        "the capped inner elbow must keep a rounded groove");
-}
-
 void checkHeldCoverage(double bendDegrees, double twistDegrees) {
     const auto twist = q_axis_angle(xAxis, twistDegrees * pi / 180.0);
     const auto poseAt = [&](double degrees) {
@@ -253,6 +238,9 @@ void checkHeldCoverage(double bendDegrees, double twistDegrees) {
     };
     const auto reference = poseAt(90.0), bent = poseAt(bendDegrees);
     const auto baseRegion = localRegion(reference, 1.0), bentRegion = localRegion(bent, 1.0);
+    require(baseRegion.anchorPose.before == bentRegion.anchorPose.before &&
+        baseRegion.anchorPose.after == bentRegion.anchorPose.after,
+        "the solved curve must keep its right-angle tangent anchors in bind space");
     for (double side : {-1.0, 1.0}) {
         for (int ring = 0; ring < 80; ++ring) {
             for (double oppositeWeight : {0.0, 0.005, 0.25}) {
@@ -263,6 +251,12 @@ void checkHeldCoverage(double bendDegrees, double twistDegrees) {
                 const auto deep = sampleLocal(bent, bentRegion, bind, {}, {}, {});
                 require(std::abs(base.coverage - deep.coverage) < 1e-10,
                     "the right-angle compensation coverage must neither grow nor fade");
+                const double anchor = side < 0.0 ? baseRegion.anchorPose.before : baseRegion.anchorPose.after;
+                if (oppositeWeight == 0.0 && std::abs(x) >= anchor && deep.coverage > 0.0) {
+                    const Vec3 rigid = q_rotate_v3(side < 0.0 ? bent.parent : bent.child, {x, 0.6, 0.8});
+                    require(v3_len(v3_sub(deep.position, rigid)) < 1e-10,
+                        "the curve must not spread into either straight rigid limb");
+                }
             }
         }
     }
@@ -314,8 +308,6 @@ int main() {
             for (const double halfWidth : {2.5, 5.0})
                 checkLimbSpacingAtHandoff(bend, twist, halfWidth);
     checkDeepRelief();
-    for (double angle : {140.0, 146.0})
-        checkInnerElbowThickness(angle);
     for (const double bend : {140.0, 155.0, 165.0, 175.0})
         for (const double span : {2.0, 4.0})
             checkDeepArcSpacing(bend, span);
