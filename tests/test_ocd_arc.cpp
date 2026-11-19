@@ -229,6 +229,33 @@ void checkDeepArcSpacing(double bendDegrees, double span) {
     }
 }
 
+void checkInnerFoldOpening(double degrees) {
+    const double angle = degrees * pi / 180.0;
+    constexpr double span = 6.0;
+    const auto rotation = q_axis_angle({0, 0, 1}, angle);
+    const auto pose = buildPose({}, xAxis, identity, rotation, span, span);
+    const auto region = localRegion(pose, 1.0);
+    const double c = std::cos(0.5 * angle), s = std::sin(0.5 * angle);
+    const Vec3 across{c, s, 0}, along{-s, c, 0};
+    int measured = 0;
+    for (int i = 0; i <= 500; ++i) {
+        const double axial = region.anchorPose.before * i / 500.0;
+        const auto edge = [&](double x) {
+            const auto bind = bindVertex({x, 1, 0}, {}, xAxis, span, span);
+            const auto arc = sampleLocal(pose, region, bind, {}, {}, {});
+            require(arc.coverage > 0.999, "fold profile must use the local arc");
+            return arc.position;
+        };
+        const auto first = edge(-axial), second = edge(axial);
+        const double depth = 0.5 * v3_dot(v3_add(first, second), along);
+        if (depth * c > 1.0) continue; // The two rigid inner tangents have separated.
+        ++measured;
+        require(v3_dot(v3_sub(second, first), across) < 0.04,
+            "the inner branches must not reopen into a pocket in the fold");
+    }
+    require(measured > 100, "measure a span of the inner contour on both limbs");
+}
+
 void checkTwist() {
     const auto twist = q_axis_angle(xAxis, 120.0 * pi / 180.0);
     const auto pose = buildPose({}, xAxis, identity, twist, 4, 4);
@@ -275,6 +302,8 @@ int main() {
             for (const double halfWidth : {2.5, 5.0})
                 checkLimbSpacingAtHandoff(bend, twist, halfWidth);
     checkDeepRelief();
+    for (double angle : {140.0, 146.0, 155.0, 165.0})
+        checkInnerFoldOpening(angle);
     for (const double bend : {140.0, 155.0, 165.0, 175.0})
         for (const double span : {2.0, 4.0})
             checkDeepArcSpacing(bend, span);

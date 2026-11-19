@@ -143,6 +143,7 @@ inline bool sample(const Pose& pose, const Bind& bind, const mos_math::Secondary
         const double narrowed = offset * (1.0 - (0.42 + 0.08 * deepFit) * innerRelief * facing);
         const double fit = tangentBudget - fillet;
         offset = std::min(narrowed, std::max(0.0, fit));
+        fillet *= 1.0 - 0.94 * deep * facing;
     }
     else if (offset < 0.0 && bindRadius > 1e-8) {
         const double facing = smoothUnit(-offset / (0.5 * bindRadius));
@@ -179,6 +180,27 @@ inline bool sample(const Pose& pose, const Bind& bind, const mos_math::Secondary
         result = v3_add(pose.pivot, v3_add(v3_scale(pose.normal, height),
             v3_add(v3_scale(outwardNormal, offset + relief * restore),
                 v3_scale(pose.outgoing, removed + distance - firstLength - arcLength))));
+    }
+    if (anchored && deep > 0.0 && originalOffset > 0.0 && bindRadius > 1e-8) {
+        // At a tight fold the two rigid inner tangents already overlap.
+        // Measure the opening across their bisector at this arc station.
+        const double halfSin = std::sin(0.5 * pose.angle);
+        const double halfCos = std::cos(0.5 * pose.angle);
+        const auto across = v3_add(v3_scale(pose.incoming, halfCos), v3_scale(pose.inward, halfSin));
+        const auto along = v3_add(v3_scale(pose.incoming, -halfSin), v3_scale(pose.inward, halfCos));
+        const auto relative = v3_sub(result, pose.pivot);
+        const double depth = v3_dot(relative, along);
+        const double lateral = v3_dot(relative, across);
+        const double rigidGap = (depth * halfCos - originalOffset) / halfSin;
+        const double crease = 0.01 * bindRadius;
+        const double gap = 0.5 * (rigidGap + std::hypot(rigidGap, crease));
+        const double branch = distance < firstLength + 0.5 * arcLength ? -1.0 : 1.0;
+        const double excess = std::max(0.0, branch * lateral - gap);
+        const double rounding = -crease * std::expm1(-excess / crease);
+        const double facing = smoothUnit(originalOffset / (0.5 * bindRadius));
+        const double anchorFade = smoothUnit((1.0 - normalized) / 0.20);
+        result = v3_sub(result, v3_scale(across,
+            branch * (excess - rounding) * deep * facing * anchorFade));
     }
     return true;
 }
