@@ -76,6 +76,7 @@ public:
     // ---- MOS 可调参数 ----
     static MObject aMosInfluenceRadius;
     static MObject aMosCurveMode;
+    static MObject aMosShapeGuide;
     static MObject aMosEndLock;
     static MObject aMosCurveSamples;
     static MObject aMosDebugLog;
@@ -316,6 +317,7 @@ private:
     struct MosCache {
         bool valid = false;
         bool direct = false;
+        bool shapeGuide = false;
         unsigned int geometryIndex = 0;
         MMatrix bindSpace;
         unsigned int numVertices = 0;

@@ -76,6 +76,7 @@ MObject OptimizedSkinCluster::aDisplayCoR;
 
 MObject OptimizedSkinCluster::aMosInfluenceRadius;
 MObject OptimizedSkinCluster::aMosCurveMode;
+MObject OptimizedSkinCluster::aMosShapeGuide;
 MObject OptimizedSkinCluster::aMosEndLock;
 MObject OptimizedSkinCluster::aMosCurveSamples;
 MObject OptimizedSkinCluster::aMosDebugLog;
@@ -415,6 +416,15 @@ MStatus OptimizedSkinCluster::initialize() {
     eAttr.setNiceNameOverride("MOS Curve Mode");
     addAttribute(aMosCurveMode);
     attributeAffects(aMosCurveMode, MPxSkinCluster::outputGeom);
+
+    aMosShapeGuide = nAttr.create("mosShapeGuide", "mosSg", MFnNumericData::kBoolean, true, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    nAttr.setKeyable(false);
+    nAttr.setChannelBox(true);
+    nAttr.setStorable(true);
+    nAttr.setNiceNameOverride("MOS Two-Bone Shape Guide");
+    CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aMosShapeGuide));
+    CHECK_MSTATUS_AND_RETURN_IT(attributeAffects(aMosShapeGuide, MPxSkinCluster::outputGeom));
 
     aMosEndLock = nAttr.create("mosEndLock", "mosEl",
         MFnNumericData::kBoolean, 1, &status);
@@ -2277,6 +2287,7 @@ bool OptimizedSkinCluster::computeMosCache(
     MDataBlock& block, unsigned int numVertices,
     const MosParams& params, const MMatrix* bindSpace, unsigned int geometryIndex) {
     const bool direct = bindSpace != nullptr;
+    const bool shapeGuide = direct && block.inputValue(aMosShapeGuide).asBool();
     m_mosCache.valid = false;
 
     // [DIAG] 读诊断开关（wc_unity 影响 bind 时 w_c）
@@ -2468,7 +2479,8 @@ bool OptimizedSkinCluster::computeMosCache(
         return true;
         };
 
-    if (params.curveMode == 0) {
+    const bool sharedGuide = shapeGuide && n_bones == 2;
+    if (params.curveMode == 0 || sharedGuide) {
         MosCurve c;
         const int segmentCount = direct ? n_bones : n_bones - 1;
         const double u_den = segmentCount;
@@ -2623,7 +2635,7 @@ bool OptimizedSkinCluster::computeMosCache(
             const double L_bone = m_mosCache.avg_bone_length;
             double w_c = 0.0;
 
-            if (direct && params.curveMode == 0) {
+            if (direct && (params.curveMode == 0 || sharedGuide)) {
                 if (vi < static_cast<int>(m_vtxCache.vertices.size())) {
                     double total = 0.0;
                     for (const auto& weight : m_vtxCache.vertices[vi]) {
@@ -2678,6 +2690,7 @@ bool OptimizedSkinCluster::computeMosCache(
 
     m_mosCache.numVertices = numVertices;
     m_mosCache.direct = direct;
+    m_mosCache.shapeGuide = shapeGuide;
     m_mosCache.geometryIndex = geometryIndex;
     if (direct) m_mosCache.bindSpace = *bindSpace;
     m_mosCache.valid = true;
@@ -2711,8 +2724,10 @@ MStatus OptimizedSkinCluster::deformMOS(
     using namespace mathcore;
     const unsigned int count = iter.count();
     const MosParams params = readMosParams(block);
+    const bool shapeGuide = block.inputValue(aMosShapeGuide).asBool();
     const bool debug = optSkinDebugLog() || params.debugLog;
-    if (!m_mosCache.valid || !m_mosCache.direct || m_mosCache.geometryIndex != multiIndex ||
+    if (!m_mosCache.valid || !m_mosCache.direct || m_mosCache.shapeGuide != shapeGuide ||
+        m_mosCache.geometryIndex != multiIndex ||
         !m_mosCache.bindSpace.isEquivalent(worldMat, 1e-12) || m_mosCache.numVertices != count ||
         m_mosCache.params.curveMode != params.curveMode ||
         m_mosCache.params.curveSamples != params.curveSamples) {
@@ -2733,6 +2748,21 @@ MStatus OptimizedSkinCluster::deformMOS(
     };
     std::vector<std::vector<PoseControl>> poseCurves(m_mosCache.curves.size());
     const auto& pivots = m_boneInfo.jointPosRest;
+    cor_contour::BendFrame guideFrame;
+    unsigned int guideParent = 0, guideChild = 0;
+    double guideLength = 0.0;
+    if (shapeGuide && params.scaleWeight <= 1e-9 && m_mosCache.curves.size() == 1) {
+        const auto& chain = m_mosCache.curves.front().chain_bones;
+        if (chain.size() == 2) {
+            guideParent = chain[0];
+            guideChild = chain[1];
+            guideLength = v3_len(v3_sub(pivots[guideChild], pivots[guideParent]));
+            guideFrame = cor_contour::buildFrame(pivots[guideParent], pivots[guideChild],
+                apply_transform(transforms[guideChild], pivots[guideChild]),
+                transforms[guideParent].q, transforms[guideChild].q);
+        }
+    }
+    const Vec3 guideManualIn = params.useManualInVector ? params.manualInVector : Vec3{};
     const bool secondary = params.inBulgeWeight != 0.0 || params.outBulgeWeight != 0.0 ||
         params.sideBulgeWeight != 0.0 || params.slideInWeight_prev != 0.0 ||
         params.slideInWeight_next != 0.0 || params.slideOutWeight_prev != 0.0 ||
@@ -2845,6 +2875,16 @@ MStatus OptimizedSkinCluster::deformMOS(
         Vec3 sampled{};
         double coverage = 0.0;
         const auto& bind = m_mosCache.verts[vertex].per_curve;
+        mos_math::GuideSample guide;
+        if (guideFrame.activation > 0.0 && !bind.empty() && bind.front().w_c >= 1.0 - 1e-8) {
+            guide = mos_math::sampleTwoBoneGuide(guideFrame, original,
+                transforms[guideParent].q, transforms[guideChild].q, guideLength,
+                incoming, outgoing, guideManualIn);
+        }
+        if (guide.coverage == 1.0 && params.influenceRadius >= 1.0) {
+            const auto result = applyEnvelope(original, guide.position, envelope);
+            return MPoint(result.x, result.y, result.z) * worldInverse;
+        }
         for (size_t c = 0; c < bind.size(); ++c) {
             const auto& attachment = bind[c];
             if (attachment.w_c <= 0.0) continue;
@@ -2857,6 +2897,10 @@ MStatus OptimizedSkinCluster::deformMOS(
             }
             sampled = v3_add(sampled, v3_scale(value, attachment.w_c));
             coverage += attachment.w_c;
+        }
+        if (guide.coverage > 0.0) {
+            sampled = v3_add(v3_scale(sampled, 1.0 - guide.coverage),
+                v3_scale(guide.position, coverage * guide.coverage));
         }
         const double mix = std::clamp(coverage * params.influenceRadius, 0.0, 1.0);
         Vec3 result = coverage > 0.0 ? v3_scale(sampled, mix / coverage) : Vec3{};

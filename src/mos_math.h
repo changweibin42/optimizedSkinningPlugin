@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ocd_math.h"
+#include "cor_contour.h"
 
 #include <algorithm>
 #include <array>
@@ -104,6 +105,43 @@ inline Vec3 sampleControl(const Vec3& center, const ocd_math::Mat3& frame, const
         settings.centerOuter * outer * outer);
     return v3_add(base, v3_add(v3_scale(direction, radialScale * radius + ortho),
         v3_add(v3_scale(bend.axis, slide), v3_scale(bend.inward, centerSlide))));
+}
+
+struct GuideSample {
+    Vec3 position{};
+    double coverage = 0.0;
+};
+
+inline GuideSample sampleTwoBoneGuide(const cor_contour::BendFrame& bend,
+    const Vec3& rest, const Quat& parentRotation, const Quat& childRotation,
+    double segmentLength, const Secondary& before, const Secondary& after,
+    const Vec3& manualIn) {
+    if (bend.activation == 0.0 || segmentLength <= 0.0) return {};
+    const double along = v3_dot(v3_sub(rest, bend.bindPivot), bend.bindAxis);
+    const double mix = std::clamp(0.5 + 0.5 * along / segmentLength, 0.0, 1.0);
+    const double sign = q_dot(parentRotation, childRotation) < 0.0 ? -1.0 : 1.0;
+    const auto rotation = q_normalize(q_add(q_scale(parentRotation, 1.0 - mix),
+        q_scale(childRotation, sign * mix)));
+    const auto guide = cor_contour::sampleSurface(bend, rest, rotation, true);
+    if (guide.influence == 0.0) return {};
+
+    auto inward = guide.inward;
+    auto normal = bend.bendNormal;
+    const auto manual = q_rotate_v3(rotation, manualIn);
+    const auto projected = v3_norm(v3_sub(manual, v3_scale(guide.tangent, v3_dot(manual, guide.tangent))));
+    if (v3_len(projected) > 0.0) {
+        inward = projected;
+        normal = v3_cross(guide.tangent, inward);
+    }
+    const double distance = std::min(1.0, std::abs(along) / (0.85 * segmentLength));
+    const double localFalloff = 1.0 - distance * distance * (3.0 - 2.0 * distance);
+    const double response = localFalloff * bend.angle / 3.14159265358979323846;
+    BendControl control{guide.tangent, inward, normal, response, segmentLength, true};
+    const auto identity = ocd_math::Mat3::identity();
+    const auto incoming = sampleControl(guide.center, identity, guide.radial, control, before);
+    control.incoming = false;
+    const auto outgoing = sampleControl(guide.center, identity, guide.radial, control, after);
+    return {v3_add(v3_scale(incoming, 1.0 - guide.phase), v3_scale(outgoing, guide.phase)), guide.influence};
 }
 
 } // namespace mos_math

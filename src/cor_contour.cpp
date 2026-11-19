@@ -45,9 +45,9 @@ BendFrame buildFrame(const Vec3& bindParent, const Vec3& bindPivot, const Vec3& 
     return frame;
 }
 
-Vec3 correction(const BendFrame& frame, const Vec3& rest, const Vec3& posed,
-    const Quat& vertexRotation, double overlap, double innerStrength, double outerStrength, bool isolatedBend) {
-    if (frame.activation == 0.0 || overlap <= 0.0) return {};
+SurfaceSample sampleSurface(const BendFrame& frame, const Vec3& rest,
+    const Quat& sectionRotation, bool isolatedBend) {
+    if (frame.activation == 0.0) return {};
 
     const auto offset = v3_sub(rest, frame.bindPivot);
     const double along = v3_dot(offset, frame.bindAxis);
@@ -64,8 +64,8 @@ Vec3 correction(const BendFrame& frame, const Vec3& rest, const Vec3& posed,
     // The sweep radius exceeds the rest radius to keep inside rings ordered.
     const double sweepRadius = sweepRadiusRatio * radius;
     const double halfSpan = sweepRadius * std::tan(frame.angle * 0.5);
-    const auto posedAxis = q_rotate_v3(vertexRotation, frame.bindAxis);
-    const auto posedSection = q_rotate_v3(vertexRotation, radial);
+    const auto posedAxis = q_rotate_v3(sectionRotation, frame.bindAxis);
+    const auto posedSection = q_rotate_v3(sectionRotation, radial);
     // Use one axial parameter for the full cross section. Different
     // inside/outside parameters shear rings even on the straight branches.
     const double spreadSpan = std::min(6.0 * halfSpan, endSupport * radius);
@@ -84,12 +84,10 @@ Vec3 correction(const BendFrame& frame, const Vec3& rest, const Vec3& posed,
     if (sample > halfSpan)
         center = v3_add(center, v3_scale(frame.outgoing, sample - halfSpan));
 
-    // Carry CoR's twist across while aligning the section with the sweep tangent.
+    // Carry the section's twist across while aligning the section with the sweep tangent.
     const auto align = q_between(posedAxis, tangent);
     const auto section = q_rotate_v3(align, posedSection);
     const double across = v3_dot(section, inward) / radius;
-    const double side = smoothStep(-1.0, 1.0, across);
-    const double strength = std::clamp(outerStrength * (1.0 - side) + innerStrength * side, 0.0, 1.0);
 
     // Bound the outer ring by the offsets of the two straight sides. A
     // smooth maximum rounds their intersection without pushing either side out.
@@ -102,12 +100,23 @@ Vec3 correction(const BendFrame& frame, const Vec3& rest, const Vec3& posed,
     const double outer = smoothStep(0.0, 1.0, -across);
     const double depth = std::max(0.0, -across * radius);
     const double expansion = outer * (sweepRadius + depth) * (1.0 / limitingCosine - 1.0);
-    const auto target = v3_add(center, v3_sub(section, v3_scale(inward, expansion)));
+    const auto shapedRadial = v3_sub(section, v3_scale(inward, expansion));
     const double fade = std::clamp((distance - fullSupport) / (endSupport - fullSupport), 0.0, 1.0);
     const double axialMask = (1.0 - fade) * (1.0 - fade) * (1.0 - fade) *
         (1.0 + 3.0 * fade + 6.0 * fade * fade);
+    return {center, shapedRadial, tangent, inward, across, frame.activation * axialMask, t};
+}
+
+Vec3 correction(const BendFrame& frame, const Vec3& rest, const Vec3& posed,
+    const Quat& vertexRotation, double overlap, double innerStrength, double outerStrength, bool isolatedBend) {
+    if (overlap <= 0.0) return {};
+    const auto sample = sampleSurface(frame, rest, vertexRotation, isolatedBend);
+    if (sample.influence == 0.0) return {};
+    const auto target = v3_add(sample.center, sample.radial);
+    const double side = smoothStep(-1.0, 1.0, sample.across);
+    const double strength = std::clamp(outerStrength * (1.0 - side) + innerStrength * side, 0.0, 1.0);
     const double weightMask = smoothStep(0.0, 0.12, overlap);
-    return v3_scale(v3_sub(target, posed), frame.activation * strength * axialMask * weightMask);
+    return v3_scale(v3_sub(target, posed), sample.influence * strength * weightMask);
 }
 
 } // namespace cor_contour
