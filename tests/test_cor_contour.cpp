@@ -138,6 +138,12 @@ void checkTube(double transitionWidth, double angle) {
     std::cout << "Tube angle=" << angle * 180.0 / pi << " weight half-width="
         << transitionWidth << " minimum axial spacing=" << minimum << '\n';
     require(minimum > 0.0, "adjacent rings must advance along the bend");
+    if (angle == pi / 2) {
+        const int middle = (rings / 2) * sides;
+        const double innerSpacing = v3_len(v3_sub(posed[middle + sides], posed[middle]));
+        require(innerSpacing > 0.019, "inside the corner: spread the center rings");
+        require(minimum > 0.014, "inside the corner: avoid creating a second cluster");
+    }
     for (const auto& triangle : triangles) {
         const auto a = triangle[0], b = triangle[1], c = triangle[2];
         const auto restCenter = v3_scale(v3_add(rest[a], v3_add(rest[b], rest[c])), 1.0 / 3.0);
@@ -162,6 +168,13 @@ void checkNoBend() {
 int main() {
     checkBend();
     checkNoBend();
+    for (const double angle : {105.0, 120.0, 130.0}) {
+        const auto child = q_axis_angle({0, 0, 1}, angle * pi / 180.0);
+        require(buildFrame(parent, pivot, pivot, identity, child).activation == 1.0,
+            "deep bend must keep full contour strength");
+        checkTube(1.5, angle * pi / 180.0);
+        checkTube(3.7, angle * pi / 180.0);
+    }
     for (const double width : {0.75, 1.5, 2.5, 3.7}) {
         checkTube(width, pi / 4);
         checkTube(width, pi / 2);

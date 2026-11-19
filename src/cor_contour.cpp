@@ -30,7 +30,7 @@ BendFrame buildFrame(const Vec3& bindParent, const Vec3& bindPivot, const Vec3& 
     constexpr double degrees = 3.14159265358979323846 / 180.0;
     frame.angle = std::atan2(sine, v3_dot(frame.incoming, frame.outgoing));
     frame.activation = smoothStep(0.0, 60.0 * degrees, frame.angle) *
-        (1.0 - smoothStep(100.0 * degrees, 145.0 * degrees, frame.angle));
+        (1.0 - smoothStep(130.0 * degrees, 162.0 * degrees, frame.angle));
     frame.bendNormal = v3_scale(normal, 1.0 / sine);
     frame.incomingNormal = v3_cross(frame.bendNormal, frame.incoming);
     return frame;
@@ -55,7 +55,16 @@ Vec3 correction(const BendFrame& frame, const Vec3& rest, const Vec3& posed,
     // The sweep radius exceeds the rest radius to keep inside rings ordered.
     const double sweepRadius = sweepRadiusRatio * radius;
     const double halfSpan = sweepRadius * std::tan(frame.angle * 0.5);
-    const double t = std::clamp(0.5 + 0.5 * along / halfSpan, 0.0, 1.0);
+    const auto posedAxis = q_rotate_v3(vertexRotation, frame.bindAxis);
+    const auto posedSection = q_rotate_v3(vertexRotation, radial);
+    const auto posedInward = v3_norm(v3_cross(frame.bendNormal, posedAxis));
+    const double inner = smoothStep(0.15, 1.0, v3_dot(posedSection, posedInward) / radius);
+    // Reparameterize the same inside contour. The mapping is monotone and
+    // joins the original spacing with unit slope at the edge of its support.
+    const double spreadSpan = std::min(2.8 * halfSpan, fullSupport * radius);
+    const double spread = std::max(0.0, 1.0 - std::abs(along) / spreadSpan);
+    const double sample = along * (1.0 + 1.5 * inner * spread * spread);
+    const double t = std::clamp(0.5 + 0.5 * sample / halfSpan, 0.0, 1.0);
     const double phase = t * frame.angle;
     const double sine = std::sin(phase);
     const double cosine = std::cos(phase);
@@ -64,15 +73,14 @@ Vec3 correction(const BendFrame& frame, const Vec3& rest, const Vec3& posed,
     auto center = v3_add(frame.posePivot,
         v3_add(v3_scale(frame.incoming, sweepRadius * sine - halfSpan),
             v3_scale(frame.incomingNormal, sweepRadius * (1.0 - cosine))));
-    if (along < -halfSpan)
-        center = v3_add(center, v3_scale(frame.incoming, along + halfSpan));
-    if (along > halfSpan)
-        center = v3_add(center, v3_scale(frame.outgoing, along - halfSpan));
+    if (sample < -halfSpan)
+        center = v3_add(center, v3_scale(frame.incoming, sample + halfSpan));
+    if (sample > halfSpan)
+        center = v3_add(center, v3_scale(frame.outgoing, sample - halfSpan));
 
     // Carry CoR's twist across while aligning the section with the sweep tangent.
-    const auto posedAxis = q_rotate_v3(vertexRotation, frame.bindAxis);
     const auto align = q_between(posedAxis, tangent);
-    const auto section = q_rotate_v3(align, q_rotate_v3(vertexRotation, radial));
+    const auto section = q_rotate_v3(align, posedSection);
     const double across = v3_dot(section, inward) / radius;
     const double side = smoothStep(-1.0, 1.0, across);
     const double strength = std::clamp(outerStrength * (1.0 - side) + innerStrength * side, 0.0, 1.0);
