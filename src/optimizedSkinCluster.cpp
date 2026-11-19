@@ -407,11 +407,11 @@ MStatus OptimizedSkinCluster::initialize() {
     addAttribute(aMosInfluenceRadius);
     attributeAffects(aMosInfluenceRadius, MPxSkinCluster::outputGeom);
 
-    aMosCurveMode = eAttr.create("mosCurveMode", "mosCm", 0, &status);
+    aMosCurveMode = eAttr.create("mosCurveMode", "mosCm", MosParams::arcSegments, &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
     eAttr.addField("Single Long Curve", 0);
     eAttr.addField("Per-Joint Curves", 1);
-    eAttr.addField("OCD Arc Segments", 2);
+    eAttr.addField("OCD Arc Segments", MosParams::arcSegments);
     eAttr.setKeyable(true);
     eAttr.setStorable(true);
     eAttr.setNiceNameOverride("MOS Curve Mode");
@@ -2289,7 +2289,7 @@ bool OptimizedSkinCluster::computeMosCache(
     const MosParams& params, const MMatrix* bindSpace, unsigned int geometryIndex) {
     const bool direct = bindSpace != nullptr;
     const bool shapeGuide = direct && block.inputValue(aMosShapeGuide).asBool();
-    const bool arcRequested = direct && params.curveMode == 2;
+    const bool arcRequested = direct && params.curveMode == MosParams::arcSegments;
     m_mosCache.valid = false;
 
     // [DIAG] 读诊断开关（wc_unity 影响 bind 时 w_c）
@@ -2796,7 +2796,7 @@ MStatus OptimizedSkinCluster::deformMOS(
     unsigned int guideParent = 0, guideChild = 0;
     double guideLength = 0.0;
     ocd_arc::Pose arcPose;
-    const bool useArc = params.curveMode == 2 && !m_mosCache.arcVertices.empty() &&
+    const bool useArc = params.curveMode == MosParams::arcSegments && !m_mosCache.arcVertices.empty() &&
         params.scaleWeight <= 1e-9;
     if (useArc) {
         const auto& chain = m_mosCache.curves.front().chain_bones;
@@ -2805,7 +2805,7 @@ MStatus OptimizedSkinCluster::deformMOS(
             v3_norm(v3_sub(pivots[child], pivots[parent])), transforms[parent].q,
             transforms[child].q, m_mosCache.arcBefore, m_mosCache.arcAfter);
     }
-    if (params.curveMode != 2 && shapeGuide && params.scaleWeight <= 1e-9 &&
+    if (params.curveMode != MosParams::arcSegments && shapeGuide && params.scaleWeight <= 1e-9 &&
         m_mosCache.curves.size() == 1) {
         const auto& chain = m_mosCache.curves.front().chain_bones;
         if (chain.size() == 2) {
@@ -3095,6 +3095,7 @@ MStatus OptimizedSkinCluster::deformCoRMosSecondary(
     // ---- A. 参数 ----
     const double env = readEnvelopeFromNode();
     MosParams P = readMosParams(block);
+    if (P.curveMode == MosParams::arcSegments) P.curveMode = 0;
 
     // α=0：完全退化为纯 CoR，跳过 MOS cache 构建
     if (std::abs(P.corMosSecondaryWeight) < 1e-9) {
