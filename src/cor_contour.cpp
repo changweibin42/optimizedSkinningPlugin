@@ -71,10 +71,18 @@ Vec3 correction(const BendFrame& frame, const Vec3& rest, const Vec3& posed,
     const double side = smoothStep(-1.0, 1.0, across);
     const double strength = std::clamp(outerStrength * (1.0 - side) + innerStrength * side, 0.0, 1.0);
 
+    // Bound the outer ring by the offsets of the two straight sides. A
+    // smooth maximum rounds their intersection without pushing either side out.
+    constexpr double cornerBlend = 0.12;
+    const double outgoingCosine = std::cos(frame.angle - phase);
+    const double difference = std::abs(cosine - outgoingCosine);
+    const double blend = std::max(0.0, cornerBlend - difference);
+    const double limitingCosine = std::min(1.0,
+        std::max(cosine, outgoingCosine) + blend * blend / (4.0 * cornerBlend));
     const double outer = smoothStep(0.0, 1.0, -across);
-    const double arcMask = 1.0 - smoothStep(0.05, 1.0, std::abs(2.0 * t - 1.0));
-    const auto fullSection = v3_scale(section, 1.0 + 0.65 * outer * arcMask);
-    const auto target = v3_add(center, fullSection);
+    const double depth = std::max(0.0, -across * radius);
+    const double expansion = outer * (sweepRadius + depth) * (1.0 / limitingCosine - 1.0);
+    const auto target = v3_add(center, v3_sub(section, v3_scale(inward, expansion)));
     const double axialMask = 1.0 - smoothStep(1.35, 2.75, std::abs(along) / radius);
     const double weightMask = smoothStep(0.0, 0.12, overlap);
     return v3_scale(v3_sub(target, posed), frame.activation * strength * axialMask * weightMask);

@@ -98,6 +98,21 @@ void checkTube(double transitionWidth, double angle) {
         posed.push_back(v3_add(base, correction(frame, rest[i], base, cor.q, 1, 1, 1)));
     }
 
+    if (angle == pi / 2) {
+        const auto& outsideCorner = posed[(rings / 2) * sides + sides / 2];
+        require(outsideCorner.x > 0.89 && outsideCorner.y < -0.89,
+            "outer corner must be fuller while keeping rounded clearance");
+        for (int ring = 0; ring < rings; ++ring) {
+            const double x = (ring - rings / 2) * spacing;
+            if (std::abs(x) > 1.3) continue;
+            for (int side = 0; side < sides; ++side) {
+                const auto& point = posed[ring * sides + side];
+                require(point.x <= 1.0 + 1e-10 && point.y >= -1.0 - 1e-10,
+                    "outer curve must stay within both straight side bounds");
+            }
+        }
+    }
+
     double minimum = spacing;
     for (int ring = 0; ring < rings - 1; ++ring) {
         const double along = (ring + 0.5 - rings / 2) * spacing;
