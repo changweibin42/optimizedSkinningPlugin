@@ -182,6 +182,9 @@ inline bool sample(const Pose& pose, const Bind& bind, const mos_math::Secondary
 
 struct LocalRegion {
     Pose anchorPose{};
+    Pose coveragePose{};
+    double startBefore = 0.0;
+    double startAfter = 0.0;
     double endBefore = 0.0;
     double endAfter = 0.0;
     double radius = 0.0;
@@ -189,19 +192,25 @@ struct LocalRegion {
 
 inline LocalRegion localRegion(const Pose& pose, double radius) {
     if (radius <= 1e-8) return {};
-    LocalRegion region{pose};
+    LocalRegion region{pose, pose};
     region.radius = radius;
-    constexpr double maxBend = 2.35; // Bound the support near a fully folded hinge.
-    const double tangentClearance = 1.45 * std::tan(0.5 * std::min(pose.angle, maxBend));
-    // Give the inner miter room to keep its offset as the elbow closes.
     const double deep = deepFalloff(pose.angle);
-    const double elbowClearance = 1.14 * std::min(std::tan(0.5 * pose.angle), 4.0) + 1.0;
-    const double baseline = std::max(2.35, tangentClearance);
-    const double wanted = radius * (baseline + deep * std::max(0.0, elbowClearance - baseline));
+    const double clearance = 1.14 * std::min(std::tan(0.5 * pose.angle), 4.0) + 1.0;
+    const double wanted = radius * (2.35 + 0.50 * deep * std::max(0.0, clearance - 2.35));
     region.anchorPose.before = std::min(wanted, 0.80 * pose.before);
     region.anchorPose.after = std::min(wanted, 0.80 * pose.after);
-    region.endBefore = std::min(0.96 * pose.before, region.anchorPose.before + 1.25 * radius);
-    region.endAfter = std::min(0.96 * pose.after, region.anchorPose.after + 1.25 * radius);
+    // Geometry uses the live angle. Coverage uses the same bind footprint
+    // and LBS pull as the right-angle pose after the bend passes 90 degrees.
+    constexpr double rightAngle = 1.57079632679489661923;
+    if (pose.angle > rightAngle && v3_len(pose.normal) > 0.0) {
+        const auto unwind = q_axis_angle(pose.normal, rightAngle - pose.angle);
+        region.coveragePose = buildPose(pose.pivot, pose.bindAxis, pose.parent,
+            q_mul(unwind, pose.child), pose.before, pose.after, pose.pivotDelta);
+    }
+    region.startBefore = std::min(2.35 * radius, 0.80 * pose.before);
+    region.startAfter = std::min(2.35 * radius, 0.80 * pose.after);
+    region.endBefore = std::min(0.96 * pose.before, region.startBefore + 1.25 * radius);
+    region.endAfter = std::min(0.96 * pose.after, region.startAfter + 1.25 * radius);
     return region;
 }
 
@@ -209,7 +218,7 @@ inline mos_math::GuideSample sampleLocal(const Pose& pose, const LocalRegion& re
     const Bind& bind, const mos_math::Secondary& before, const mos_math::Secondary& after,
     const Vec3& manualIn) {
     const double axial = bind.fraction * (pose.before + pose.after) - pose.before;
-    const double start = axial < 0.0 ? region.anchorPose.before : region.anchorPose.after;
+    const double start = axial < 0.0 ? region.startBefore : region.startAfter;
     const double end = axial < 0.0 ? region.endBefore : region.endAfter;
     const double distance = std::abs(axial);
     const double span = axial < 0.0 ? pose.before : pose.after;
@@ -218,10 +227,11 @@ inline mos_math::GuideSample sampleLocal(const Pose& pose, const LocalRegion& re
     const double geometric = (1.0 - t) * (1.0 - t) * (1.0 - t) * (1.0 + 3.0 * t + 6.0 * t * t);
     // Compare LBS's cross-sectional displacement against the rigid limb.
     // The same opposite weight pulls more on a ring farther from the hinge.
-    const auto axis = axial < 0.0 ? pose.incoming : pose.outgoing;
+    const auto& coveragePose = region.coveragePose;
+    const auto axis = axial < 0.0 ? coveragePose.incoming : coveragePose.outgoing;
     const auto fromPivot = v3_add(v3_scale(pose.bindAxis, axial), bind.radial);
-    const auto difference = v3_add(pose.pivotDelta, v3_sub(q_rotate_v3(pose.child, fromPivot),
-        q_rotate_v3(pose.parent, fromPivot)));
+    const auto difference = v3_add(coveragePose.pivotDelta,
+        v3_sub(q_rotate_v3(coveragePose.child, fromPivot), q_rotate_v3(coveragePose.parent, fromPivot)));
     const auto normalError = v3_sub(difference, v3_scale(axis, v3_dot(difference, axis)));
     const double error = bind.oppositeWeight * v3_len(normalError);
     // Let the residual LBS pull determine the handoff on each limb. Only

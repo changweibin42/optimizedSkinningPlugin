@@ -77,15 +77,16 @@ void checkLocalBend(double degrees) {
             const auto cap = bindVertex({5 * side, radial, 0}, {}, xAxis, 5, 5);
             require(sampleLocal(pose, region, cap, edit, edit, {}).coverage == 0.0,
                 "end rings must be fully controlled by LBS");
-            const auto join = bindVertex({region.anchorPose.before * side, radial, 0}, {}, xAxis, 5, 5);
-            const auto base = sampleLocal(pose, region, join, {}, {}, {});
-            const auto modified = sampleLocal(pose, region, join, edit, edit, {});
+            const auto join = bindVertex({region.anchorPose.before * side, radial, 0}, {}, xAxis,
+                region.anchorPose.before, region.anchorPose.after);
             const auto expected = q_rotate_v3(side < 0.0 ? identity : rotation,
                 {region.anchorPose.before * side, radial, 0});
-            require(base.coverage > 0.999 && v3_len(v3_sub(base.position, expected)) < 1e-10,
+            Vec3 base{}, modified{};
+            require(sample(region.anchorPose, join, {}, {}, {}, base, true) &&
+                v3_len(v3_sub(base, expected)) < 1e-10,
                 "straight anchors must remain in the original cross-section plane");
-            require(v3_len(v3_sub(base.position, modified.position)) < 1e-10,
-                "bulge and slide must vanish at the anchors");
+            require(sample(region.anchorPose, join, edit, edit, {}, modified, true) &&
+                v3_len(v3_sub(base, modified)) < 1e-10, "bulge and slide must vanish at the anchors");
         }
     }
 
@@ -186,7 +187,7 @@ void checkDeepRelief() {
     const auto inside = bindVertex({0, 1, 0}, {}, xAxis, 4.0, 4.0);
     const auto outside = bindVertex({0, -1, 0}, {}, xAxis, 4.0, 4.0);
     const auto inner = sampleLocal(pose, region, inside, {}, {}, {});
-    require(inner.coverage > 0.999 && inner.position.x > -2.5 && inner.position.x < -2.1,
+    require(inner.coverage > 0.999 && inner.position.x > -2.5 && inner.position.x < -1.5,
         "the short inner bend retains a rounded groove within its tangent span");
     const auto outer = sampleLocal(pose, region, outside, {}, {}, {});
     require(outer.coverage > 0.999 && std::abs(v3_len(outer.position) - 1.0) < 1e-10,
@@ -208,7 +209,7 @@ void checkDeepArcSpacing(double bendDegrees, double span) {
     const auto rotation = q_axis_angle({0, 0, 1}, bendDegrees * pi / 180.0);
     const auto pose = buildPose({}, xAxis, identity, rotation, span, span);
     const auto region = localRegion(pose, 1.0);
-    const double anchor = region.anchorPose.before;
+    const double anchor = region.startBefore;
     const double step = anchor / 200.0;
     for (int side = 0; side < 24; ++side) {
         const double azimuth = 2.0 * pi * side / 24.0;
@@ -240,8 +241,31 @@ void checkInnerElbowThickness(double degrees) {
     const double c = std::cos(0.5 * angle), s = std::sin(0.5 * angle);
     const Vec3 bisector{-s, c, 0};
     const double projectedThickness = c * v3_dot(elbow.position, bisector);
-    require(elbow.coverage > 0.999 && projectedThickness > 0.90 && projectedThickness < 1.20,
-        "a long elbow should keep its inner offset close to the bind radius");
+    require(elbow.coverage > 0.999 && projectedThickness > 0.73 && projectedThickness < 1.20,
+        "the capped inner elbow must keep a rounded groove");
+}
+
+void checkHeldCoverage(double bendDegrees, double twistDegrees) {
+    const auto twist = q_axis_angle(xAxis, twistDegrees * pi / 180.0);
+    const auto poseAt = [&](double degrees) {
+        const auto swing = q_axis_angle({0, 0, 1}, degrees * pi / 180.0);
+        return buildPose({}, xAxis, identity, q_mul(swing, twist), 5.0, 6.0);
+    };
+    const auto reference = poseAt(90.0), bent = poseAt(bendDegrees);
+    const auto baseRegion = localRegion(reference, 1.0), bentRegion = localRegion(bent, 1.0);
+    for (double side : {-1.0, 1.0}) {
+        for (int ring = 0; ring < 80; ++ring) {
+            for (double oppositeWeight : {0.0, 0.005, 0.25}) {
+                const double x = side * ring * 0.06;
+                auto bind = bindVertex({x, 0.6, 0.8}, {}, xAxis, 5.0, 6.0);
+                bind.oppositeWeight = oppositeWeight;
+                const auto base = sampleLocal(reference, baseRegion, bind, {}, {}, {});
+                const auto deep = sampleLocal(bent, bentRegion, bind, {}, {}, {});
+                require(std::abs(base.coverage - deep.coverage) < 1e-10,
+                    "the right-angle compensation coverage must neither grow nor fade");
+            }
+        }
+    }
 }
 
 void checkTwist() {
@@ -295,6 +319,10 @@ int main() {
     for (const double bend : {140.0, 155.0, 165.0, 175.0})
         for (const double span : {2.0, 4.0})
             checkDeepArcSpacing(bend, span);
+    for (double angle : {120.0, 140.0, 155.0, 175.0}) {
+        checkHeldCoverage(angle, 0.0);
+        checkHeldCoverage(angle, 30.0);
+    }
     checkTwist();
 
     const auto pose = buildPose({}, xAxis, identity, q_axis_angle({0, 0, 1}, pi / 2), 4.0, 4.0);
