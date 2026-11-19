@@ -411,6 +411,7 @@ MStatus OptimizedSkinCluster::initialize() {
     CHECK_MSTATUS_AND_RETURN_IT(status);
     eAttr.addField("Single Long Curve", 0);
     eAttr.addField("Per-Joint Curves", 1);
+    eAttr.addField("OCD Arc Segments", 2);
     eAttr.setKeyable(true);
     eAttr.setStorable(true);
     eAttr.setNiceNameOverride("MOS Curve Mode");
@@ -2288,6 +2289,7 @@ bool OptimizedSkinCluster::computeMosCache(
     const MosParams& params, const MMatrix* bindSpace, unsigned int geometryIndex) {
     const bool direct = bindSpace != nullptr;
     const bool shapeGuide = direct && block.inputValue(aMosShapeGuide).asBool();
+    const bool arcRequested = direct && params.curveMode == 2;
     m_mosCache.valid = false;
 
     // [DIAG] 读诊断开关（wc_unity 影响 bind 时 w_c）
@@ -2345,6 +2347,19 @@ bool OptimizedSkinCluster::computeMosCache(
             if (jnt.hasFn(MFn::kJoint)) {
                 joints.push_back(jnt);
                 logicalIdx.push_back(idx);
+            }
+        }
+    }
+    if (arcRequested) {
+        std::set<unsigned int> weighted;
+        for (const auto& weights : m_vtxCache.vertices)
+            for (const auto& weight : weights)
+                if (weight.second > 0.0f) weighted.insert(weight.first);
+        if (weighted.size() == 2) {
+            for (size_t i = logicalIdx.size(); i-- > 0;) {
+                if (weighted.count(logicalIdx[i])) continue;
+                logicalIdx.erase(logicalIdx.begin() + i);
+                joints.erase(joints.begin() + i);
             }
         }
     }
@@ -2432,6 +2447,29 @@ bool OptimizedSkinCluster::computeMosCache(
         return index >= bindInverses.size();
     })) return false;
 
+    m_mosCache.arcVertices.clear();
+    m_mosCache.arcBefore = m_mosCache.arcAfter = 0.0;
+    if (arcRequested && joints.size() == 2 && n_bones == 2 && bone_len[0] > 1e-8) {
+        const auto pivot = bind_jp[chain[1]];
+        const auto axis = bone_dir[0];
+        for (unsigned int i = 0; i < numVertices; ++i) {
+            if (m_vtxCache.vertices[i].empty()) continue;
+            const auto& point = points[i];
+            const double axial = mathcore::v3_dot(
+                mathcore::v3_sub({point.x, point.y, point.z}, pivot), axis);
+            m_mosCache.arcBefore = std::max(m_mosCache.arcBefore, -axial);
+            m_mosCache.arcAfter = std::max(m_mosCache.arcAfter, axial);
+        }
+        if (m_mosCache.arcBefore > 1e-8 && m_mosCache.arcAfter > 1e-8) {
+            m_mosCache.arcVertices.resize(numVertices);
+            for (unsigned int i = 0; i < numVertices; ++i) {
+                const auto& point = points[i];
+                m_mosCache.arcVertices[i] = ocd_arc::bindVertex({point.x, point.y, point.z},
+                    pivot, axis, m_mosCache.arcBefore, m_mosCache.arcAfter);
+            }
+        }
+    }
+
     m_mosCache.curves.clear();
 
     auto push_cv = [](MosCurve& c, const mathcore::Vec3& p,
@@ -2480,7 +2518,7 @@ bool OptimizedSkinCluster::computeMosCache(
         };
 
     const bool sharedGuide = shapeGuide && n_bones == 2;
-    if (params.curveMode == 0 || sharedGuide) {
+    if (params.curveMode == 0 || sharedGuide || arcRequested) {
         MosCurve c;
         const int segmentCount = direct ? n_bones : n_bones - 1;
         const double u_den = segmentCount;
@@ -2635,7 +2673,7 @@ bool OptimizedSkinCluster::computeMosCache(
             const double L_bone = m_mosCache.avg_bone_length;
             double w_c = 0.0;
 
-            if (direct && (params.curveMode == 0 || sharedGuide)) {
+            if (direct && (params.curveMode == 0 || sharedGuide || arcRequested)) {
                 if (vi < static_cast<int>(m_vtxCache.vertices.size())) {
                     double total = 0.0;
                     for (const auto& weight : m_vtxCache.vertices[vi]) {
@@ -2714,6 +2752,12 @@ bool OptimizedSkinCluster::computeMosCache(
             numVertices, m_mosCache.n_curves, ratio * 100.0,
             params.curveMode, m_mosCache.avg_bone_length, ms);
         MGlobal::displayInfo(MString(buf));
+        if (arcRequested) {
+            if (m_mosCache.arcVertices.empty())
+                MGlobal::displayWarning("[OCD Arc] A connected two-bone bind with weighted vertices on both sides is required; using MOS cubic.");
+            else
+                MGlobal::displayInfo("[OCD Arc] Bound two-bone offset curves.");
+        }
     }
     return true;
 }
@@ -2751,7 +2795,18 @@ MStatus OptimizedSkinCluster::deformMOS(
     cor_contour::BendFrame guideFrame;
     unsigned int guideParent = 0, guideChild = 0;
     double guideLength = 0.0;
-    if (shapeGuide && params.scaleWeight <= 1e-9 && m_mosCache.curves.size() == 1) {
+    ocd_arc::Pose arcPose;
+    const bool useArc = params.curveMode == 2 && !m_mosCache.arcVertices.empty() &&
+        params.scaleWeight <= 1e-9;
+    if (useArc) {
+        const auto& chain = m_mosCache.curves.front().chain_bones;
+        const auto parent = chain[0], child = chain[1];
+        arcPose = ocd_arc::buildPose(apply_transform(transforms[child], pivots[child]),
+            v3_norm(v3_sub(pivots[child], pivots[parent])), transforms[parent].q,
+            transforms[child].q, m_mosCache.arcBefore, m_mosCache.arcAfter);
+    }
+    if (params.curveMode != 2 && shapeGuide && params.scaleWeight <= 1e-9 &&
+        m_mosCache.curves.size() == 1) {
         const auto& chain = m_mosCache.curves.front().chain_bones;
         if (chain.size() == 2) {
             guideParent = chain[0];
@@ -2875,6 +2930,13 @@ MStatus OptimizedSkinCluster::deformMOS(
         Vec3 sampled{};
         double coverage = 0.0;
         const auto& bind = m_mosCache.verts[vertex].per_curve;
+        Vec3 arcPosition{};
+        const bool arcSampled = useArc && ocd_arc::sample(arcPose, m_mosCache.arcVertices[vertex],
+            incoming, outgoing, guideManualIn, arcPosition);
+        if (arcSampled && params.influenceRadius >= 1.0) {
+            const auto result = applyEnvelope(original, arcPosition, envelope);
+            return MPoint(result.x, result.y, result.z) * worldInverse;
+        }
         mos_math::GuideSample guide;
         if (guideFrame.activation > 0.0 && !bind.empty() && bind.front().w_c >= 1.0 - 1e-8) {
             guide = mos_math::sampleTwoBoneGuide(guideFrame, original,
@@ -2885,7 +2947,11 @@ MStatus OptimizedSkinCluster::deformMOS(
             const auto result = applyEnvelope(original, guide.position, envelope);
             return MPoint(result.x, result.y, result.z) * worldInverse;
         }
-        for (size_t c = 0; c < bind.size(); ++c) {
+        if (arcSampled) {
+            sampled = arcPosition;
+            coverage = 1.0;
+        }
+        for (size_t c = 0; !arcSampled && c < bind.size(); ++c) {
             const auto& attachment = bind[c];
             if (attachment.w_c <= 0.0) continue;
             Vec3 value{};

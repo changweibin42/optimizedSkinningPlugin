@@ -1,0 +1,96 @@
+#include "ocd_arc.h"
+
+#include <cstdlib>
+#include <iostream>
+
+using namespace ocd_arc;
+
+namespace {
+
+constexpr double pi = 3.14159265358979323846;
+const Vec3 xAxis{1, 0, 0};
+const Quat identity{0, 0, 0, 1};
+
+void require(bool condition, const char* description) {
+    if (!condition) {
+        std::cerr << description << '\n';
+        std::exit(1);
+    }
+}
+
+Vec3 evaluate(const Pose& pose, const Bind& bind,
+    const mos_math::Secondary& before = {}, const mos_math::Secondary& after = {}) {
+    Vec3 result{};
+    require(sample(pose, bind, before, after, {}, result), "expected a valid offset curve");
+    return result;
+}
+
+void checkBend(double degrees) {
+    const double angle = degrees * pi / 180.0;
+    const auto rotation = q_axis_angle({0, 0, 1}, angle);
+    const auto pose = buildPose({}, xAxis, identity, rotation, 4.0, 4.0);
+    for (const double offset : {-1.0, 0.0, 1.0}) {
+        const auto first = evaluate(pose, {0.0, {0, offset, 0}});
+        const auto last = evaluate(pose, {1.0, {0, offset, 0}});
+        require(v3_len(v3_sub(first, {-4, offset, 0})) < 1e-10, "incoming endpoint");
+        require(v3_len(v3_sub(last, q_rotate_v3(rotation, {4, offset, 0}))) < 1e-10,
+            "outgoing endpoint");
+        const double radius = std::max(-offset, 0.14 * std::abs(offset));
+        const double straight = 4.0 - (offset + radius) * std::tan(angle * 0.5);
+        const double total = 2.0 * straight + radius * angle;
+        const double join = straight / total;
+        const double step = 1e-6;
+        const auto atJoin = evaluate(pose, {join, {0, offset, 0}});
+        const auto left = evaluate(pose, {join - step, {0, offset, 0}});
+        const auto right = evaluate(pose, {join + step, {0, offset, 0}});
+        if (radius > 0.0)
+            require(v3_dot(v3_norm(v3_sub(atJoin, left)), v3_norm(v3_sub(right, atJoin))) >
+                1.0 - 1e-7, "line and arc must meet tangentially");
+        auto previous = first;
+        for (int i = 1; i <= 2048; ++i) {
+            const double f = static_cast<double>(i) / 2048.0;
+            const auto current = evaluate(pose, {f, {0, offset, 0}});
+            const double arcPhase = radius > 0.0
+                ? std::clamp((f * total - straight) / radius, 0.0, angle)
+                : (f < join ? 0.0 : angle);
+            const auto tangent = q_rotate_v3(q_axis_angle({0, 0, 1}, arcPhase), xAxis);
+            const auto delta = v3_sub(current, previous);
+            if (radius > 0.0 || f != join)
+                require(v3_dot(delta, tangent) > 0.0, "vertex samples must advance along the curve");
+            if (radius > 0.0)
+                require(v3_len(delta) > 0.999 * total / 2048.0, "arc-length spacing must be uniform");
+            previous = current;
+        }
+    }
+}
+
+} // namespace
+
+int main() {
+    const auto bind = bindVertex({0.8, 0.5, -0.3}, {}, xAxis, 3.0, 4.0);
+    const auto straight = buildPose({}, xAxis, identity, identity, 3.0, 4.0);
+    require(v3_len(v3_sub(evaluate(straight, bind), {0.8, 0.5, -0.3})) < 1e-12,
+        "straight bind must recover the input vertex");
+    for (const auto angle : {45.0, 90.0, 120.0}) checkBend(angle);
+
+    const auto pose = buildPose({}, xAxis, identity, q_axis_angle({0, 0, 1}, pi / 2), 4.0, 4.0);
+    const auto inside = bindVertex({}, {}, xAxis, 4.0, 4.0);
+    const Bind inner{inside.fraction, {0, 1, 0}}, outer{inside.fraction, {0, -1, 0}};
+    const auto p = evaluate(pose, inner);
+    const auto q = evaluate(pose, outer);
+    require(p.x < -1.0 && p.x > -1.06 && p.y > 1.0 && p.y < 1.06, "inner fillet");
+    require(std::abs(q.x - std::sqrt(0.5)) < 1e-10 && std::abs(q.y + std::sqrt(0.5)) < 1e-10,
+        "outer branch uses the minimum arc tangent at the bone ends");
+    mos_math::Secondary bulge;
+    bulge.bulgeOuter = 0.2;
+    require(v3_len(v3_sub(evaluate(pose, inner, bulge, bulge), p)) < 1e-10, "outer-only bulge");
+    require(evaluate(pose, outer, bulge, bulge).x > q.x, "outer bulge expands the offset curve");
+    mos_math::Secondary slide;
+    slide.slideInner = 0.1;
+    const auto input = bindVertex({-2, 1, 0}, {}, xAxis, 4.0, 4.0);
+    const auto base = evaluate(pose, input);
+    const auto moved = evaluate(pose, input, slide);
+    require(moved.x > base.x && std::abs(moved.y - base.y) < 1e-10,
+        "incoming slide moves along the offset curve");
+    std::cout << "OCD arc bind, spacing, 45/90/120 degree bends, bulge and slide checks passed\n";
+}

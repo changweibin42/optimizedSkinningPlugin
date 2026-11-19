@@ -23,6 +23,7 @@
 #include "ddm_v4.h"
 #include "ocd_math.h"
 #include "mos_math.h"
+#include "ocd_arc.h"
 #include "optimizedSkinClusterCoR.h"
 
 class DlbGpu;
@@ -318,6 +319,9 @@ private:
         bool valid = false;
         bool direct = false;
         bool shapeGuide = false;
+        double arcBefore = 0.0;
+        double arcAfter = 0.0;
+        std::vector<ocd_arc::Bind> arcVertices;
         unsigned int geometryIndex = 0;
         MMatrix bindSpace;
         unsigned int numVertices = 0;
