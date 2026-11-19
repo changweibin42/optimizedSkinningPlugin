@@ -37,17 +37,23 @@ BendFrame buildFrame(const Vec3& bindParent, const Vec3& bindPivot, const Vec3& 
 }
 
 Vec3 correction(const BendFrame& frame, const Vec3& rest, const Vec3& posed,
-    const Quat& vertexRotation, double overlap, double innerStrength, double outerStrength) {
+    const Quat& vertexRotation, double overlap, double innerStrength, double outerStrength, bool isolatedBend) {
     if (frame.activation == 0.0 || overlap <= 0.0) return {};
 
     const auto offset = v3_sub(rest, frame.bindPivot);
     const double along = v3_dot(offset, frame.bindAxis);
     const auto radial = v3_sub(offset, v3_scale(frame.bindAxis, along));
     const double radius = v3_len(radial);
-    if (radius < 1e-8 || std::abs(along) >= 2.75 * radius) return {};
+    if (radius < 1e-8) return {};
+    const double distance = std::abs(along) / radius;
+    // On a two-joint mesh, keep the sweep tangent through the near straight
+    // sections before handing back to CoR. Use local support for shared joints.
+    const double fullSupport = isolatedBend ? 3.25 : 1.35;
+    const double endSupport = isolatedBend ? 4.5 : 2.75;
+    if (distance >= endSupport) return {};
 
     // The sweep radius exceeds the rest radius to keep inside rings ordered.
-    const double sweepRadius = 1.3 * radius;
+    const double sweepRadius = sweepRadiusRatio * radius;
     const double halfSpan = sweepRadius * std::tan(frame.angle * 0.5);
     const double t = std::clamp(0.5 + 0.5 * along / halfSpan, 0.0, 1.0);
     const double phase = t * frame.angle;
@@ -83,7 +89,9 @@ Vec3 correction(const BendFrame& frame, const Vec3& rest, const Vec3& posed,
     const double depth = std::max(0.0, -across * radius);
     const double expansion = outer * (sweepRadius + depth) * (1.0 / limitingCosine - 1.0);
     const auto target = v3_add(center, v3_sub(section, v3_scale(inward, expansion)));
-    const double axialMask = 1.0 - smoothStep(1.35, 2.75, std::abs(along) / radius);
+    const double fade = std::clamp((distance - fullSupport) / (endSupport - fullSupport), 0.0, 1.0);
+    const double axialMask = (1.0 - fade) * (1.0 - fade) * (1.0 - fade) *
+        (1.0 + 3.0 * fade + 6.0 * fade * fade);
     const double weightMask = smoothStep(0.0, 0.12, overlap);
     return v3_scale(v3_sub(target, posed), frame.activation * strength * axialMask * weightMask);
 }

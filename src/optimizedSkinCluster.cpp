@@ -1952,7 +1952,7 @@ MStatus OptimizedSkinCluster::deformCoR(
         auto posed = base;
         if (isolatedBend) {
             posed = mathcore::v3_add(posed, cor_contour::correction(*isolatedBend, original, base,
-                transform.q, 1.0, innerStrength, outerStrength));
+                transform.q, 1.0, innerStrength, outerStrength, true));
         }
         else if (activeBends > 0) {
             for (const auto& child : rotationWeights) {

@@ -61,7 +61,7 @@ void checkBend() {
 // Test the full CoR + contour path on a triangulated tube. A midpoint-only
 // check misses the folded rings seen next to the inner corner in Maya.
 void checkTube(double transitionWidth, double angle) {
-    constexpr int rings = 61;
+    constexpr int rings = 101;
     constexpr int sides = 24;
     constexpr double spacing = 0.1;
     std::vector<Vec3> rest;
@@ -95,16 +95,27 @@ void checkTube(double transitionWidth, double angle) {
     for (size_t i = 0; i < rest.size(); ++i) {
         const auto cor = cor_paper::vertexTransform(centers[i], weights[i], bones);
         const auto base = apply_transform(cor, rest[i]);
-        posed.push_back(v3_add(base, correction(frame, rest[i], base, cor.q, 1, 1, 1)));
+        posed.push_back(v3_add(base, correction(frame, rest[i], base, cor.q, 1, 1, 1, true)));
     }
 
     if (angle == pi / 2) {
+        const auto& insideCorner = posed[(rings / 2) * sides];
+        require(insideCorner.x > -1.05 && insideCorner.y < 1.05,
+            "inner corner must approach the intersection of the straight sides");
         const auto& outsideCorner = posed[(rings / 2) * sides + sides / 2];
         require(outsideCorner.x > 0.89 && outsideCorner.y < -0.89,
             "outer corner must be fuller while keeping rounded clearance");
         for (int ring = 0; ring < rings; ++ring) {
             const double x = (ring - rings / 2) * spacing;
-            if (std::abs(x) > 1.3) continue;
+            if (std::abs(x) > 3.25) continue;
+            if (std::abs(x) >= 1.2) {
+                const auto& inside = posed[ring * sides];
+                const auto& outside = posed[ring * sides + sides / 2];
+                require(x < 0.0
+                    ? std::abs(inside.y - 1.0) < 1e-10 && std::abs(outside.y + 1.0) < 1e-10
+                    : std::abs(inside.x + 1.0) < 1e-10 && std::abs(outside.x - 1.0) < 1e-10,
+                    "neither straight section may ripple near the corner");
+            }
             for (int side = 0; side < sides; ++side) {
                 const auto& point = posed[ring * sides + side];
                 require(point.x <= 1.0 + 1e-10 && point.y >= -1.0 - 1e-10,
@@ -116,7 +127,7 @@ void checkTube(double transitionWidth, double angle) {
     double minimum = spacing;
     for (int ring = 0; ring < rings - 1; ++ring) {
         const double along = (ring + 0.5 - rings / 2) * spacing;
-        const double halfSpan = 1.3 * std::tan(angle * 0.5);
+        const double halfSpan = sweepRadiusRatio * std::tan(angle * 0.5);
         const double phase = angle * std::clamp(0.5 + 0.5 * along / halfSpan, 0.0, 1.0);
         const Vec3 tangent{std::cos(phase), std::sin(phase), 0};
         for (int side = 0; side < sides; ++side) {
@@ -130,7 +141,7 @@ void checkTube(double transitionWidth, double angle) {
     for (const auto& triangle : triangles) {
         const auto a = triangle[0], b = triangle[1], c = triangle[2];
         const auto restCenter = v3_scale(v3_add(rest[a], v3_add(rest[b], rest[c])), 1.0 / 3.0);
-        const double halfSpan = 1.3 * std::tan(angle * 0.5);
+        const double halfSpan = sweepRadiusRatio * std::tan(angle * 0.5);
         const double phase = angle * std::clamp(0.5 + 0.5 * restCenter.x / halfSpan, 0.0, 1.0);
         const Vec3 outward{-std::sin(phase) * restCenter.y, std::cos(phase) * restCenter.y, restCenter.z};
         const auto normal = v3_cross(v3_sub(posed[b], posed[a]), v3_sub(posed[c], posed[a]));
@@ -151,7 +162,7 @@ void checkNoBend() {
 int main() {
     checkBend();
     checkNoBend();
-    for (const double width : {0.75, 1.5, 2.5}) {
+    for (const double width : {0.75, 1.5, 2.5, 3.7}) {
         checkTube(width, pi / 4);
         checkTube(width, pi / 2);
     }
