@@ -217,8 +217,11 @@ inline mos_math::GuideSample sampleLocal(const Pose& pose, const LocalRegion& re
         q_rotate_v3(pose.parent, fromPivot)));
     const auto normalError = v3_sub(difference, v3_scale(axis, v3_dot(difference, axis)));
     const double error = bind.oppositeWeight * v3_len(normalError);
-    const double skin = smoothUnit(error / (0.025 * region.radius));
-    const double cap = 1.0 - smoothUnit((distance / span - 0.93) / 0.07);
+    // Let the residual LBS pull determine the handoff on each limb. Only
+    // reserve a wider endpoint taper when mixed weights still pull there.
+    const double skin = smoothUnit(error / (0.004 * region.radius));
+    const double capWidth = std::min(0.07 * span, 0.04 * region.radius + 2.0 * error);
+    const double cap = smoothUnit((span - distance) / capWidth);
     const double coverage = geometric + (1.0 - geometric) * skin * cap;
     if (coverage <= 0.0) return {};
     Bind local = bind;

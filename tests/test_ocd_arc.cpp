@@ -143,6 +143,42 @@ void checkWeightedHandoff() {
     }
 }
 
+void checkLimbSpacingAtHandoff(double bendDegrees, double twistDegrees, double halfWidth) {
+    const auto bend = q_axis_angle({0, 0, 1}, bendDegrees * pi / 180.0);
+    const auto twist = q_axis_angle(xAxis, twistDegrees * pi / 180.0);
+    const auto rotation = q_mul(bend, twist);
+    constexpr double span = 5.0;
+    const auto pose = buildPose({}, xAxis, identity, rotation, span, span);
+    const auto region = localRegion(pose, 1.0);
+    const double start = region.anchorPose.before;
+    const double spacing = (span - start) / 500.0;
+    for (const double side : {-1.0, 1.0}) {
+        double previous = 0.0;
+        for (int ring = 0; ring <= 500; ++ring) {
+            const double distance = ring == 0 ? span : span - ring * spacing;
+            const Vec3 rest{side * distance, 1, 0};
+            const auto childWeight = smoothUnit(0.5 + rest.x / (2.0 * halfWidth));
+            auto bind = bindVertex(rest, {}, xAxis, span, span);
+            bind.oppositeWeight = side < 0.0 ? childWeight : 1.0 - childWeight;
+            const auto arc = sampleLocal(pose, region, bind, {}, {}, {});
+            const auto lbs = v3_add(v3_scale(rest, 1.0 - childWeight),
+                v3_scale(q_rotate_v3(rotation, rest), childWeight));
+            const auto point = blendWithLbs(pose, lbs, arc.position, arc.coverage);
+            const auto limb = side < 0.0 ? point : q_rotate_v3(q_inverse(rotation), point);
+            require(v3_len({0, limb.y - 1.0, limb.z}) < 0.0015,
+                "the straight limb must stay within 0.15% of the bind radius");
+            if (ring > 0) {
+                const double step = side * (previous - limb.x);
+                require(step > 0.9 * spacing && step < 1.1 * spacing,
+                    "the handoff must preserve ordered, evenly spaced limb rings");
+            }
+            if (ring == 0 || (distance >= region.endBefore && bind.oppositeWeight == 0.0))
+                require(v3_len(v3_sub(point, lbs)) == 0.0, "rigid tail must return exact LBS");
+            previous = limb.x;
+        }
+    }
+}
+
 void checkDeepRelief() {
     const auto rotation = q_axis_angle({0, 0, 1}, 140.0 * pi / 180.0);
     const auto pose = buildPose({}, xAxis, identity, rotation, 4.0, 4.0);
@@ -209,6 +245,10 @@ int main() {
     }
 
     checkWeightedHandoff();
+    for (const double bend : {90.0, 120.0, 140.0})
+        for (const double twist : {0.0, 30.0})
+            for (const double halfWidth : {2.5, 5.0})
+                checkLimbSpacingAtHandoff(bend, twist, halfWidth);
     checkDeepRelief();
     checkTwist();
 
