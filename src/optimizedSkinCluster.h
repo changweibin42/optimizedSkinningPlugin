@@ -68,6 +68,7 @@ public:
     static MObject aCorCompStrengthOut;
     static MObject aCorSigma;
     static MObject aCorDebugLog;
+    static MObject aCorContourIn, aCorContourOut;
     static MObject aDdmIterations, aDdmLambda, aDdmKappa, aDdmAlpha, aDdmDebugLog;
     static MObject aDisplayCoR;
 
@@ -160,8 +161,9 @@ private:
     // ================================================================
     // 四种算法的 deform 实现
     // ================================================================
+    enum class CenteredMode { CoR, DdmV4, Contour };
     MStatus deformCoR(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int,
-        bool useDdm = false);
+        CenteredMode mode = CenteredMode::CoR);
     MStatus deformDLB(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int,
         bool useOpenCL = false);
     std::unique_ptr<DlbGpu> m_dlbGpu;

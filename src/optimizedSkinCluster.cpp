@@ -1,5 +1,6 @@
 #include "optimizedSkinCluster.h"
 #include "algorithms.h"
+#include "cor_contour.h"
 #include "dlb_gpu.h"
 #include "node_ids.h"
 #include "plugin_debug.h"
@@ -63,6 +64,8 @@ MObject OptimizedSkinCluster::aCorCompStrengthIn;   // 新增
 MObject OptimizedSkinCluster::aCorCompStrengthOut;  // 新增
 MObject OptimizedSkinCluster::aCorSigma;
 MObject OptimizedSkinCluster::aCorDebugLog;
+MObject OptimizedSkinCluster::aCorContourIn;
+MObject OptimizedSkinCluster::aCorContourOut;
 MObject OptimizedSkinCluster::aDdmIterations;
 MObject OptimizedSkinCluster::aDdmLambda;
 MObject OptimizedSkinCluster::aDdmKappa;
@@ -179,6 +182,7 @@ MStatus OptimizedSkinCluster::initialize() {
     eAttr.addField("CoR + MOS Secondary", 4);
     eAttr.addField("CoR + Compensation", 5);
     eAttr.addField("DDM v4 (2019)", 6);
+    eAttr.addField("CoR + Contour", 7);
     eAttr.setKeyable(true);
     eAttr.setStorable(true);
     addAttribute(aAlgorithmType);
@@ -331,6 +335,23 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setNiceNameOverride("CoR Debug Log");
     CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aCorDebugLog));
     CHECK_MSTATUS_AND_RETURN_IT(attributeAffects(aCorDebugLog, MPxSkinCluster::outputGeom));
+
+    const auto addContourControl = [&](MObject& attr, const char* name, const char* shortName,
+        const char* label) -> MStatus {
+        MStatus result;
+        attr = nAttr.create(name, shortName, MFnNumericData::kDouble, 1.0, &result);
+        if (!result) return result;
+        nAttr.setMin(0.0);
+        nAttr.setMax(2.0);
+        nAttr.setKeyable(true);
+        nAttr.setStorable(true);
+        nAttr.setNiceNameOverride(label);
+        result = addAttribute(attr);
+        if (!result) return result;
+        return attributeAffects(attr, MPxSkinCluster::outputGeom);
+    };
+    CHECK_MSTATUS_AND_RETURN_IT(addContourControl(aCorContourIn, "corContourIn", "ccin", "CoR Contour Inner"));
+    CHECK_MSTATUS_AND_RETURN_IT(addContourControl(aCorContourOut, "corContourOut", "ccout", "CoR Contour Outer"));
 
     const ddm_v4::Settings ddmDefaults;
     const auto addDdmControl = [&](MObject& attr, const char* name, const char* shortName,
@@ -1572,7 +1593,9 @@ MStatus OptimizedSkinCluster::deform(
     int algo = block.inputValue(aAlgorithmType, &status).asShort();
     if (!status) return status;
 
-    if (algo == 0 || algo == 6) return deformCoR(block, iter, worldMat, multiIndex, algo == 6);
+    if (algo == 0) return deformCoR(block, iter, worldMat, multiIndex);
+    if (algo == 6) return deformCoR(block, iter, worldMat, multiIndex, CenteredMode::DdmV4);
+    if (algo == 7) return deformCoR(block, iter, worldMat, multiIndex, CenteredMode::Contour);
 
     unsigned int nV = iter.count();
     collectBoneInfo(block);
@@ -1716,11 +1739,13 @@ MStatus OptimizedSkinCluster::rebuildCenteredSkinning(
 
 MStatus OptimizedSkinCluster::deformCoR(
     MDataBlock& block, MItGeometry& iter,
-    const MMatrix& worldMat, unsigned int multiIndex, bool useDdm) {
+    const MMatrix& worldMat, unsigned int multiIndex, CenteredMode mode) {
+    const bool useDdm = mode == CenteredMode::DdmV4;
+    const bool useContour = mode == CenteredMode::Contour;
     const bool debug = optSkinDebugLog() ||
         block.inputValue(useDdm ? aDdmDebugLog : aCorDebugLog).asBool();
     const MString prefix = debug
-        ? MString(useDdm ? "[DDM v4] " : "[CoR] ") + MFnDependencyNode(thisMObject()).name() + ": "
+        ? MString(useDdm ? "[DDM v4] " : useContour ? "[CoR Contour] " : "[CoR] ") + MFnDependencyNode(thisMObject()).name() + ": "
         : MString();
     const auto reportFailure = [&](MStatus status, const char* stage) {
         if (!status && debug) MGlobal::displayWarning(prefix + stage + " - " + status.errorString());
@@ -1729,6 +1754,14 @@ MStatus OptimizedSkinCluster::deformCoR(
 
     const double envelope = readEnvelopeFromNode();
     MStatus status;
+    double innerStrength = 0.0, outerStrength = 0.0;
+    if (useContour) {
+        innerStrength = block.inputValue(aCorContourIn, &status).asDouble();
+        if (!status) return reportFailure(status, "read corContourIn");
+        outerStrength = block.inputValue(aCorContourOut, &status).asDouble();
+        if (!status) return reportFailure(status, "read corContourOut");
+    }
+
     double sigma = 0.0;
     bool forceFull = false;
     ddm_v4::Settings ddmSettings;
@@ -1836,6 +1869,54 @@ MStatus OptimizedSkinCluster::deformCoR(
         if (debug && !relative.isEquivalent(MMatrix::identity, 1e-8)) ++posedCount;
     }
 
+    struct ContourPair {
+        size_t parent = 0;
+        cor_contour::BendFrame frame;
+    };
+    std::vector<ContourPair> contourPairs;
+    size_t pairCount = 0, activeBends = 0;
+    if (innerStrength > 0.0 || outerStrength > 0.0) {
+        const MPlug matrixPlug(thisMObject(), MPxSkinCluster::matrix);
+        std::vector<MObject> joints(influenceCount);
+        std::vector<mathcore::Vec3> bindPivots(influenceCount);
+        for (unsigned int entry = 0; entry < matrixPlug.numConnectedElements(); ++entry) {
+            const auto element = matrixPlug.connectionByPhysicalIndex(entry);
+            const unsigned int id = element.logicalIndex();
+            const auto found = std::lower_bound(cache.influenceIds.begin(), cache.influenceIds.end(), id);
+            if (found == cache.influenceIds.end() || *found != id) continue;
+            const size_t slot = found - cache.influenceIds.begin();
+            if (!hasBind[slot] || !hasPose[slot] || bindInverses[slot].isSingular()) continue;
+            MPlugArray sources;
+            if (!element.connectedTo(sources, true, false) || sources.length() != 1) continue;
+            const auto joint = sources[0].node();
+            if (!joint.hasFn(MFn::kJoint)) continue;
+            joints[slot] = joint;
+            const auto bind = bindInverses[slot].inverse();
+            bindPivots[slot] = {bind[3][0], bind[3][1], bind[3][2]};
+        }
+
+        contourPairs.resize(influenceCount);
+        for (size_t child = 0; child < influenceCount; ++child) {
+            if (joints[child].isNull()) continue;
+            MFnDagNode ancestor(joints[child]);
+            while (ancestor.parentCount() > 0) {
+                const auto parentJoint = ancestor.parent(0);
+                const auto found = std::find(joints.begin(), joints.end(), parentJoint);
+                if (found != joints.end()) {
+                    const size_t parent = found - joints.begin();
+                    const auto& pose = poses[child];
+                    auto frame = cor_contour::buildFrame(bindPivots[parent], bindPivots[child],
+                        {pose[3][0], pose[3][1], pose[3][2]}, bindToPose[parent].q, bindToPose[child].q);
+                    contourPairs[child] = {parent, frame};
+                    ++pairCount;
+                    if (frame.activation > 0.0) ++activeBends;
+                    break;
+                }
+                if (!parentJoint.hasFn(MFn::kDagNode) || !ancestor.setObject(parentJoint)) break;
+            }
+        }
+    }
+
     MPointArray points;
     status = iter.allPositions(points);
     if (!status) return reportFailure(status, "read output geometry points");
@@ -1859,7 +1940,21 @@ MStatus OptimizedSkinCluster::deformCoR(
         const auto transform = cor_paper::vertexTransform(
             {centerWorld.x, centerWorld.y, centerWorld.z}, rotationWeights, translationWeights, bindToPose);
         const mathcore::Vec3 original{restWorld.x, restWorld.y, restWorld.z};
-        const auto result = applyEnvelope(original, mathcore::apply_transform(transform, original), envelope);
+        const auto base = mathcore::apply_transform(transform, original);
+        auto posed = base;
+        if (activeBends > 0) {
+            for (const auto& child : rotationWeights) {
+                const auto& pair = contourPairs[child.first];
+                if (pair.frame.activation == 0.0) continue;
+                const auto parent = std::lower_bound(rotationWeights.begin(), rotationWeights.end(), pair.parent,
+                    [](const auto& weight, size_t index) { return weight.first < index; });
+                if (parent == rotationWeights.end() || parent->first != pair.parent) continue;
+                const double overlap = 4.0 * parent->second * child.second;
+                posed = mathcore::v3_add(posed, cor_contour::correction(pair.frame, original, base,
+                    transform.q, overlap, innerStrength, outerStrength));
+            }
+        }
+        const auto result = applyEnvelope(original, posed, envelope);
         return MPoint(result.x, result.y, result.z) * worldInverse;
     };
 
@@ -1902,6 +1997,11 @@ MStatus OptimizedSkinCluster::deformCoR(
             "pose matrices=%zu/%zu bind matrices=%zu/%zu nonIdentity=%zu affected=%u envelope=%.3f maxDelta=%.8g",
             poseCount, influenceCount, bindCount, influenceCount, posedCount, affected,
             envelope, std::sqrt(maxDeltaSquared));
+        if (useContour) {
+            const auto used = std::strlen(message);
+            snprintf(message + used, sizeof(message) - used,
+                " jointPairs=%zu activeBends=%zu", pairCount, activeBends);
+        }
         MGlobal::displayInfo(prefix + message);
     }
     return MS::kSuccess;
@@ -4681,7 +4781,7 @@ MStatus OptimizedSkinCluster::deformCoRComp(
 bool OptimizedSkinCluster::getCoRData(
     std::vector<mathcore::Vec3>& out) const {
     const short algorithm = MPlug(thisMObject(), aAlgorithmType).asShort();
-    if (algorithm == 0 || algorithm == 6) {
+    if (algorithm == 0 || algorithm == 6 || algorithm == 7) {
         const auto& cache = algorithm == 6 ? m_ddmV4 : m_paperCoR;
         if (!cache.valid || cache.weightVersion != m_currentWeightVersion) return false;
         out = cache.centers;
