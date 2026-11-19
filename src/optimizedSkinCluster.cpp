@@ -2815,9 +2815,11 @@ MStatus OptimizedSkinCluster::deformMOS(
     if (useArc) {
         const auto& chain = m_mosCache.curves.front().chain_bones;
         const auto parent = chain[0], child = chain[1];
-        arcPose = ocd_arc::buildPose(apply_transform(transforms[child], pivots[child]),
-            v3_norm(v3_sub(pivots[child], pivots[parent])), transforms[parent].q,
-            transforms[child].q, m_mosCache.arcBefore, m_mosCache.arcAfter);
+        const auto childPivot = apply_transform(transforms[child], pivots[child]);
+        const auto parentPivot = apply_transform(transforms[parent], pivots[child]);
+        arcPose = ocd_arc::buildPose(childPivot, v3_norm(v3_sub(pivots[child], pivots[parent])),
+            transforms[parent].q, transforms[child].q, m_mosCache.arcBefore, m_mosCache.arcAfter,
+            v3_sub(childPivot, parentPivot));
     }
     const auto arcRegion = ocd_arc::localRegion(arcPose, m_mosCache.arcRadius);
     if (params.curveMode != MosParams::arcSegments && shapeGuide && params.scaleWeight <= 1e-9 &&

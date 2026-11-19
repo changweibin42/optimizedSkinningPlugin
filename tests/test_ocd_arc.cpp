@@ -133,7 +133,7 @@ void checkWeightedHandoff() {
         const auto rigid = q_rotate_v3(side < 0.0 ? identity : rotation, {side * 4.0, 1.0, 0});
         require(sampleLocal(pose, region, bind, {}, {}, {}).coverage == 0.0,
             "beyond the geometric region a pure LBS limb remains untouched");
-        bind.oppositeWeight = 0.04;
+        bind.oppositeWeight = 0.012;
         const auto retained = sampleLocal(pose, region, bind, {}, {}, {});
         require(retained.coverage == 1.0 && v3_len(v3_sub(retained.position, rigid)) < 1e-10,
             "retain the straight branch through the remaining mixed-weight band");
@@ -153,8 +153,18 @@ void checkDeepRelief() {
     require(inner.coverage > 0.999 && inner.position.x > -2.1 && inner.position.x < -1.4,
         "the inner bend relief brings the groove closer to the hinge");
     const auto outer = sampleLocal(pose, region, outside, {}, {}, {});
-    require(outer.coverage > 0.999 && v3_len(outer.position) > 0.999 &&
-        v3_len(outer.position) < 1.001, "deep relief must keep the outer arc radius");
+    require(outer.coverage > 0.999 && std::abs(v3_len(outer.position) - 0.84) < 1e-10,
+        "deep bend should have less outer extension");
+    const auto rightAngle = buildPose({}, xAxis, identity, q_axis_angle({0, 0, 1}, pi / 2), 4, 4);
+    const auto rightRegion = localRegion(rightAngle, 1.0);
+    mos_math::Secondary edit;
+    edit.bulgeOuter = 0.2;
+    const double deepEdit = v3_len(v3_sub(
+        sampleLocal(pose, region, outside, edit, edit, {}).position, outer.position));
+    const double rightEdit = v3_len(v3_sub(
+        sampleLocal(rightAngle, rightRegion, outside, edit, edit, {}).position,
+        sampleLocal(rightAngle, rightRegion, outside, {}, {}, {}).position));
+    require(deepEdit > 0.0 && deepEdit < rightEdit, "secondary bulge must be weaker at 140 degrees");
     checkLocalBend(140.0);
 }
 
