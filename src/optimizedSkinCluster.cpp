@@ -2448,7 +2448,7 @@ bool OptimizedSkinCluster::computeMosCache(
     })) return false;
 
     m_mosCache.arcVertices.clear();
-    m_mosCache.arcBefore = m_mosCache.arcAfter = 0.0;
+    m_mosCache.arcBefore = m_mosCache.arcAfter = m_mosCache.arcRadius = 0.0;
     if (arcRequested && joints.size() == 2 && n_bones == 2 && bone_len[0] > 1e-8) {
         const auto pivot = bind_jp[chain[1]];
         const auto axis = bone_dir[0];
@@ -2462,10 +2462,17 @@ bool OptimizedSkinCluster::computeMosCache(
         }
         if (m_mosCache.arcBefore > 1e-8 && m_mosCache.arcAfter > 1e-8) {
             m_mosCache.arcVertices.resize(numVertices);
+            const double radiusWindow = 0.5 * std::min(m_mosCache.arcBefore, m_mosCache.arcAfter);
             for (unsigned int i = 0; i < numVertices; ++i) {
+                if (m_vtxCache.vertices[i].empty()) continue;
                 const auto& point = points[i];
                 m_mosCache.arcVertices[i] = ocd_arc::bindVertex({point.x, point.y, point.z},
                     pivot, axis, m_mosCache.arcBefore, m_mosCache.arcAfter);
+                const double axial = m_mosCache.arcVertices[i].fraction *
+                    (m_mosCache.arcBefore + m_mosCache.arcAfter) - m_mosCache.arcBefore;
+                if (std::abs(axial) <= radiusWindow)
+                    m_mosCache.arcRadius = std::max(m_mosCache.arcRadius,
+                        mathcore::v3_len(m_mosCache.arcVertices[i].radial));
             }
         }
     }
@@ -2756,7 +2763,7 @@ bool OptimizedSkinCluster::computeMosCache(
             if (m_mosCache.arcVertices.empty())
                 MGlobal::displayWarning("[OCD Arc] A connected two-bone bind with weighted vertices on both sides is required; using MOS cubic.");
             else
-                MGlobal::displayInfo("[OCD Arc] Bound two-bone offset curves.");
+                MGlobal::displayInfo("[OCD Arc] Bound local two-bone offset curves with LBS outside the bend.");
         }
     }
     return true;
@@ -2805,6 +2812,7 @@ MStatus OptimizedSkinCluster::deformMOS(
             v3_norm(v3_sub(pivots[child], pivots[parent])), transforms[parent].q,
             transforms[child].q, m_mosCache.arcBefore, m_mosCache.arcAfter);
     }
+    const auto arcRegion = ocd_arc::localRegion(arcPose, m_mosCache.arcRadius);
     if (params.curveMode != MosParams::arcSegments && shapeGuide && params.scaleWeight <= 1e-9 &&
         m_mosCache.curves.size() == 1) {
         const auto& chain = m_mosCache.curves.front().chain_bones;
@@ -2930,11 +2938,11 @@ MStatus OptimizedSkinCluster::deformMOS(
         Vec3 sampled{};
         double coverage = 0.0;
         const auto& bind = m_mosCache.verts[vertex].per_curve;
-        Vec3 arcPosition{};
-        const bool arcSampled = useArc && ocd_arc::sample(arcPose, m_mosCache.arcVertices[vertex],
-            incoming, outgoing, guideManualIn, arcPosition);
-        if (arcSampled && params.influenceRadius >= 1.0) {
-            const auto result = applyEnvelope(original, arcPosition, envelope);
+        const auto arc = useArc ? ocd_arc::sampleLocal(arcPose, arcRegion,
+            m_mosCache.arcVertices[vertex], incoming, outgoing, guideManualIn) : mos_math::GuideSample{};
+        const double arcMix = std::clamp(arc.coverage * params.influenceRadius, 0.0, 1.0);
+        if (arcMix >= 1.0) {
+            const auto result = applyEnvelope(original, arc.position, envelope);
             return MPoint(result.x, result.y, result.z) * worldInverse;
         }
         mos_math::GuideSample guide;
@@ -2947,11 +2955,7 @@ MStatus OptimizedSkinCluster::deformMOS(
             const auto result = applyEnvelope(original, guide.position, envelope);
             return MPoint(result.x, result.y, result.z) * worldInverse;
         }
-        if (arcSampled) {
-            sampled = arcPosition;
-            coverage = 1.0;
-        }
-        for (size_t c = 0; !arcSampled && c < bind.size(); ++c) {
+        for (size_t c = 0; !useArc && c < bind.size(); ++c) {
             const auto& attachment = bind[c];
             if (attachment.w_c <= 0.0) continue;
             Vec3 value{};
@@ -2968,8 +2972,9 @@ MStatus OptimizedSkinCluster::deformMOS(
             sampled = v3_add(v3_scale(sampled, 1.0 - guide.coverage),
                 v3_scale(guide.position, coverage * guide.coverage));
         }
-        const double mix = std::clamp(coverage * params.influenceRadius, 0.0, 1.0);
-        Vec3 result = coverage > 0.0 ? v3_scale(sampled, mix / coverage) : Vec3{};
+        const double mix = useArc ? arcMix : std::clamp(coverage * params.influenceRadius, 0.0, 1.0);
+        Vec3 result = useArc ? v3_scale(arc.position, arcMix) :
+            (coverage > 0.0 ? v3_scale(sampled, mix / coverage) : Vec3{});
         if (mix < 1.0) {
             Vec3 fallback{};
             double total = 0.0;

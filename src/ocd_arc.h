@@ -47,10 +47,23 @@ inline Pose buildPose(const Vec3& pivot, const Vec3& axis, const Quat& parent,
     return pose;
 }
 
+inline double redistributeLength(double fraction, double bindLength, double posedLength) {
+    const double t = std::clamp(fraction, 0.0, 1.0);
+    const double ramp = std::min(0.20, 0.45 * posedLength / bindLength);
+    if (ramp <= 1e-8) return t * posedLength;
+    double shift = (t - 0.5 * ramp) / (1.0 - ramp);
+    if (t < ramp) shift = 0.5 * t * t / (ramp * (1.0 - ramp));
+    if (t > 1.0 - ramp) {
+        const double remaining = 1.0 - t;
+        shift = 1.0 - 0.5 * remaining * remaining / (ramp * (1.0 - ramp));
+    }
+    return fraction * bindLength + shift * (posedLength - bindLength);
+}
+
 // Straight bind specialization of the Sony segment–arc–segment example.
 // Each vertex's offset has its own two tangent lines and its own arc length.
 inline bool sample(const Pose& pose, const Bind& bind, const mos_math::Secondary& before,
-    const mos_math::Secondary& after, const Vec3& manualIn, Vec3& result) {
+    const mos_math::Secondary& after, const Vec3& manualIn, Vec3& result, bool anchored = false) {
     constexpr double pi = 3.14159265358979323846;
     if (pose.before <= 0.0 || pose.after <= 0.0 || pose.angle >= pi - 1e-5) return false;
     const double axial = bind.fraction * (pose.before + pose.after) - pose.before;
@@ -103,8 +116,10 @@ inline bool sample(const Pose& pose, const Bind& bind, const mos_math::Secondary
     const double firstLength = pose.before - removed;
     const double arcLength = radius * pose.angle;
     const double lastLength = pose.after - removed;
-    const double distance = std::clamp(bind.fraction * (firstLength + arcLength + lastLength) +
-        slide, 0.0, firstLength + arcLength + lastLength);
+    const double posedLength = firstLength + arcLength + lastLength;
+    const double distance = anchored
+        ? redistributeLength(bind.fraction, pose.before + pose.after, posedLength) + slide
+        : std::clamp(bind.fraction * posedLength + slide, 0.0, posedLength);
     if (distance <= firstLength) {
         result = v3_add(first, v3_scale(pose.incoming, distance));
     }
@@ -121,6 +136,43 @@ inline bool sample(const Pose& pose, const Bind& bind, const mos_math::Secondary
                 v3_scale(pose.outgoing, removed + distance - firstLength - arcLength))));
     }
     return true;
+}
+
+struct LocalRegion {
+    Pose anchorPose{};
+    double endBefore = 0.0;
+    double endAfter = 0.0;
+};
+
+inline LocalRegion localRegion(const Pose& pose, double radius) {
+    if (radius <= 1e-8) return {};
+    LocalRegion region{pose};
+    constexpr double maxBend = 2.35; // Bound the support near a fully folded hinge.
+    const double tangentClearance = 1.45 * std::tan(0.5 * std::min(pose.angle, maxBend));
+    const double wanted = radius * std::max(2.35, tangentClearance);
+    region.anchorPose.before = std::min(wanted, 0.80 * pose.before);
+    region.anchorPose.after = std::min(wanted, 0.80 * pose.after);
+    region.endBefore = std::min(0.96 * pose.before, region.anchorPose.before + 1.25 * radius);
+    region.endAfter = std::min(0.96 * pose.after, region.anchorPose.after + 1.25 * radius);
+    return region;
+}
+
+inline mos_math::GuideSample sampleLocal(const Pose& pose, const LocalRegion& region,
+    const Bind& bind, const mos_math::Secondary& before, const mos_math::Secondary& after,
+    const Vec3& manualIn) {
+    const double axial = bind.fraction * (pose.before + pose.after) - pose.before;
+    const double start = axial < 0.0 ? region.anchorPose.before : region.anchorPose.after;
+    const double end = axial < 0.0 ? region.endBefore : region.endAfter;
+    const double distance = std::abs(axial);
+    if (distance >= end) return {};
+    const double t = std::clamp((distance - start) / (end - start), 0.0, 1.0);
+    const double coverage = (1.0 - t) * (1.0 - t) * (1.0 - t) * (1.0 + 3.0 * t + 6.0 * t * t);
+    Bind local = bind;
+    local.fraction = (axial + region.anchorPose.before) /
+        (region.anchorPose.before + region.anchorPose.after);
+    Vec3 result{};
+    if (!sample(region.anchorPose, local, before, after, manualIn, result, true)) return {};
+    return {result, coverage};
 }
 
 } // namespace ocd_arc

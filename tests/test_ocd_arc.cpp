@@ -64,6 +64,66 @@ void checkBend(double degrees) {
     }
 }
 
+void checkLocalBend(double degrees) {
+    const double angle = degrees * pi / 180.0;
+    const auto rotation = q_axis_angle({0, 0, 1}, angle);
+    const auto pose = buildPose({}, xAxis, identity, rotation, 5.0, 5.0);
+    const auto region = localRegion(pose, 1.0);
+    mos_math::Secondary edit;
+    edit.bulgeOuter = 0.2;
+    edit.slideInner = 0.1;
+    for (const double side : {-1.0, 1.0}) {
+        for (const double radial : {-1.0, 1.0}) {
+            const auto cap = bindVertex({5 * side, radial, 0}, {}, xAxis, 5, 5);
+            require(sampleLocal(pose, region, cap, edit, edit, {}).coverage == 0.0,
+                "end rings must be fully controlled by LBS");
+            const auto join = bindVertex({region.anchorPose.before * side, radial, 0}, {}, xAxis, 5, 5);
+            const auto base = sampleLocal(pose, region, join, {}, {}, {});
+            const auto modified = sampleLocal(pose, region, join, edit, edit, {});
+            const auto expected = q_rotate_v3(side < 0.0 ? identity : rotation,
+                {region.anchorPose.before * side, radial, 0});
+            require(base.coverage > 0.999 && v3_len(v3_sub(base.position, expected)) < 1e-10,
+                "straight anchors must remain in the original cross-section plane");
+            require(v3_len(v3_sub(base.position, modified.position)) < 1e-10,
+                "bulge and slide must vanish at the anchors");
+        }
+    }
+
+    constexpr int sides = 24;
+    constexpr int rings = 201;
+    std::vector<Vec3> posed;
+    for (int ring = 0; ring < rings; ++ring) {
+        const double x = -5.0 + 0.05 * ring;
+        const double t = std::clamp(0.5 + x / 5.0, 0.0, 1.0);
+        const double w = t * t * (3.0 - 2.0 * t);
+        for (int k = 0; k < sides; ++k) {
+            const double phi = k * 2.0 * pi / sides;
+            const Vec3 p{x, std::cos(phi), std::sin(phi)};
+            const auto bind = bindVertex(p, {}, xAxis, 5, 5);
+            const auto sample = sampleLocal(pose, region, bind, {}, {}, {});
+            const auto lbs = v3_add(v3_scale(p, 1.0 - w), v3_scale(q_rotate_v3(rotation, p), w));
+            const auto result = v3_add(v3_scale(lbs, 1.0 - sample.coverage),
+                v3_scale(sample.position, sample.coverage));
+            if (std::abs(x) >= region.endBefore)
+                require(v3_len(v3_sub(result, lbs)) == 0.0, "outside support must match LBS exactly");
+            posed.push_back(result);
+        }
+    }
+    for (int ring = 0; ring < rings - 1; ++ring) {
+        const double x = -5.0 + 0.05 * (ring + 0.5);
+        const double phase = angle * std::clamp(0.5 + x / (2.0 * region.anchorPose.before), 0.0, 1.0);
+        for (int k = 0; k < sides; ++k) {
+            const int at = ring * sides + k;
+            const int next = ring * sides + (k + 1) % sides;
+            const double phi = (k + 0.5) * 2.0 * pi / sides;
+            const auto outward = q_rotate_v3(q_axis_angle({0, 0, 1}, phase),
+                {0, std::cos(phi), std::sin(phi)});
+            const auto normal = v3_cross(v3_sub(posed[next], posed[at]), v3_sub(posed[at + sides], posed[at]));
+            require(v3_dot(normal, outward) > 0.0, "the local-to-LBS tube must keep outward winding");
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -71,7 +131,10 @@ int main() {
     const auto straight = buildPose({}, xAxis, identity, identity, 3.0, 4.0);
     require(v3_len(v3_sub(evaluate(straight, bind), {0.8, 0.5, -0.3})) < 1e-12,
         "straight bind must recover the input vertex");
-    for (const auto angle : {45.0, 90.0, 120.0}) checkBend(angle);
+    for (const auto angle : {45.0, 90.0, 120.0}) {
+        checkBend(angle);
+        checkLocalBend(angle);
+    }
 
     const auto pose = buildPose({}, xAxis, identity, q_axis_angle({0, 0, 1}, pi / 2), 4.0, 4.0);
     const auto inside = bindVertex({}, {}, xAxis, 4.0, 4.0);

@@ -322,6 +322,7 @@ private:
         bool shapeGuide = false;
         double arcBefore = 0.0;
         double arcAfter = 0.0;
+        double arcRadius = 0.0;
         std::vector<ocd_arc::Bind> arcVertices;
         unsigned int geometryIndex = 0;
         MMatrix bindSpace;
