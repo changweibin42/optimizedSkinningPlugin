@@ -168,6 +168,34 @@ void checkDeepRelief() {
     checkLocalBend(140.0);
 }
 
+void checkTwist() {
+    const auto twist = q_axis_angle(xAxis, 120.0 * pi / 180.0);
+    const auto pose = buildPose({}, xAxis, identity, twist, 4, 4);
+    const auto region = localRegion(pose, 1.0);
+    for (int ring = 0; ring <= 20; ++ring) {
+        const double x = region.anchorPose.before * (0.1 * ring - 1.0);
+        const double mix = 0.5 + 0.5 * x / region.anchorPose.before;
+        const Vec3 rest{x, 1, 0};
+        const auto guided = sampleLocal(pose, region, bindVertex(rest, {}, xAxis, 4, 4), {}, {}, {});
+        const auto expected = q_rotate_v3(q_axis_angle(xAxis, mix * 120.0 * pi / 180.0), rest);
+        require(guided.coverage > 0.999 && v3_len(v3_sub(guided.position, expected)) < 1e-10,
+            "pure twist must interpolate angle without shrinking the section");
+    }
+
+    const auto blend = blendWithLbs(pose, {1, 0.8, 0}, {2, 0, 1}, 0.5);
+    require(std::abs(blend.x - 1.5) < 1e-10 &&
+        std::abs(v3_len({0, blend.y, blend.z}) - 0.9) < 1e-10,
+        "hybrid twist must not add chord shrinkage");
+    require(v3_len(v3_sub(blendWithLbs(pose, {1, 0.8, 0}, {}, 0.0), {1, 0.8, 0})) == 0.0,
+        "outside support the actual LBS output is preserved");
+
+    const auto bend = q_axis_angle({0, 0, 1}, pi / 2);
+    const auto bent = buildPose({}, xAxis, identity, q_mul(bend, twist), 4, 4);
+    require(std::abs(bent.angle - pi / 2) < 1e-10 &&
+        std::abs(bent.twistAngle - 120.0 * pi / 180.0) < 1e-10,
+        "a large bend must preserve the independent twist angle");
+}
+
 } // namespace
 
 int main() {
@@ -182,6 +210,7 @@ int main() {
 
     checkWeightedHandoff();
     checkDeepRelief();
+    checkTwist();
 
     const auto pose = buildPose({}, xAxis, identity, q_axis_angle({0, 0, 1}, pi / 2), 4.0, 4.0);
     const auto inside = bindVertex({}, {}, xAxis, 4.0, 4.0);

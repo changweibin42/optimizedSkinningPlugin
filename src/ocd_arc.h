@@ -33,12 +33,19 @@ struct Pose {
     double before = 0.0;
     double after = 0.0;
     Vec3 pivotDelta{};
+    double twistAngle = 0.0;
 };
 
 inline Pose buildPose(const Vec3& pivot, const Vec3& axis, const Quat& parent,
     const Quat& child, double before, double after, const Vec3& pivotDelta = {}) {
     Pose pose{pivot, axis, q_rotate_v3(parent, axis), q_rotate_v3(child, axis),
         {}, {}, parent, child, 0.0, before, after, pivotDelta};
+    const auto swing = q_between(pose.incoming, pose.outgoing);
+    const auto childOnIncoming = q_mul(q_inverse(swing), child);
+    auto relativeTwist = q_mul(childOnIncoming, q_inverse(parent));
+    if (relativeTwist.w < 0.0) relativeTwist = q_scale(relativeTwist, -1.0);
+    pose.twistAngle = 2.0 * std::atan2(v3_dot(
+        {relativeTwist.x, relativeTwist.y, relativeTwist.z}, pose.incoming), relativeTwist.w);
     const auto cross = v3_cross(pose.incoming, pose.outgoing);
     const double sine = v3_len(cross);
     pose.angle = std::atan2(sine, v3_dot(pose.incoming, pose.outgoing));
@@ -81,12 +88,10 @@ inline bool sample(const Pose& pose, const Bind& bind, const mos_math::Secondary
     const double axial = bind.fraction * (pose.before + pose.after) - pose.before;
     const double twistMix = 0.5 + 0.5 * std::clamp(axial /
         (axial < 0.0 ? pose.before : pose.after), -1.0, 1.0);
-    const double sign = q_dot(pose.parent, pose.child) < 0.0 ? -1.0 : 1.0;
-    const auto section = q_normalize(q_add(q_scale(pose.parent, 1.0 - twistMix),
-        q_scale(pose.child, sign * twistMix)));
-    const auto sectionAxis = q_rotate_v3(section, pose.bindAxis);
-    auto radial = q_rotate_v3(q_between(sectionAxis, pose.incoming),
-        q_rotate_v3(section, bind.radial));
+    // Transport swing along the curve. Twist rotates the cross section
+    // independently, without averaging the two swung joint frames.
+    auto radial = q_rotate_v3(q_axis_angle(pose.incoming, pose.twistAngle * twistMix),
+        q_rotate_v3(pose.parent, bind.radial));
     if (pose.angle < 1e-8) {
         result = v3_add(pose.pivot, v3_add(v3_scale(pose.incoming, axial), radial));
         return true;
@@ -222,6 +227,34 @@ inline mos_math::GuideSample sampleLocal(const Pose& pose, const LocalRegion& re
     Vec3 result{};
     if (!sample(region.anchorPose, local, before, after, manualIn, result, true)) return {};
     return {result, coverage};
+}
+
+inline Vec3 blendWithLbs(const Pose& pose, const Vec3& lbs, const Vec3& curve, double mix) {
+    if (mix <= 0.0) return lbs;
+    if (mix >= 1.0) return curve;
+    const auto linear = v3_add(v3_scale(lbs, 1.0 - mix), v3_scale(curve, mix));
+    constexpr double degrees = 3.14159265358979323846 / 180.0;
+    const double twistShare = 1.0 - smoothUnit(pose.angle / (15.0 * degrees));
+    if (twistShare <= 0.0 || std::abs(pose.twistAngle) < 1e-8) return linear;
+
+    const auto axis = pose.incoming;
+    const auto perpendicular = [&](const Vec3& point) {
+        const auto fromPivot = v3_sub(point, pose.pivot);
+        return v3_sub(fromPivot, v3_scale(axis, v3_dot(fromPivot, axis)));
+    };
+    const auto lbsRadial = perpendicular(lbs);
+    const auto arcRadial = perpendicular(curve);
+    const double lbsRadius = v3_len(lbsRadial), arcRadius = v3_len(arcRadial);
+    if (lbsRadius < 1e-8 || arcRadius < 1e-8) return linear;
+
+    // Interpolating radial vectors makes the hybrid path cut through the
+    // section. Follow the short arc between their phases instead.
+    const double angle = std::atan2(v3_dot(axis, v3_cross(lbsRadial, arcRadial)),
+        v3_dot(lbsRadial, arcRadial));
+    const double radius = (1.0 - mix) * lbsRadius + mix * arcRadius;
+    const auto radial = v3_scale(q_rotate_v3(q_axis_angle(axis, mix * angle), lbsRadial),
+        radius / lbsRadius);
+    return v3_add(linear, v3_scale(v3_sub(radial, perpendicular(linear)), twistShare));
 }
 
 } // namespace ocd_arc

@@ -2993,8 +2993,9 @@ MStatus OptimizedSkinCluster::deformMOS(
                     weight.second));
                 total += weight.second;
             }
-            result = v3_add(result, v3_scale(total > 0.0 ? v3_scale(fallback, 1.0 / total) : original,
-                1.0 - mix));
+            const auto lbs = total > 0.0 ? v3_scale(fallback, 1.0 / total) : original;
+            result = useArc ? ocd_arc::blendWithLbs(arcPose, lbs, arc.position, mix) :
+                v3_add(result, v3_scale(lbs, 1.0 - mix));
         }
         result = applyEnvelope(original, result, envelope);
         return MPoint(result.x, result.y, result.z) * worldInverse;
