@@ -61,14 +61,9 @@ inline double smoothUnit(double value) {
     return t * t * (3.0 - 2.0 * t);
 }
 
-inline double deepFalloff(double angle) {
-    constexpr double degrees = 3.14159265358979323846 / 180.0;
-    return smoothUnit((angle - 90.0 * degrees) / (50.0 * degrees));
-}
-
-inline double redistributeLength(double fraction, double bindLength, double posedLength, double deep) {
+inline double redistributeLength(double fraction, double bindLength, double posedLength) {
     const double t = std::clamp(fraction, 0.0, 1.0);
-    const double ramp = std::min(0.20 - 0.10 * deep, 0.45 * posedLength / bindLength);
+    const double ramp = std::min(0.20, 0.45 * posedLength / bindLength);
     if (ramp <= 1e-8) return t * posedLength;
     double shift = (t - 0.5 * ramp) / (1.0 - ramp);
     if (t < ramp) shift = 0.5 * t * t / (ramp * (1.0 - ramp));
@@ -111,8 +106,7 @@ inline bool sample(const Pose& pose, const Bind& bind, const mos_math::Secondary
         normal = v3_cross(pose.incoming, inward);
     }
     const auto identity = ocd_math::Mat3::identity();
-    const double deep = anchored ? deepFalloff(pose.angle) : 0.0;
-    const double response = fade * pose.angle / pi * (1.0 - 0.55 * deep);
+    const double response = fade * pose.angle / pi;
     mos_math::BendControl control{pose.incoming, inward, normal, response,
         std::min(pose.before, pose.after), true};
     const auto editBefore = mos_math::sampleControl({}, identity, radial, control, before);
@@ -129,20 +123,10 @@ inline bool sample(const Pose& pose, const Bind& bind, const mos_math::Secondary
     // Outside, radius -offset turns at the bone ends. Inside, leave a
     // small fillet to avoid a zero-length arc at the miter.
     const double bindRadius = v3_len(bind.radial);
-    double fillet = 0.14 * bindRadius;
-    constexpr double degrees = pi / 180.0;
-    const double deepFit = anchored ? smoothUnit((pose.angle - 120.0 * degrees) / (35.0 * degrees)) : 0.0;
-    // Reserve tangent span to restore the section gradually. Fit the fillet
-    // across the whole section so near-neutral offsets can also turn.
-    const double tangentBudget = (0.92 - 0.26 * deepFit) *
-        std::min(pose.before, pose.after) / halfAngleTan;
-    fillet += (std::min(fillet, 0.5 * tangentBudget) - fillet) * deepFit;
+    const double fillet = 0.14 * bindRadius;
     if (anchored && offset > 0.0 && bindRadius > 1e-8) {
+        const double tangentBudget = 0.92 * std::min(pose.before, pose.after) / halfAngleTan;
         offset = std::min(offset, std::max(0.0, tangentBudget - fillet));
-    }
-    else if (offset < 0.0 && bindRadius > 1e-8) {
-        const double facing = smoothUnit(-offset / (0.5 * bindRadius));
-        offset *= 1.0 - 0.16 * deep * facing;
     }
     radial = v3_add(radial, v3_scale(pose.inward, offset - originalOffset));
     const double radius = std::max(-offset, fillet);
@@ -156,7 +140,7 @@ inline bool sample(const Pose& pose, const Bind& bind, const mos_math::Secondary
     const double lastLength = pose.after - removed;
     const double posedLength = firstLength + arcLength + lastLength;
     const double distance = anchored
-        ? redistributeLength(bind.fraction, pose.before + pose.after, posedLength, deep) + slide
+        ? redistributeLength(bind.fraction, pose.before + pose.after, posedLength) + slide
         : std::clamp(bind.fraction * posedLength + slide, 0.0, posedLength);
     if (distance <= firstLength) {
         const double restore = smoothUnit(1.0 - distance / firstLength);
@@ -184,19 +168,21 @@ struct LocalRegion {
     double endBefore = 0.0;
     double endAfter = 0.0;
     double radius = 0.0;
+    double extraBend = 0.0;
 };
 
 inline LocalRegion localRegion(const Pose& pose, double radius) {
     if (radius <= 1e-8) return {};
     LocalRegion region{pose};
     region.radius = radius;
-    constexpr double maxBend = 2.35; // Bound the support near a fully folded hinge.
-    const double tangentClearance = 1.45 * std::tan(0.5 * std::min(pose.angle, maxBend));
-    // Give the inner miter room to keep its offset as the elbow closes.
-    const double deep = deepFalloff(pose.angle);
-    const double elbowClearance = 1.14 * std::min(std::tan(0.5 * pose.angle), 4.0) + 1.0;
-    const double baseline = std::max(2.35, tangentClearance);
-    const double wanted = radius * (baseline + deep * std::max(0.0, elbowClearance - baseline));
+    constexpr double rightAngle = 1.57079632679489661923;
+    if (pose.angle > rightAngle && v3_len(pose.normal) > 0.0) {
+        region.extraBend = pose.angle - rightAngle;
+        const auto unwind = q_axis_angle(pose.normal, -region.extraBend);
+        region.anchorPose = buildPose(pose.pivot, pose.bindAxis, pose.parent,
+            q_mul(unwind, pose.child), pose.before, pose.after, pose.pivotDelta);
+    }
+    const double wanted = 2.35 * radius;
     region.anchorPose.before = std::min(wanted, 0.80 * pose.before);
     region.anchorPose.after = std::min(wanted, 0.80 * pose.after);
     region.endBefore = std::min(0.96 * pose.before, region.anchorPose.before + 1.25 * radius);
@@ -235,6 +221,14 @@ inline mos_math::GuideSample sampleLocal(const Pose& pose, const LocalRegion& re
         (region.anchorPose.before + region.anchorPose.after);
     Vec3 result{};
     if (!sample(region.anchorPose, local, before, after, manualIn, result, true)) return {};
+    if (region.extraBend > 0.0) {
+        // Carry the reference vertex around the hinge. Each limb receives
+        // its exact rotation at its anchor, with zero rotation slope there.
+        const double limbPosition = std::min(1.0, std::abs(axial) / start);
+        const double phase = 0.5 + std::copysign(0.5 * smoothUnit(limbPosition * limbPosition), axial);
+        const auto turn = q_axis_angle(pose.normal, region.extraBend * phase);
+        result = v3_add(pose.pivot, q_rotate_v3(turn, v3_sub(result, pose.pivot)));
+    }
     return {result, coverage};
 }
 
