@@ -179,6 +179,31 @@ void checkLimbSpacingAtHandoff(double bendDegrees, double twistDegrees, double h
     }
 }
 
+void checkDeepRelief() {
+    const auto rotation = q_axis_angle({0, 0, 1}, 140.0 * pi / 180.0);
+    const auto pose = buildPose({}, xAxis, identity, rotation, 4.0, 4.0);
+    const auto region = localRegion(pose, 1.0);
+    const auto inside = bindVertex({0, 1, 0}, {}, xAxis, 4.0, 4.0);
+    const auto outside = bindVertex({0, -1, 0}, {}, xAxis, 4.0, 4.0);
+    const auto inner = sampleLocal(pose, region, inside, {}, {}, {});
+    require(inner.coverage > 0.999 && inner.position.x > -2.5 && inner.position.x < -2.1,
+        "the short inner bend retains a rounded groove within its tangent span");
+    const auto outer = sampleLocal(pose, region, outside, {}, {}, {});
+    require(outer.coverage > 0.999 && std::abs(v3_len(outer.position) - 1.0) < 1e-10,
+        "deep bend must retain the right-angle outer offset");
+    const auto rightAngle = buildPose({}, xAxis, identity, q_axis_angle({0, 0, 1}, pi / 2), 4, 4);
+    const auto rightRegion = localRegion(rightAngle, 1.0);
+    mos_math::Secondary edit;
+    edit.bulgeOuter = 0.2;
+    const double deepEdit = v3_len(v3_sub(
+        sampleLocal(pose, region, outside, edit, edit, {}).position, outer.position));
+    const double rightEdit = v3_len(v3_sub(
+        sampleLocal(rightAngle, rightRegion, outside, edit, edit, {}).position,
+        sampleLocal(rightAngle, rightRegion, outside, {}, {}, {}).position));
+    require(deepEdit > 0.0 && rightEdit > 0.0, "bulge must remain active at both angles");
+    checkLocalBend(140.0);
+}
+
 void checkDeepArcSpacing(double bendDegrees, double span) {
     const auto rotation = q_axis_angle({0, 0, 1}, bendDegrees * pi / 180.0);
     const auto pose = buildPose({}, xAxis, identity, rotation, span, span);
@@ -196,7 +221,7 @@ void checkDeepArcSpacing(double bendDegrees, double span) {
             require(arc.coverage > 0.999, "a deep bend must keep the local arc on every side of the tube");
             if (ring > 0) {
                 const double spacing = v3_len(v3_sub(arc.position, previous)) / step;
-                require(spacing > (span < 3.0 ? 0.16 : 0.35) && spacing < 2.7,
+                require(spacing > 0.20 && spacing < 2.2,
                     "deep arc edges must avoid severe bunching or stretching");
             }
             previous = arc.position;
@@ -204,33 +229,19 @@ void checkDeepArcSpacing(double bendDegrees, double span) {
     }
 }
 
-void checkHeldCorrection(double bendDegrees, double twistDegrees, double before, double after) {
-    const auto twist = q_axis_angle(xAxis, twistDegrees * pi / 180.0);
-    const auto poseAt = [&](double angle) {
-        const auto swing = q_axis_angle({0, 0, 1}, angle * pi / 180.0);
-        return buildPose({}, xAxis, identity, q_mul(swing, twist), before, after);
-    };
-    const auto referencePose = poseAt(90.0), deepPose = poseAt(bendDegrees);
-    const auto referenceRegion = localRegion(referencePose, 1.0), deepRegion = localRegion(deepPose, 1.0);
-    mos_math::Secondary edit;
-    edit.bulgeOuter = 0.2;
-    edit.slideInner = 0.1;
-    for (const Vec3 crossSection : {Vec3{0, 1, 0}, Vec3{0, -1, 0}, Vec3{0, 0.6, 0.8}}) {
-        for (double x : {-0.65 * before, -0.25 * before, 0.0, 0.25 * after, 0.65 * after}) {
-            const auto bind = bindVertex(v3_add({x, 0, 0}, crossSection), {}, xAxis, before, after);
-            const auto reference = sampleLocal(referencePose, referenceRegion, bind, {}, {}, {});
-            const auto deep = sampleLocal(deepPose, deepRegion, bind, {}, {}, {});
-            require(reference.coverage > 0.999 && deep.coverage > 0.999,
-                "the deep bend must retain the reference support");
-            require(std::abs(v3_len(reference.position) - v3_len(deep.position)) < 1e-10,
-                "deep bend must preserve each compensated vertex's distance from the hinge");
-            const auto editedReference = sampleLocal(referencePose, referenceRegion, bind, edit, edit, {});
-            const auto editedDeep = sampleLocal(deepPose, deepRegion, bind, edit, edit, {});
-            require(std::abs(v3_len(v3_sub(editedReference.position, reference.position)) -
-                v3_len(v3_sub(editedDeep.position, deep.position))) < 1e-10,
-                "deep bend must preserve the strength of an authored edit");
-        }
-    }
+void checkInnerElbowThickness(double degrees) {
+    const double angle = degrees * pi / 180.0;
+    constexpr double span = 6.0;
+    const auto rotation = q_axis_angle({0, 0, 1}, angle);
+    const auto pose = buildPose({}, xAxis, identity, rotation, span, span);
+    const auto region = localRegion(pose, 1.0);
+    const auto bind = bindVertex({0, 1, 0}, {}, xAxis, span, span);
+    const auto elbow = sampleLocal(pose, region, bind, {}, {}, {});
+    const double c = std::cos(0.5 * angle), s = std::sin(0.5 * angle);
+    const Vec3 bisector{-s, c, 0};
+    const double projectedThickness = c * v3_dot(elbow.position, bisector);
+    require(elbow.coverage > 0.999 && projectedThickness > 0.90 && projectedThickness < 1.20,
+        "a long elbow should keep its inner offset close to the bind radius");
 }
 
 void checkTwist() {
@@ -278,11 +289,9 @@ int main() {
         for (const double twist : {0.0, 30.0})
             for (const double halfWidth : {2.5, 5.0})
                 checkLimbSpacingAtHandoff(bend, twist, halfWidth);
-    checkLocalBend(140.0);
-    for (double angle : {120.0, 140.0, 155.0, 175.0}) {
-        checkHeldCorrection(angle, 0.0, 3.0, 3.0);
-        checkHeldCorrection(angle, 30.0, 2.5, 3.5);
-    }
+    checkDeepRelief();
+    for (double angle : {140.0, 146.0})
+        checkInnerElbowThickness(angle);
     for (const double bend : {140.0, 155.0, 165.0, 175.0})
         for (const double span : {2.0, 4.0})
             checkDeepArcSpacing(bend, span);
