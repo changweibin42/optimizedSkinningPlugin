@@ -66,9 +66,9 @@ inline double deepFalloff(double angle) {
     return smoothUnit((angle - 90.0 * degrees) / (50.0 * degrees));
 }
 
-inline double redistributeLength(double fraction, double bindLength, double posedLength) {
+inline double redistributeLength(double fraction, double bindLength, double posedLength, double deep) {
     const double t = std::clamp(fraction, 0.0, 1.0);
-    const double ramp = std::min(0.20, 0.45 * posedLength / bindLength);
+    const double ramp = std::min(0.20 - 0.10 * deep, 0.45 * posedLength / bindLength);
     if (ramp <= 1e-8) return t * posedLength;
     double shift = (t - 0.5 * ramp) / (1.0 - ramp);
     if (t < ramp) shift = 0.5 * t * t / (ramp * (1.0 - ramp));
@@ -138,12 +138,7 @@ inline bool sample(const Pose& pose, const Bind& bind, const mos_math::Secondary
         std::min(pose.before, pose.after) / halfAngleTan;
     fillet += (std::min(fillet, 0.5 * tangentBudget) - fillet) * deepFit;
     if (anchored && offset > 0.0 && bindRadius > 1e-8) {
-        const double innerRelief = smoothUnit((pose.angle - 110.0 * degrees) / (30.0 * degrees));
-        const double facing = smoothUnit(offset / (0.5 * bindRadius));
-        const double narrowed = offset * (1.0 - (0.42 + 0.08 * deepFit) * innerRelief * facing);
-        const double fit = tangentBudget - fillet;
-        offset = std::min(narrowed, std::max(0.0, fit));
-        fillet *= 1.0 - 0.94 * deep * facing;
+        offset = std::min(offset, std::max(0.0, tangentBudget - fillet));
     }
     else if (offset < 0.0 && bindRadius > 1e-8) {
         const double facing = smoothUnit(-offset / (0.5 * bindRadius));
@@ -161,7 +156,7 @@ inline bool sample(const Pose& pose, const Bind& bind, const mos_math::Secondary
     const double lastLength = pose.after - removed;
     const double posedLength = firstLength + arcLength + lastLength;
     const double distance = anchored
-        ? redistributeLength(bind.fraction, pose.before + pose.after, posedLength) + slide
+        ? redistributeLength(bind.fraction, pose.before + pose.after, posedLength, deep) + slide
         : std::clamp(bind.fraction * posedLength + slide, 0.0, posedLength);
     if (distance <= firstLength) {
         const double restore = smoothUnit(1.0 - distance / firstLength);
@@ -181,27 +176,6 @@ inline bool sample(const Pose& pose, const Bind& bind, const mos_math::Secondary
             v3_add(v3_scale(outwardNormal, offset + relief * restore),
                 v3_scale(pose.outgoing, removed + distance - firstLength - arcLength))));
     }
-    if (anchored && deep > 0.0 && originalOffset > 0.0 && bindRadius > 1e-8) {
-        // At a tight fold the two rigid inner tangents already overlap.
-        // Measure the opening across their bisector at this arc station.
-        const double halfSin = std::sin(0.5 * pose.angle);
-        const double halfCos = std::cos(0.5 * pose.angle);
-        const auto across = v3_add(v3_scale(pose.incoming, halfCos), v3_scale(pose.inward, halfSin));
-        const auto along = v3_add(v3_scale(pose.incoming, -halfSin), v3_scale(pose.inward, halfCos));
-        const auto relative = v3_sub(result, pose.pivot);
-        const double depth = v3_dot(relative, along);
-        const double lateral = v3_dot(relative, across);
-        const double rigidGap = (depth * halfCos - originalOffset) / halfSin;
-        const double crease = 0.01 * bindRadius;
-        const double gap = 0.5 * (rigidGap + std::hypot(rigidGap, crease));
-        const double branch = distance < firstLength + 0.5 * arcLength ? -1.0 : 1.0;
-        const double excess = std::max(0.0, branch * lateral - gap);
-        const double rounding = -crease * std::expm1(-excess / crease);
-        const double facing = smoothUnit(originalOffset / (0.5 * bindRadius));
-        const double anchorFade = smoothUnit((1.0 - normalized) / 0.20);
-        result = v3_sub(result, v3_scale(across,
-            branch * (excess - rounding) * deep * facing * anchorFade));
-    }
     return true;
 }
 
@@ -218,7 +192,11 @@ inline LocalRegion localRegion(const Pose& pose, double radius) {
     region.radius = radius;
     constexpr double maxBend = 2.35; // Bound the support near a fully folded hinge.
     const double tangentClearance = 1.45 * std::tan(0.5 * std::min(pose.angle, maxBend));
-    const double wanted = radius * std::max(2.35, tangentClearance);
+    // Give the inner miter room to keep its offset as the elbow closes.
+    const double deep = deepFalloff(pose.angle);
+    const double elbowClearance = 1.14 * std::min(std::tan(0.5 * pose.angle), 4.0) + 1.0;
+    const double baseline = std::max(2.35, tangentClearance);
+    const double wanted = radius * (baseline + deep * std::max(0.0, elbowClearance - baseline));
     region.anchorPose.before = std::min(wanted, 0.80 * pose.before);
     region.anchorPose.after = std::min(wanted, 0.80 * pose.after);
     region.endBefore = std::min(0.96 * pose.before, region.anchorPose.before + 1.25 * radius);
