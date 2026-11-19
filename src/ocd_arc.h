@@ -129,13 +129,19 @@ inline bool sample(const Pose& pose, const Bind& bind, const mos_math::Secondary
     // Outside, radius -offset turns at the bone ends. Inside, leave a
     // small fillet to avoid a zero-length arc at the miter.
     const double bindRadius = v3_len(bind.radial);
-    const double fillet = 0.14 * bindRadius;
+    double fillet = 0.14 * bindRadius;
+    constexpr double degrees = pi / 180.0;
+    const double deepFit = anchored ? smoothUnit((pose.angle - 120.0 * degrees) / (35.0 * degrees)) : 0.0;
+    // Reserve tangent span to restore the section gradually. Fit the fillet
+    // across the whole section so near-neutral offsets can also turn.
+    const double tangentBudget = (0.92 - 0.26 * deepFit) *
+        std::min(pose.before, pose.after) / halfAngleTan;
+    fillet += (std::min(fillet, 0.5 * tangentBudget) - fillet) * deepFit;
     if (anchored && offset > 0.0 && bindRadius > 1e-8) {
-        constexpr double degrees = pi / 180.0;
         const double innerRelief = smoothUnit((pose.angle - 110.0 * degrees) / (30.0 * degrees));
         const double facing = smoothUnit(offset / (0.5 * bindRadius));
-        const double narrowed = offset * (1.0 - 0.42 * innerRelief * facing);
-        const double fit = 0.92 * std::min(pose.before, pose.after) / halfAngleTan - fillet;
+        const double narrowed = offset * (1.0 - (0.42 + 0.08 * deepFit) * innerRelief * facing);
+        const double fit = tangentBudget - fillet;
         offset = std::min(narrowed, std::max(0.0, fit));
     }
     else if (offset < 0.0 && bindRadius > 1e-8) {

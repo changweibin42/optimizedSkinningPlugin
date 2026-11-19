@@ -204,6 +204,31 @@ void checkDeepRelief() {
     checkLocalBend(140.0);
 }
 
+void checkDeepArcSpacing(double bendDegrees, double span) {
+    const auto rotation = q_axis_angle({0, 0, 1}, bendDegrees * pi / 180.0);
+    const auto pose = buildPose({}, xAxis, identity, rotation, span, span);
+    const auto region = localRegion(pose, 1.0);
+    const double anchor = region.anchorPose.before;
+    const double step = anchor / 200.0;
+    for (int side = 0; side < 24; ++side) {
+        const double azimuth = 2.0 * pi * side / 24.0;
+        Vec3 previous{};
+        for (int ring = 0; ring <= 400; ++ring) {
+            const double axial = anchor * (ring / 200.0 - 1.0);
+            const auto bind = bindVertex({axial, std::cos(azimuth), std::sin(azimuth)},
+                {}, xAxis, span, span);
+            const auto arc = sampleLocal(pose, region, bind, {}, {}, {});
+            require(arc.coverage > 0.999, "a deep bend must keep the local arc on every side of the tube");
+            if (ring > 0) {
+                const double spacing = v3_len(v3_sub(arc.position, previous)) / step;
+                require(spacing > 0.20 && spacing < 2.2,
+                    "deep arc edges must avoid severe bunching or stretching");
+            }
+            previous = arc.position;
+        }
+    }
+}
+
 void checkTwist() {
     const auto twist = q_axis_angle(xAxis, 120.0 * pi / 180.0);
     const auto pose = buildPose({}, xAxis, identity, twist, 4, 4);
@@ -250,6 +275,9 @@ int main() {
             for (const double halfWidth : {2.5, 5.0})
                 checkLimbSpacingAtHandoff(bend, twist, halfWidth);
     checkDeepRelief();
+    for (const double bend : {140.0, 155.0, 165.0, 175.0})
+        for (const double span : {2.0, 4.0})
+            checkDeepArcSpacing(bend, span);
     checkTwist();
 
     const auto pose = buildPose({}, xAxis, identity, q_axis_angle({0, 0, 1}, pi / 2), 4.0, 4.0);
