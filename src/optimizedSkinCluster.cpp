@@ -31,6 +31,7 @@
 #include <climits>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <set>
 
@@ -62,6 +63,11 @@ MObject OptimizedSkinCluster::aCorCompStrengthIn;   // 新增
 MObject OptimizedSkinCluster::aCorCompStrengthOut;  // 新增
 MObject OptimizedSkinCluster::aCorSigma;
 MObject OptimizedSkinCluster::aCorDebugLog;
+MObject OptimizedSkinCluster::aDdmIterations;
+MObject OptimizedSkinCluster::aDdmLambda;
+MObject OptimizedSkinCluster::aDdmKappa;
+MObject OptimizedSkinCluster::aDdmAlpha;
+MObject OptimizedSkinCluster::aDdmDebugLog;
 MObject OptimizedSkinCluster::aCorIncBudgetDiv;
 MObject OptimizedSkinCluster::aDisplayCoR;
 
@@ -172,6 +178,7 @@ MStatus OptimizedSkinCluster::initialize() {
     eAttr.addField("MOS", 3);
     eAttr.addField("CoR + MOS Secondary", 4);
     eAttr.addField("CoR + Compensation", 5);
+    eAttr.addField("DDM v4 (2019)", 6);
     eAttr.setKeyable(true);
     eAttr.setStorable(true);
     addAttribute(aAlgorithmType);
@@ -324,6 +331,35 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setNiceNameOverride("CoR Debug Log");
     CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aCorDebugLog));
     CHECK_MSTATUS_AND_RETURN_IT(attributeAffects(aCorDebugLog, MPxSkinCluster::outputGeom));
+
+    const ddm_v4::Settings ddmDefaults;
+    const auto addDdmControl = [&](MObject& attr, const char* name, const char* shortName,
+        MFnNumericData::Type type, double value, double maximum) -> MStatus {
+        MStatus result;
+        attr = nAttr.create(name, shortName, type, value, &result);
+        if (!result) return result;
+        nAttr.setMin(0.0);
+        nAttr.setMax(maximum);
+        nAttr.setKeyable(true);
+        nAttr.setStorable(true);
+        result = addAttribute(attr);
+        return result ? attributeAffects(attr, MPxSkinCluster::outputGeom) : result;
+    };
+    CHECK_MSTATUS_AND_RETURN_IT(addDdmControl(aDdmIterations, "ddmIterations", "ddmi",
+        MFnNumericData::kInt, ddmDefaults.iterations, 100.0));
+    CHECK_MSTATUS_AND_RETURN_IT(addDdmControl(aDdmLambda, "ddmLambda", "ddml",
+        MFnNumericData::kDouble, ddmDefaults.lambda, 100.0));
+    CHECK_MSTATUS_AND_RETURN_IT(addDdmControl(aDdmKappa, "ddmKappa", "ddmk",
+        MFnNumericData::kDouble, ddmDefaults.kappa, 100.0));
+    CHECK_MSTATUS_AND_RETURN_IT(addDdmControl(aDdmAlpha, "ddmAlpha", "ddma",
+        MFnNumericData::kDouble, ddmDefaults.alpha, 1.0));
+
+    aDdmDebugLog = nAttr.create("ddmDebugLog", "ddmdl", MFnNumericData::kBoolean, false, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    nAttr.setKeyable(false);
+    nAttr.setStorable(false);
+    CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aDdmDebugLog));
+    CHECK_MSTATUS_AND_RETURN_IT(attributeAffects(aDdmDebugLog, MPxSkinCluster::outputGeom));
 
     aDisplayCoR = nAttr.create("displayCoR", "dcr",
         MFnNumericData::kBoolean, 0, &status);
@@ -635,8 +671,10 @@ MStatus OptimizedSkinCluster::setDependentsDirty(
 
     MObject attr = plug.attribute();
 
-    if (attr == MPxSkinCluster::input || attr == MPxSkinCluster::inputGeom)
+    if (attr == MPxSkinCluster::input || attr == MPxSkinCluster::inputGeom) {
         m_paperCoR.valid = false;
+        m_ddmV4.valid = false;
+    }
 
     if (attr == aDiagFlags) {
         // diagFlags 影响 bind 时的 w_c 计算与 deform 时的 F 计算，
@@ -748,8 +786,10 @@ MStatus OptimizedSkinCluster::preEvaluation(const MDGContext& context,
         m_vtxCache.valid = false;
         ++m_currentWeightVersion;
     }
-    if (evaluationNode.dirtyPlugExists(MPxSkinCluster::inputGeom))
+    if (evaluationNode.dirtyPlugExists(MPxSkinCluster::inputGeom)) {
         m_paperCoR.valid = false;
+        m_ddmV4.valid = false;
+    }
     return MPxSkinCluster::preEvaluation(context, evaluationNode);
 }
 
@@ -1532,7 +1572,7 @@ MStatus OptimizedSkinCluster::deform(
     int algo = block.inputValue(aAlgorithmType, &status).asShort();
     if (!status) return status;
 
-    if (algo == 0) return deformCoR(block, iter, worldMat, multiIndex);
+    if (algo == 0 || algo == 6) return deformCoR(block, iter, worldMat, multiIndex, algo == 6);
 
     unsigned int nV = iter.count();
     collectBoneInfo(block);
@@ -1552,8 +1592,9 @@ MStatus OptimizedSkinCluster::deform(
 // ================================================================
 // deformCoR
 // ================================================================
-MStatus OptimizedSkinCluster::rebuildPaperCoR(
-    MDataBlock& block, unsigned int geometryIndex, double sigma, const char*& stage) {
+MStatus OptimizedSkinCluster::rebuildCenteredSkinning(
+    MDataBlock& block, unsigned int geometryIndex, double sigma, const ddm_v4::Settings* settings,
+    CenteredSkinningCache& cache, const char*& stage) {
     MStatus status;
     stage = "input geometry";
     auto geometry = block.inputArrayValue(MPxSkinCluster::input, &status);
@@ -1570,32 +1611,18 @@ MStatus OptimizedSkinCluster::rebuildPaperCoR(
     MPointArray positions;
     status = mesh.getPoints(positions, MSpace::kObject);
     if (!status) return status;
-    stage = "rest mesh triangles";
-    MIntArray triangleCounts, indices;
-    status = mesh.getTriangles(triangleCounts, indices);
-    if (!status) return status;
-
     std::vector<mathcore::Vec3> restPoints;
     restPoints.reserve(positions.length());
     for (unsigned int i = 0; i < positions.length(); ++i) {
         const auto& p = positions[i];
         restPoints.push_back({p.x, p.y, p.z});
     }
-    std::vector<cor_paper::Triangle> triangles;
-    triangles.reserve(indices.length() / 3);
-    for (unsigned int i = 0; i + 2 < indices.length(); i += 3) {
-        cor_paper::Triangle triangle = {static_cast<unsigned int>(indices[i]),
-            static_cast<unsigned int>(indices[i + 1]), static_cast<unsigned int>(indices[i + 2])};
-        if (triangle[0] >= restPoints.size() || triangle[1] >= restPoints.size() ||
-            triangle[2] >= restPoints.size()) return MS::kFailure;
-        triangles.push_back(triangle);
-    }
 
     stage = "vertex weights";
     auto weightList = block.inputArrayValue(MPxSkinCluster::weightList, &status);
     if (!status) return status;
 
-    PaperCoRCache next;
+    CenteredSkinningCache next;
     next.weights.resize(restPoints.size());
     std::set<unsigned int> influenceIds;
     const unsigned int rows = weightList.elementCount(&status);
@@ -1640,21 +1667,61 @@ MStatus OptimizedSkinCluster::rebuildPaperCoR(
         }
     }
 
-    next.centers = cor_paper::computeCenters(restPoints, next.weights, triangles, sigma);
+    if (settings) {
+        stage = "rest mesh edges";
+        const int edgeCount = mesh.numEdges(&status);
+        if (!status) return status;
+        std::vector<ddm_v4::Edge> edges;
+        edges.reserve(edgeCount);
+        for (int edge = 0; edge < edgeCount; ++edge) {
+            int2 vertices;
+            status = mesh.getEdgeVertices(edge, vertices);
+            if (!status) return status;
+            edges.push_back({static_cast<unsigned int>(vertices[0]),
+                static_cast<unsigned int>(vertices[1])});
+        }
+
+        stage = "DDM implicit bind diffusion";
+        ddm_v4::BindData data;
+        if (!ddm_v4::precompute(restPoints, next.weights, next.influenceIds.size(), edges,
+            *settings, data)) return MS::kFailure;
+        next.centers = std::move(data.centers);
+        next.weights = std::move(data.rotationWeights);
+        next.translationWeights = std::move(data.translationWeights);
+        next.ddmSettings = *settings;
+    }
+    else {
+        stage = "rest mesh triangles";
+        MIntArray triangleCounts, indices;
+        status = mesh.getTriangles(triangleCounts, indices);
+        if (!status) return status;
+        std::vector<cor_paper::Triangle> triangles;
+        triangles.reserve(indices.length() / 3);
+        for (unsigned int i = 0; i + 2 < indices.length(); i += 3) {
+            cor_paper::Triangle triangle = {static_cast<unsigned int>(indices[i]),
+                static_cast<unsigned int>(indices[i + 1]), static_cast<unsigned int>(indices[i + 2])};
+            if (triangle[0] >= restPoints.size() || triangle[1] >= restPoints.size() ||
+                triangle[2] >= restPoints.size()) return MS::kFailure;
+            triangles.push_back(triangle);
+        }
+        next.centers = cor_paper::computeCenters(restPoints, next.weights, triangles, sigma);
+    }
     next.geometryIndex = geometryIndex;
     next.weightVersion = m_currentWeightVersion;
     next.sigma = sigma;
     next.valid = true;
-    m_paperCoR = std::move(next);
+    cache = std::move(next);
     return MS::kSuccess;
 }
 
 MStatus OptimizedSkinCluster::deformCoR(
     MDataBlock& block, MItGeometry& iter,
-    const MMatrix& worldMat, unsigned int multiIndex) {
-    const bool debug = optSkinDebugLog() || block.inputValue(aCorDebugLog).asBool();
+    const MMatrix& worldMat, unsigned int multiIndex, bool useDdm) {
+    const bool debug = optSkinDebugLog() ||
+        block.inputValue(useDdm ? aDdmDebugLog : aCorDebugLog).asBool();
     const MString prefix = debug
-        ? MString("[CoR] ") + MFnDependencyNode(thisMObject()).name() + ": " : MString();
+        ? MString(useDdm ? "[DDM v4] " : "[CoR] ") + MFnDependencyNode(thisMObject()).name() + ": "
+        : MString();
     const auto reportFailure = [&](MStatus status, const char* stage) {
         if (!status && debug) MGlobal::displayWarning(prefix + stage + " - " + status.errorString());
         return status;
@@ -1662,30 +1729,56 @@ MStatus OptimizedSkinCluster::deformCoR(
 
     const double envelope = readEnvelopeFromNode();
     MStatus status;
-    const double sigma = block.inputValue(aCorSigma, &status).asDouble();
-    if (!status) return reportFailure(status, "read corSigma");
-    const bool forceFull = block.inputValue(aForceFullCoR, &status).asBool();
-    if (!status) return reportFailure(status, "read forceFullCoR");
+    double sigma = 0.0;
+    bool forceFull = false;
+    ddm_v4::Settings ddmSettings;
+    if (useDdm) {
+        ddmSettings.iterations = block.inputValue(aDdmIterations, &status).asInt();
+        if (!status) return reportFailure(status, "read ddmIterations");
+        ddmSettings.lambda = block.inputValue(aDdmLambda, &status).asDouble();
+        if (!status) return reportFailure(status, "read ddmLambda");
+        ddmSettings.kappa = block.inputValue(aDdmKappa, &status).asDouble();
+        if (!status) return reportFailure(status, "read ddmKappa");
+        ddmSettings.alpha = block.inputValue(aDdmAlpha, &status).asDouble();
+        if (!status) return reportFailure(status, "read ddmAlpha");
+    }
+    else {
+        sigma = block.inputValue(aCorSigma, &status).asDouble();
+        if (!status) return reportFailure(status, "read corSigma");
+        forceFull = block.inputValue(aForceFullCoR, &status).asBool();
+        if (!status) return reportFailure(status, "read forceFullCoR");
+    }
 
-    if (forceFull || !m_paperCoR.valid || m_paperCoR.geometryIndex != multiIndex ||
-        m_paperCoR.weightVersion != m_currentWeightVersion || m_paperCoR.sigma != sigma) {
-        m_paperCoR.valid = false;
+    auto& cache = useDdm ? m_ddmV4 : m_paperCoR;
+    if (forceFull || !cache.valid || cache.geometryIndex != multiIndex ||
+        cache.weightVersion != m_currentWeightVersion ||
+        (useDdm ? !(cache.ddmSettings == ddmSettings) : cache.sigma != sigma)) {
+        cache.valid = false;
         const char* stage = "bind cache";
-        status = rebuildPaperCoR(block, multiIndex, sigma, stage);
+        const auto start = std::chrono::steady_clock::now();
+        status = rebuildCenteredSkinning(block, multiIndex, sigma, useDdm ? &ddmSettings : nullptr,
+            cache, stage);
         if (!status) return reportFailure(status, stage);
         if (debug) {
-            const auto weighted = std::count_if(m_paperCoR.weights.begin(), m_paperCoR.weights.end(),
+            const auto weighted = std::count_if(cache.weights.begin(), cache.weights.end(),
                 [](const auto& weights) { return !weights.empty(); });
-            char message[180];
+            const double bindMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+            char message[200];
             snprintf(message, sizeof(message),
-                "bind geometry=%u vertices=%zu weighted=%zu influences=%zu sigma=%.4f",
-                multiIndex, m_paperCoR.centers.size(), static_cast<size_t>(weighted),
-                m_paperCoR.influenceIds.size(), sigma);
+                "bind geometry=%u vertices=%zu weighted=%zu influences=%zu bindMs=%.3f",
+                multiIndex, cache.centers.size(), static_cast<size_t>(weighted),
+                cache.influenceIds.size(), bindMs);
+            const size_t used = std::strlen(message);
+            if (useDdm)
+                snprintf(message + used, sizeof(message) - used, " p=%d lambda=%.3g kappa=%.3g alpha=%.3g",
+                    ddmSettings.iterations, ddmSettings.lambda, ddmSettings.kappa, ddmSettings.alpha);
+            else
+                snprintf(message + used, sizeof(message) - used, " sigma=%.4f", sigma);
             MGlobal::displayInfo(prefix + message);
         }
     }
 
-    const auto& cache = m_paperCoR;
     if (envelope <= 1e-6 || cache.influenceIds.empty()) {
         if (debug) MGlobal::displayWarning(prefix + (cache.influenceIds.empty()
             ? "no positive skin weights in the input geometry" : "envelope is zero"));
@@ -1760,8 +1853,11 @@ MStatus OptimizedSkinCluster::deformCoR(
         const MPoint restWorld = p * worldMat;
         const auto& center = cache.centers[vertex];
         const MPoint centerWorld = MPoint(center.x, center.y, center.z) * worldMat;
+        const auto& rotationWeights = cache.weights[vertex];
+        const auto& translationWeights = cache.translationWeights.empty()
+            ? rotationWeights : cache.translationWeights[vertex];
         const auto transform = cor_paper::vertexTransform(
-            {centerWorld.x, centerWorld.y, centerWorld.z}, cache.weights[vertex], bindToPose);
+            {centerWorld.x, centerWorld.y, centerWorld.z}, rotationWeights, translationWeights, bindToPose);
         const mathcore::Vec3 original{restWorld.x, restWorld.y, restWorld.z};
         const auto result = applyEnvelope(original, mathcore::apply_transform(transform, original), envelope);
         return MPoint(result.x, result.y, result.z) * worldInverse;
@@ -4584,9 +4680,11 @@ MStatus OptimizedSkinCluster::deformCoRComp(
 // ================================================================
 bool OptimizedSkinCluster::getCoRData(
     std::vector<mathcore::Vec3>& out) const {
-    if (MPlug(thisMObject(), aAlgorithmType).asShort() == 0) {
-        if (!m_paperCoR.valid || m_paperCoR.weightVersion != m_currentWeightVersion) return false;
-        out = m_paperCoR.centers;
+    const short algorithm = MPlug(thisMObject(), aAlgorithmType).asShort();
+    if (algorithm == 0 || algorithm == 6) {
+        const auto& cache = algorithm == 6 ? m_ddmV4 : m_paperCoR;
+        if (!cache.valid || cache.weightVersion != m_currentWeightVersion) return false;
+        out = cache.centers;
         return true;
     }
     if (!m_corCache.valid) return false;

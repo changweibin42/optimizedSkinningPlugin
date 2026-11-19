@@ -178,18 +178,25 @@ std::vector<mathcore::Vec3> computeCenters(const std::vector<mathcore::Vec3>& re
 
 mathcore::RigidTransform vertexTransform(const mathcore::Vec3& center, const Weights& weights,
     const std::vector<mathcore::RigidTransform>& bindToPose) {
-    if (weights.empty()) return {{0.0, 0.0, 0.0, 1.0}, {0.0, 0.0, 0.0}};
+    return vertexTransform(center, weights, weights, bindToPose);
+}
+
+mathcore::RigidTransform vertexTransform(const mathcore::Vec3& center,
+    const Weights& rotationWeights, const Weights& translationWeights,
+    const std::vector<mathcore::RigidTransform>& bindToPose) {
+    if (rotationWeights.empty() || translationWeights.empty())
+        return {{0.0, 0.0, 0.0, 1.0}, {0.0, 0.0, 0.0}};
 
     Quat sum{0.0, 0.0, 0.0, 0.0};
-    Vec3 posedCenter{0.0, 0.0, 0.0};
-    for (const auto& [influence, weight] : weights) {
-        const auto& transform = bindToPose[influence];
-        // Algorithm 1, line 5: apply the sign correction to the running
-        // quaternion sum, in influence order.
-        const double signedWeight = q_dot(sum, transform.q) < 0.0 ? -weight : weight;
-        sum = q_add(sum, q_scale(transform.q, signedWeight));
-        posedCenter = v3_add(posedCenter, v3_scale(apply_transform(transform, center), weight));
+    for (const auto& [influence, weight] : rotationWeights) {
+        const auto& q = bindToPose[influence].q;
+        // Resolve antipodality against the running quaternion sum.
+        const double signedWeight = q_dot(sum, q) < 0.0 ? -weight : weight;
+        sum = q_add(sum, q_scale(q, signedWeight));
     }
+    Vec3 posedCenter{0.0, 0.0, 0.0};
+    for (const auto& [influence, weight] : translationWeights)
+        posedCenter = v3_add(posedCenter, v3_scale(apply_transform(bindToPose[influence], center), weight));
     const Quat rotation = q_normalize(sum);
     return {rotation, v3_sub(posedCenter, q_rotate_v3(rotation, center))};
 }

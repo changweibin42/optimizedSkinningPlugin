@@ -4,7 +4,7 @@ import maya.api.OpenMaya as om
 import maya.cmds as cmds
 
 
-def smoke_test():
+def smoke_test(check_ddm=False):
     """Check rest and rotated output through Maya with sparse weight and matrix indices."""
     nodes = []
     selection = cmds.ls(selection=True, long=True)
@@ -55,11 +55,25 @@ def smoke_test():
         assert (posed[3] - rest[3]).length() > 0.1
         assert (posed[2] - rest[2]).length() > 0.1
 
+        if check_ddm:
+            cmds.setAttr(skin + ".algorithmType", 6)
+            cmds.setAttr(skin + ".ddmDebugLog", True)
+            ddm = mesh_fn.getPoints(om.MSpace.kObject)
+            assert_point(ddm[1], rest[1], "DDM unweighted vertex")
+            assert (ddm[3] - rest[3]).length() > 0.1
+            assert (ddm[2] - posed[2]).length() > 1e-3
+
+            cmds.setAttr(skin + ".ddmIterations", 0)
+            unsmoothed = mesh_fn.getPoints(om.MSpace.kObject)
+            assert_point(unsmoothed[3], expected, "DDM zero-iteration rigid influence")
+            cmds.setAttr(skin + ".ddmIterations", 20)
+
         cmds.setAttr(driver + ".rotateZ", 0)
         reset = mesh_fn.getPoints(om.MSpace.kObject)
         for vertex in range(len(rest)):
             assert_point(reset[vertex], rest[vertex], "reset vertex {}".format(vertex))
-        print("[CoR] Maya sparse weight/pose smoke test passed")
+        print("[DDM v4] Maya smoke test passed" if check_ddm
+              else "[CoR] Maya sparse weight/pose smoke test passed")
     finally:
         for node in reversed(nodes):
             if cmds.objExists(node):

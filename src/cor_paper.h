@@ -24,4 +24,8 @@ mathcore::RigidTransform vertexTransform(const mathcore::Vec3& center,
     const Weights& weights,
     const std::vector<mathcore::RigidTransform>& bindToPose);
 
+mathcore::RigidTransform vertexTransform(const mathcore::Vec3& center,
+    const Weights& rotationWeights, const Weights& translationWeights,
+    const std::vector<mathcore::RigidTransform>& bindToPose);
+
 } // namespace cor_paper

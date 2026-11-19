@@ -20,6 +20,7 @@
 #include "math_core.h"
 #include "algorithms.h"
 #include "cor_paper.h"
+#include "ddm_v4.h"
 #include "ocd_math.h"
 #include "optimizedSkinClusterCoR.h"
 
@@ -67,6 +68,7 @@ public:
     static MObject aCorCompStrengthOut;
     static MObject aCorSigma;
     static MObject aCorDebugLog;
+    static MObject aDdmIterations, aDdmLambda, aDdmKappa, aDdmAlpha, aDdmDebugLog;
     static MObject aDisplayCoR;
 
     // ---- MOS 可调参数 ----
@@ -158,7 +160,8 @@ private:
     // ================================================================
     // 四种算法的 deform 实现
     // ================================================================
-    MStatus deformCoR(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int);
+    MStatus deformCoR(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int,
+        bool useDdm = false);
     MStatus deformDLB(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int,
         bool useOpenCL = false);
     std::unique_ptr<DlbGpu> m_dlbGpu;
@@ -202,18 +205,21 @@ private:
     };
     CoRCache m_corCache;
 
-    struct PaperCoRCache {
+    struct CenteredSkinningCache {
         bool valid = false;
         unsigned int geometryIndex = 0;
         unsigned long long weightVersion = 0;
         double sigma = 0.0;
+        ddm_v4::Settings ddmSettings;
         std::vector<unsigned int> influenceIds;
         std::vector<cor_paper::Weights> weights;
+        std::vector<cor_paper::Weights> translationWeights;
         std::vector<mathcore::Vec3> centers;
     };
-    PaperCoRCache m_paperCoR;
+    CenteredSkinningCache m_paperCoR, m_ddmV4;
 
-    MStatus rebuildPaperCoR(MDataBlock& block, unsigned int geometryIndex, double sigma,
+    MStatus rebuildCenteredSkinning(MDataBlock& block, unsigned int geometryIndex,
+        double sigma, const ddm_v4::Settings* settings, CenteredSkinningCache& cache,
         const char*& stage);
 
     bool computeCoRCache(MDataBlock& block, unsigned int numVertices);
