@@ -21,58 +21,63 @@ BendFrame buildFrame(const Vec3& bindParent, const Vec3& bindPivot, const Vec3& 
     frame.bindPivot = bindPivot;
     frame.bindAxis = v3_norm(v3_sub(bindPivot, bindParent));
     frame.posePivot = posePivot;
-    const auto incoming = q_rotate_v3(parentRotation, frame.bindAxis);
-    const auto outgoing = q_rotate_v3(childRotation, frame.bindAxis);
-    const auto bendNormal = v3_cross(incoming, outgoing);
-    const double sine = v3_len(bendNormal);
+    frame.incoming = q_rotate_v3(parentRotation, frame.bindAxis);
+    frame.outgoing = q_rotate_v3(childRotation, frame.bindAxis);
+    const auto normal = v3_cross(frame.incoming, frame.outgoing);
+    const double sine = v3_len(normal);
     if (sine < 1e-8) return frame;
 
     constexpr double degrees = 3.14159265358979323846 / 180.0;
-    const double angle = std::atan2(sine, v3_dot(incoming, outgoing));
-    frame.activation = smoothStep(0.0, 90.0 * degrees, angle) *
-        (1.0 - smoothStep(150.0 * degrees, 170.0 * degrees, angle));
-    const auto planeNormal = v3_scale(bendNormal, 1.0 / sine);
-    frame.incomingNormal = v3_cross(planeNormal, incoming);
-    frame.outgoingNormal = v3_cross(planeNormal, outgoing);
-    frame.inward = v3_norm(v3_add(frame.incomingNormal, frame.outgoingNormal));
+    frame.angle = std::atan2(sine, v3_dot(frame.incoming, frame.outgoing));
+    frame.activation = smoothStep(0.0, 60.0 * degrees, frame.angle) *
+        (1.0 - smoothStep(100.0 * degrees, 145.0 * degrees, frame.angle));
+    frame.bendNormal = v3_scale(normal, 1.0 / sine);
+    frame.incomingNormal = v3_cross(frame.bendNormal, frame.incoming);
     return frame;
 }
 
 Vec3 correction(const BendFrame& frame, const Vec3& rest, const Vec3& posed,
     const Quat& vertexRotation, double overlap, double innerStrength, double outerStrength) {
     if (frame.activation == 0.0 || overlap <= 0.0) return {};
+
     const auto offset = v3_sub(rest, frame.bindPivot);
     const double along = v3_dot(offset, frame.bindAxis);
     const auto radial = v3_sub(offset, v3_scale(frame.bindAxis, along));
     const double radius = v3_len(radial);
     if (radius < 1e-8 || std::abs(along) >= 2.75 * radius) return {};
 
-    const auto axis = q_rotate_v3(vertexRotation, frame.bindAxis);
-    const auto inward = v3_norm(v3_sub(frame.inward, v3_scale(axis, v3_dot(frame.inward, axis))));
-    const double target = v3_dot(q_rotate_v3(vertexRotation, radial), inward);
-    const double sideMask = smoothStep(0.15, 0.65, std::abs(target) / radius);
-    const bool inner = target > 0.0;
-    const double strength = inner ? innerStrength : outerStrength;
-    if (sideMask == 0.0 || strength <= 0.0) return {};
+    // The sweep radius exceeds the rest radius to keep inside rings ordered.
+    const double sweepRadius = 1.3 * radius;
+    const double halfSpan = sweepRadius * std::tan(frame.angle * 0.5);
+    const double t = std::clamp(0.5 + 0.5 * along / halfSpan, 0.0, 1.0);
+    const double phase = t * frame.angle;
+    const double sine = std::sin(phase);
+    const double cosine = std::cos(phase);
+    const auto tangent = v3_add(v3_scale(frame.incoming, cosine), v3_scale(frame.incomingNormal, sine));
+    const auto inward = v3_cross(frame.bendNormal, tangent);
+    auto center = v3_add(frame.posePivot,
+        v3_add(v3_scale(frame.incoming, sweepRadius * sine - halfSpan),
+            v3_scale(frame.incomingNormal, sweepRadius * (1.0 - cosine))));
+    if (along < -halfSpan)
+        center = v3_add(center, v3_scale(frame.incoming, along + halfSpan));
+    if (along > halfSpan)
+        center = v3_add(center, v3_scale(frame.outgoing, along - halfSpan));
 
-    // Smooth the intersection of the two offset planes to round the corner.
-    const auto fromPivot = v3_sub(posed, frame.posePivot);
-    const double incomingDistance = v3_dot(fromPivot, frame.incomingNormal);
-    const double outgoingDistance = v3_dot(fromPivot, frame.outgoingNormal);
-    const double width = radius * (inner ? 0.15 : 0.40);
-    const double blend = std::clamp(0.5 + 0.5 * (outgoingDistance - incomingDistance) / width, 0.0, 1.0);
-    const double distance = blend * incomingDistance + (1.0 - blend) * outgoingDistance -
-        width * blend * (1.0 - blend);
-    const double deficit = target - distance;
-    if ((inner && deficit <= 0.0) || (!inner && deficit >= 0.0)) return {};
+    // Carry CoR's twist across while aligning the section with the sweep tangent.
+    const auto posedAxis = q_rotate_v3(vertexRotation, frame.bindAxis);
+    const auto align = q_between(posedAxis, tangent);
+    const auto section = q_rotate_v3(align, q_rotate_v3(vertexRotation, radial));
+    const double across = v3_dot(section, inward) / radius;
+    const double side = smoothStep(-1.0, 1.0, across);
+    const double strength = std::clamp(outerStrength * (1.0 - side) + innerStrength * side, 0.0, 1.0);
 
-    const auto gradient = v3_add(v3_scale(frame.incomingNormal, blend),
-        v3_scale(frame.outgoingNormal, 1.0 - blend));
-    const double gradientLength = v3_len(gradient);
-    const double axialMask = 1.0 - smoothStep(0.35, 2.75, std::abs(along) / radius);
-    const double amount = std::clamp(deficit / gradientLength, -0.6 * radius, 0.6 * radius);
-    return v3_scale(gradient, amount / gradientLength *
-        frame.activation * overlap * sideMask * axialMask * strength);
+    const double outer = smoothStep(0.0, 1.0, -across);
+    const double arcMask = 1.0 - smoothStep(0.05, 1.0, std::abs(2.0 * t - 1.0));
+    const auto fullSection = v3_scale(section, 1.0 + 0.65 * outer * arcMask);
+    const auto target = v3_add(center, fullSection);
+    const double axialMask = 1.0 - smoothStep(1.35, 2.75, std::abs(along) / radius);
+    const double weightMask = smoothStep(0.0, 0.12, overlap);
+    return v3_scale(v3_sub(target, posed), frame.activation * strength * axialMask * weightMask);
 }
 
 } // namespace cor_contour

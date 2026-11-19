@@ -343,6 +343,7 @@ MStatus OptimizedSkinCluster::initialize() {
         if (!result) return result;
         nAttr.setMin(0.0);
         nAttr.setMax(2.0);
+        nAttr.setSoftMax(1.0);
         nAttr.setKeyable(true);
         nAttr.setStorable(true);
         nAttr.setNiceNameOverride(label);
@@ -1875,6 +1876,7 @@ MStatus OptimizedSkinCluster::deformCoR(
     };
     std::vector<ContourPair> contourPairs;
     size_t pairCount = 0, activeBends = 0;
+    const cor_contour::BendFrame* isolatedBend = nullptr;
     if (innerStrength > 0.0 || outerStrength > 0.0) {
         const MPlug matrixPlug(thisMObject(), MPxSkinCluster::matrix);
         std::vector<MObject> joints(influenceCount);
@@ -1915,6 +1917,12 @@ MStatus OptimizedSkinCluster::deformCoR(
                 if (!parentJoint.hasFn(MFn::kDagNode) || !ancestor.setObject(parentJoint)) break;
             }
         }
+        // A two-influence tube can have overlapping rigid sections even where
+        // weights are already 100% on one side. Let the axial taper reach those rings.
+        if (influenceCount == 2 && activeBends == 1) {
+            for (const auto& pair : contourPairs)
+                if (pair.frame.activation > 0.0) isolatedBend = &pair.frame;
+        }
     }
 
     MPointArray points;
@@ -1942,7 +1950,11 @@ MStatus OptimizedSkinCluster::deformCoR(
         const mathcore::Vec3 original{restWorld.x, restWorld.y, restWorld.z};
         const auto base = mathcore::apply_transform(transform, original);
         auto posed = base;
-        if (activeBends > 0) {
+        if (isolatedBend) {
+            posed = mathcore::v3_add(posed, cor_contour::correction(*isolatedBend, original, base,
+                transform.q, 1.0, innerStrength, outerStrength));
+        }
+        else if (activeBends > 0) {
             for (const auto& child : rotationWeights) {
                 const auto& pair = contourPairs[child.first];
                 if (pair.frame.activation == 0.0) continue;

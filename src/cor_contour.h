@@ -8,9 +8,11 @@ struct BendFrame {
     mathcore::Vec3 bindPivot{};
     mathcore::Vec3 bindAxis{};
     mathcore::Vec3 posePivot{};
+    mathcore::Vec3 incoming{};
+    mathcore::Vec3 outgoing{};
     mathcore::Vec3 incomingNormal{};
-    mathcore::Vec3 outgoingNormal{};
-    mathcore::Vec3 inward{};
+    mathcore::Vec3 bendNormal{};
+    double angle = 0.0;
     double activation = 0.0;
 };
 
