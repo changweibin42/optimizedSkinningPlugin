@@ -140,6 +140,26 @@ void checkTube(double transitionWidth, double angle) {
             minimum = std::min(minimum, v3_dot(v3_sub(posed[at + sides], posed[at]), tangent));
         }
     }
+    if (angle == pi / 4 || angle == pi / 2) {
+        double minimumStraight = spacing;
+        double largestSpacingChange = 0.0;
+        for (int ring = 1; ring < rings - 1; ++ring) {
+            const double along = (ring - rings / 2) * spacing;
+            if (std::abs(along) < 1.4 || std::abs(along) > 4.8) continue;
+            const Vec3 axis = along < 0.0 ? frame.incoming : frame.outgoing;
+            for (int side = 0; side < sides; ++side) {
+                const int at = ring * sides + side;
+                const double back = v3_dot(v3_sub(posed[at], posed[at - sides]), axis);
+                const double next = v3_dot(v3_sub(posed[at + sides], posed[at]), axis);
+                minimumStraight = std::min(minimumStraight, std::min(back, next));
+                largestSpacingChange = std::max(largestSpacingChange, std::abs(next - back));
+            }
+        }
+        std::cout << "Straight spacing: min=" << minimumStraight
+            << " largest step=" << largestSpacingChange << '\n';
+        require(minimumStraight > 0.055, "avoid compressing the straight branch into dense bands");
+        require(largestSpacingChange < 0.025, "adjacent straight rings must change spacing gradually");
+    }
     std::cout << "Tube angle=" << angle * 180.0 / pi << " weight half-width="
         << transitionWidth << " minimum axial spacing=" << minimum << '\n';
     require(minimum > 0.0, "adjacent rings must advance along the bend");
