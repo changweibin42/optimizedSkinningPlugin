@@ -111,6 +111,11 @@ void checkTube(double transitionWidth, double angle) {
             if (std::abs(x) >= 1.2) {
                 const auto& inside = posed[ring * sides];
                 const auto& outside = posed[ring * sides + sides / 2];
+                for (int side = 0; side < sides; ++side) {
+                    const auto& point = posed[ring * sides + side];
+                    const double skew = x < 0.0 ? point.x - inside.x : point.y - inside.y;
+                    require(std::abs(skew) < 1e-10, "straight-branch rings must remain planar");
+                }
                 require(x < 0.0
                     ? std::abs(inside.y - 1.0) < 1e-10 && std::abs(outside.y + 1.0) < 1e-10
                     : std::abs(inside.x + 1.0) < 1e-10 && std::abs(outside.x - 1.0) < 1e-10,

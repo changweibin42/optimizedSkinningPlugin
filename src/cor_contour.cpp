@@ -11,6 +11,32 @@ double smoothStep(double start, double end, double value) {
     return t * t * (3.0 - 2.0 * t);
 }
 
+// Integrate a piecewise-linear spacing adjustment. The outer two ramps
+// return the axial offset and its derivative to zero at the end of support.
+double redistributeRings(double along, double span) {
+    const double x = std::abs(along) / span;
+    if (x >= 1.0) return along;
+
+    constexpr double core = 0.45;
+    constexpr double shoulder = 0.5 * (1.0 - core);
+    constexpr double centerGain = 1.02;
+    constexpr double shoulderLoss = centerGain * core / (1.0 - core);
+
+    double offset;
+    if (x <= core) {
+        offset = centerGain * x * (1.0 - 0.5 * x / core);
+    }
+    else if (x < core + shoulder) {
+        const double t = x - core;
+        offset = 0.5 * centerGain * core - 0.5 * shoulderLoss * t * t / shoulder;
+    }
+    else {
+        const double t = 1.0 - x;
+        offset = 0.5 * shoulderLoss * t * t / shoulder;
+    }
+    return along + std::copysign(span * offset, along);
+}
+
 } // namespace
 
 using namespace mathcore;
@@ -57,13 +83,10 @@ Vec3 correction(const BendFrame& frame, const Vec3& rest, const Vec3& posed,
     const double halfSpan = sweepRadius * std::tan(frame.angle * 0.5);
     const auto posedAxis = q_rotate_v3(vertexRotation, frame.bindAxis);
     const auto posedSection = q_rotate_v3(vertexRotation, radial);
-    const auto posedInward = v3_norm(v3_cross(frame.bendNormal, posedAxis));
-    const double inner = smoothStep(0.15, 1.0, v3_dot(posedSection, posedInward) / radius);
-    // Reparameterize the same inside contour. The mapping is monotone and
-    // joins the original spacing with unit slope at the edge of its support.
+    // Use one axial parameter for the full cross section. Different
+    // inside/outside parameters shear rings even on the straight branches.
     const double spreadSpan = std::min(2.8 * halfSpan, fullSupport * radius);
-    const double spread = std::max(0.0, 1.0 - std::abs(along) / spreadSpan);
-    const double sample = along * (1.0 + 1.5 * inner * spread * spread);
+    const double sample = redistributeRings(along, spreadSpan);
     const double t = std::clamp(0.5 + 0.5 * sample / halfSpan, 0.0, 1.0);
     const double phase = t * frame.angle;
     const double sine = std::sin(phase);
