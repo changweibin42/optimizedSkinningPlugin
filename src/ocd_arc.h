@@ -9,6 +9,7 @@ using namespace mathcore;
 struct Bind {
     double fraction = 0.0;
     Vec3 radial{};
+    double oppositeWeight = 0.0;
 };
 
 inline Bind bindVertex(const Vec3& point, const Vec3& pivot, const Vec3& axis,
@@ -45,6 +46,11 @@ inline Pose buildPose(const Vec3& pivot, const Vec3& axis, const Quat& parent,
         pose.inward = v3_cross(pose.normal, pose.incoming);
     }
     return pose;
+}
+
+inline double smoothUnit(double value) {
+    const double t = std::clamp(value, 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
 }
 
 inline double redistributeLength(double fraction, double bindLength, double posedLength) {
@@ -103,12 +109,24 @@ inline bool sample(const Pose& pose, const Bind& bind, const mos_math::Secondary
     const double slide = v3_dot(edited, pose.incoming);
     radial = v3_sub(edited, v3_scale(pose.incoming, slide));
 
-    const double offset = v3_dot(radial, pose.inward);
+    const double originalOffset = v3_dot(radial, pose.inward);
+    double offset = originalOffset;
     const double height = v3_dot(radial, pose.normal);
     const double halfAngleTan = std::tan(0.5 * pose.angle);
     // Outside, radius -offset turns at the bone ends. Inside, leave a
     // small fillet to avoid a zero-length arc at the miter.
-    const double radius = std::max(-offset, 0.14 * v3_len(bind.radial));
+    const double bindRadius = v3_len(bind.radial);
+    const double radius = std::max(-offset, 0.14 * bindRadius);
+    if (anchored && offset > 0.0 && bindRadius > 1e-8) {
+        constexpr double degrees = pi / 180.0;
+        const double deep = smoothUnit((pose.angle - 110.0 * degrees) / (30.0 * degrees));
+        const double facing = smoothUnit(offset / (0.5 * bindRadius));
+        const double narrowed = offset * (1.0 - 0.42 * deep * facing);
+        const double fit = 0.92 * std::min(pose.before, pose.after) / halfAngleTan - radius;
+        offset = std::min(narrowed, std::max(0.0, fit));
+        radial = v3_add(radial, v3_scale(pose.inward, offset - originalOffset));
+    }
+    const double relief = originalOffset - offset;
     const double removed = (offset + radius) * halfAngleTan;
     if (removed >= std::min(pose.before, pose.after)) return false;
 
@@ -121,7 +139,9 @@ inline bool sample(const Pose& pose, const Bind& bind, const mos_math::Secondary
         ? redistributeLength(bind.fraction, pose.before + pose.after, posedLength) + slide
         : std::clamp(bind.fraction * posedLength + slide, 0.0, posedLength);
     if (distance <= firstLength) {
-        result = v3_add(first, v3_scale(pose.incoming, distance));
+        const double restore = smoothUnit(1.0 - distance / firstLength);
+        result = v3_add(first, v3_add(v3_scale(pose.incoming, distance),
+            v3_scale(pose.inward, relief * restore)));
     }
     else if (distance < firstLength + arcLength) {
         const double phase = (distance - firstLength) / radius;
@@ -131,8 +151,9 @@ inline bool sample(const Pose& pose, const Bind& bind, const mos_math::Secondary
     }
     else {
         const auto outwardNormal = v3_cross(pose.normal, pose.outgoing);
+        const double restore = smoothUnit((distance - firstLength - arcLength) / lastLength);
         result = v3_add(pose.pivot, v3_add(v3_scale(pose.normal, height),
-            v3_add(v3_scale(outwardNormal, offset),
+            v3_add(v3_scale(outwardNormal, offset + relief * restore),
                 v3_scale(pose.outgoing, removed + distance - firstLength - arcLength))));
     }
     return true;
@@ -164,9 +185,16 @@ inline mos_math::GuideSample sampleLocal(const Pose& pose, const LocalRegion& re
     const double start = axial < 0.0 ? region.anchorPose.before : region.anchorPose.after;
     const double end = axial < 0.0 ? region.endBefore : region.endAfter;
     const double distance = std::abs(axial);
-    if (distance >= end) return {};
+    const double span = axial < 0.0 ? pose.before : pose.after;
+    if (distance >= span || end <= start) return {};
     const double t = std::clamp((distance - start) / (end - start), 0.0, 1.0);
-    const double coverage = (1.0 - t) * (1.0 - t) * (1.0 - t) * (1.0 + 3.0 * t + 6.0 * t * t);
+    const double geometric = (1.0 - t) * (1.0 - t) * (1.0 - t) * (1.0 + 3.0 * t + 6.0 * t * t);
+    // Delay the handoff while the opposite influence can still visibly
+    // pull the limb inward. The end blend protects the original end rings.
+    const double skin = smoothUnit(bind.oppositeWeight / 0.04);
+    const double cap = 1.0 - smoothUnit((distance / span - 0.93) / 0.07);
+    const double coverage = geometric + (1.0 - geometric) * skin * cap;
+    if (coverage <= 0.0) return {};
     Bind local = bind;
     local.fraction = (axial + region.anchorPose.before) /
         (region.anchorPose.before + region.anchorPose.after);

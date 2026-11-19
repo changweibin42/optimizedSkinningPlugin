@@ -2473,6 +2473,13 @@ bool OptimizedSkinCluster::computeMosCache(
                 if (std::abs(axial) <= radiusWindow)
                     m_mosCache.arcRadius = std::max(m_mosCache.arcRadius,
                         mathcore::v3_len(m_mosCache.arcVertices[i].radial));
+                const auto oppositeBone = axial < 0.0 ? chain[1] : chain[0];
+                double opposite = 0.0, total = 0.0;
+                for (const auto& weight : m_vtxCache.vertices[i]) {
+                    total += weight.second;
+                    if (weight.first == oppositeBone) opposite += weight.second;
+                }
+                if (total > 0.0) m_mosCache.arcVertices[i].oppositeWeight = opposite / total;
             }
         }
     }

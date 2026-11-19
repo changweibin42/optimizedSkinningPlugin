@@ -124,6 +124,40 @@ void checkLocalBend(double degrees) {
     }
 }
 
+void checkWeightedHandoff() {
+    const auto rotation = q_axis_angle({0, 0, 1}, pi / 2);
+    const auto pose = buildPose({}, xAxis, identity, rotation, 5, 5);
+    const auto region = localRegion(pose, 1.0);
+    for (const double side : {-1.0, 1.0}) {
+        auto bind = bindVertex({side * 4.0, 1.0, 0}, {}, xAxis, 5, 5);
+        const auto rigid = q_rotate_v3(side < 0.0 ? identity : rotation, {side * 4.0, 1.0, 0});
+        require(sampleLocal(pose, region, bind, {}, {}, {}).coverage == 0.0,
+            "beyond the geometric region a pure LBS limb remains untouched");
+        bind.oppositeWeight = 0.04;
+        const auto retained = sampleLocal(pose, region, bind, {}, {}, {});
+        require(retained.coverage == 1.0 && v3_len(v3_sub(retained.position, rigid)) < 1e-10,
+            "retain the straight branch through the remaining mixed-weight band");
+        bind.fraction = side < 0.0 ? 0.0 : 1.0;
+        require(sampleLocal(pose, region, bind, {}, {}, {}).coverage == 0.0,
+            "the end ring stays with LBS even if painted with mixed weights");
+    }
+}
+
+void checkDeepRelief() {
+    const auto rotation = q_axis_angle({0, 0, 1}, 140.0 * pi / 180.0);
+    const auto pose = buildPose({}, xAxis, identity, rotation, 4.0, 4.0);
+    const auto region = localRegion(pose, 1.0);
+    const auto inside = bindVertex({0, 1, 0}, {}, xAxis, 4.0, 4.0);
+    const auto outside = bindVertex({0, -1, 0}, {}, xAxis, 4.0, 4.0);
+    const auto inner = sampleLocal(pose, region, inside, {}, {}, {});
+    require(inner.coverage > 0.999 && inner.position.x > -2.1 && inner.position.x < -1.4,
+        "the inner bend relief brings the groove closer to the hinge");
+    const auto outer = sampleLocal(pose, region, outside, {}, {}, {});
+    require(outer.coverage > 0.999 && v3_len(outer.position) > 0.999 &&
+        v3_len(outer.position) < 1.001, "deep relief must keep the outer arc radius");
+    checkLocalBend(140.0);
+}
+
 } // namespace
 
 int main() {
@@ -135,6 +169,9 @@ int main() {
         checkBend(angle);
         checkLocalBend(angle);
     }
+
+    checkWeightedHandoff();
+    checkDeepRelief();
 
     const auto pose = buildPose({}, xAxis, identity, q_axis_angle({0, 0, 1}, pi / 2), 4.0, 4.0);
     const auto inside = bindVertex({}, {}, xAxis, 4.0, 4.0);
@@ -155,5 +192,5 @@ int main() {
     const auto moved = evaluate(pose, input, slide);
     require(moved.x > base.x && std::abs(moved.y - base.y) < 1e-10,
         "incoming slide moves along the offset curve");
-    std::cout << "OCD arc bind, spacing, 45/90/120 degree bends, bulge and slide checks passed\n";
+    std::cout << "OCD arc bind, spacing, 45/90/120/140 degree bends, bulge and slide checks passed\n";
 }
