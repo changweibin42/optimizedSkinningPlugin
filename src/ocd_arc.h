@@ -139,7 +139,9 @@ inline bool sample(const Pose& pose, const Bind& bind, const mos_math::Secondary
     // Fit the inner roundover before reducing the limb-normal offset.
     // Its tangent points stay on the two posed limb directions.
     const double remainingForFillet = tangentBudget - std::max(0.0, offset);
-    const double minimumFillet = std::min(0.06 * bindRadius, 0.5 * tangentBudget);
+    // Keep a small finite turn when the inner branches approach each other.
+    // The regular fillet stays in place wherever it still fits.
+    const double minimumFillet = std::min(0.015 * bindRadius, 0.5 * tangentBudget);
     const double fittedFillet = std::clamp(remainingForFillet, minimumFillet, fillet);
     fillet += (fittedFillet - fillet) * deep;
     if (anchored && offset > 0.0 && bindRadius > 1e-8) {

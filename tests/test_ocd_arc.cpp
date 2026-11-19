@@ -262,6 +262,34 @@ void checkHeldCoverage(double bendDegrees, double twistDegrees) {
     }
 }
 
+void checkDeepInnerOpening(double degrees) {
+    const double angle = degrees * pi / 180.0;
+    constexpr double span = 6.0;
+    const auto child = q_axis_angle({0, 0, 1}, angle);
+    const auto pose = buildPose({}, xAxis, identity, child, span, span);
+    const auto region = localRegion(pose, 1.0);
+    const double cosine = std::cos(0.5 * angle);
+    const double sine = std::sin(0.5 * angle);
+    const Vec3 across{cosine, sine, 0}, along{-sine, cosine, 0};
+    int measured = 0;
+    const auto inner = [&](double x) {
+        const auto bind = bindVertex({x, 1, 0}, {}, xAxis, span, span);
+        const auto arc = sampleLocal(pose, region, bind, {}, {}, {});
+        require(arc.coverage > 0.999, "measure the fully corrected inner bend");
+        return arc.position;
+    };
+    for (int ring = 0; ring <= 500; ++ring) {
+        const double x = region.anchorPose.before * ring / 500.0;
+        const auto first = inner(-x), second = inner(x);
+        const double depth = 0.5 * v3_dot(v3_add(first, second), along);
+        if (depth * cosine > 1.0) continue;
+        ++measured;
+        require(v3_dot(v3_sub(second, first), across) < 0.08,
+            "the inner fold must avoid a wide secondary opening in the overlap zone");
+    }
+    require(measured > 100, "measure the inner opening across multiple rings");
+}
+
 void checkTwist() {
     const auto twist = q_axis_angle(xAxis, 120.0 * pi / 180.0);
     const auto pose = buildPose({}, xAxis, identity, twist, 4, 4);
@@ -315,6 +343,8 @@ int main() {
         checkHeldCoverage(angle, 0.0);
         checkHeldCoverage(angle, 30.0);
     }
+    for (double angle : {133.0, 137.0, 140.0, 146.0})
+        checkDeepInnerOpening(angle);
     checkTwist();
 
     const auto pose = buildPose({}, xAxis, identity, q_axis_angle({0, 0, 1}, pi / 2), 4.0, 4.0);
