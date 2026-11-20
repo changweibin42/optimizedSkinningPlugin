@@ -400,6 +400,55 @@ void checkRadialCorrection() {
     }
 }
 
+void checkNarrowFold() {
+    constexpr double span = 6.0;
+    for (double degrees : {90.0, 120.0, 140.0}) {
+        const double angle = degrees * pi / 180.0;
+        const auto rotation = q_axis_angle({0, 0, 1}, angle);
+        const auto pose = buildPose({}, xAxis, identity, rotation, span, span);
+        const auto base = localRegion(pose, 1.0);
+        auto fold = base;
+        fold.foldBefore = fold.foldAfter = 4.15;
+        const double reference = radialReferenceAngle(angle);
+        const auto refRotation = q_axis_angle({0, 0, 1}, reference);
+        const auto sample = [&](const LocalRegion& region, double x, double azimuth) {
+            const Vec3 rest{x, std::cos(azimuth), std::sin(azimuth)};
+            const double weight = smoothUnit(0.5 + x / 10.0);
+            auto bind = bindVertex(rest, {}, xAxis, span, span);
+            bind.oppositeWeight = x < 0.0 ? weight : 1.0 - weight;
+            const auto lbs = v3_add(v3_scale(rest, 1.0 - weight),
+                v3_scale(q_rotate_v3(rotation, rest), weight));
+            return v3_add(lbs, radialCorrection(pose, region, bind, lbs, reference, refRotation,
+                nullptr, nullptr, {}));
+        };
+        for (double x : {-5.5, -2.0, 0.0, 2.0, 5.5}) {
+            require(v3_len(v3_sub(sample(fold, x, pi), sample(base, x, pi))) == 0.0,
+                "the inner guide must leave the outer contour unchanged");
+            if (degrees == 90.0 || std::abs(x) >= 5.5)
+                require(v3_len(v3_sub(sample(fold, x, 0.0), sample(base, x, 0.0))) == 0.0,
+                    "the guide must preserve 90 degrees and single-bone tails");
+        }
+        if (degrees != 140.0) continue;
+        const auto bisector = v3_norm(v3_sub(pose.outgoing, pose.incoming));
+        const double tipDepth = v3_dot(sample(fold, 0.0, 0.0), bisector);
+        require(tipDepth > 1.8 && tipDepth < 1.9, "the inner profile must meet at the compact, posed corner");
+        for (int side = 1; side <= 6; ++side) {
+            const double azimuth = side * pi / 12.0;
+            auto previous = sample(fold, -4.15, azimuth);
+            Vec3 previousEdge{};
+            for (int ring = 1; ring <= 166; ++ring) {
+                const auto next = sample(fold, -4.15 + 0.05 * ring, azimuth);
+                const auto edge = v3_norm(v3_sub(next, previous));
+                if (ring > 1)
+                    require(v3_dot(previousEdge, edge) > std::cos(28.0 * pi / 180.0),
+                        "edge lines beside the narrow fold must turn gradually");
+                previous = next;
+                previousEdge = edge;
+            }
+        }
+    }
+}
+
 void checkTwist() {
     const auto twist = q_axis_angle(xAxis, 120.0 * pi / 180.0);
     const auto pose = buildPose({}, xAxis, identity, twist, 4, 4);
@@ -457,6 +506,7 @@ int main() {
         checkDeepInnerOpening(angle);
     checkDeepMotionAndLines();
     checkRadialCorrection();
+    checkNarrowFold();
     checkTwist();
 
     const auto pose = buildPose({}, xAxis, identity, q_axis_angle({0, 0, 1}, pi / 2), 4.0, 4.0);

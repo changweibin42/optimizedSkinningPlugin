@@ -216,6 +216,8 @@ struct LocalRegion {
     double endBefore = 0.0;
     double endAfter = 0.0;
     double radius = 0.0;
+    double foldBefore = 0.0;
+    double foldAfter = 0.0;
 };
 
 inline LocalRegion localRegion(const Pose& pose, double radius) {
@@ -282,6 +284,54 @@ inline double radialReferenceAngle(double angle) {
     return angle <= knee ? angle : knee + (rightAngle - knee) * (t + t * t * (1.0 - t));
 }
 
+inline Vec3 narrowFoldCorrection(const Pose& pose, const LocalRegion& region, const Bind& bind,
+    const Vec3& lbs, const Vec3& correction, double axial, double radius, double childWeight) {
+    constexpr double degrees = 3.14159265358979323846 / 180.0;
+    const double bend = smoothUnit((pose.angle - 95.0 * degrees) / (45.0 * degrees));
+    const double span = axial < 0.0 ? region.foldBefore : region.foldAfter;
+    const double shorter = std::min(region.foldBefore, region.foldAfter);
+    const double mixed = smoothUnit(std::min(childWeight, 1.0 - childWeight) / 0.04);
+    if (bend == 0.0 || mixed == 0.0 || shorter <= 1e-8 || std::abs(axial) >= span) return correction;
+
+    const auto parentRadial = q_rotate_v3(pose.parent, bind.radial);
+    const auto halfTwist = q_axis_angle(pose.incoming, 0.5 * pose.twistAngle);
+    const auto middleRadial = q_rotate_v3(halfTwist, parentRadial);
+    const double innerOffset = v3_dot(middleRadial, pose.inward);
+    const double facing = smoothUnit((innerOffset / radius - 0.15) / 0.7);
+    if (facing == 0.0) return correction;
+
+    // Lay out both inner walls as long, shallow rails. A short quadratic
+    // across their common corner keeps both rail tangents continuous.
+    const auto parentPivot = v3_sub(pose.pivot, pose.pivotDelta);
+    const auto midPivot = v3_sub(pose.pivot, v3_scale(pose.pivotDelta, 0.5));
+    const auto left = v3_add(parentPivot, v3_sub(parentRadial, v3_scale(pose.incoming, region.foldBefore)));
+    const auto right = v3_add(pose.pivot, v3_add(q_rotate_v3(pose.child, bind.radial),
+        v3_scale(pose.outgoing, region.foldAfter)));
+    const auto bisector = v3_norm(v3_sub(pose.outgoing, pose.incoming));
+    const double shoulderDepth = std::min(v3_dot(v3_sub(left, midPivot), bisector),
+        v3_dot(v3_sub(right, midPivot), bisector));
+    if (shoulderDepth <= 1e-8) return correction;
+    const double depth = std::min(1.8 * innerOffset, 0.8 * shoulderDepth);
+    const auto tip = v3_add(midPivot, v3_add(v3_scale(bisector, depth),
+        v3_scale(pose.normal, v3_dot(middleRadial, pose.normal))));
+    const auto leftSlope = v3_scale(v3_sub(left, tip), 1.0 / region.foldBefore);
+    const auto rightSlope = v3_scale(v3_sub(right, tip), 1.0 / region.foldAfter);
+    const double lateral = std::abs(v3_dot(middleRadial, pose.normal)) / radius;
+    const double offCenter = smoothUnit(lateral / 0.35);
+    const double roundWidth = std::min((0.10 + 0.33 * offCenter) * radius, 0.18 * shorter);
+    Vec3 rail;
+    if (std::abs(axial) < roundWidth) {
+        const double u = 0.5 + 0.5 * axial / roundWidth;
+        rail = v3_add(tip, v3_add(v3_scale(leftSlope, roundWidth * (1.0 - u) * (1.0 - u)),
+            v3_scale(rightSlope, roundWidth * u * u)));
+    } else {
+        rail = v3_add(tip, v3_scale(axial < 0.0 ? leftSlope : rightSlope, std::abs(axial)));
+    }
+    const double shoulder = 1.0 - smoothUnit(std::abs(axial) / span);
+    const double blend = bend * facing * shoulder * mixed;
+    return v3_add(v3_scale(correction, 1.0 - blend), v3_scale(v3_sub(rail, lbs), blend));
+}
+
 inline Vec3 radialCorrection(const Pose& pose, const LocalRegion& region, const Bind& bind, const Vec3& lbs,
     double referenceAngle, const Quat& referenceChild, const mos_math::Secondary* before,
     const mos_math::Secondary* after, const Vec3& manualIn) {
@@ -338,6 +388,7 @@ inline Vec3 radialCorrection(const Pose& pose, const LocalRegion& region, const 
             }
         }
     }
+    correction = narrowFoldCorrection(pose, region, bind, lbs, correction, axial, radius, childWeight);
     if (before && after && pose.angle > 1e-8 && end > start && std::abs(axial) < end) {
         const auto axis = q_rotate_v3(swing, pose.incoming);
         auto inward = q_rotate_v3(swing, pose.inward);

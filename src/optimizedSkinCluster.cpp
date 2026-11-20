@@ -2451,6 +2451,7 @@ bool OptimizedSkinCluster::computeMosCache(
 
     m_mosCache.arcVertices.clear();
     m_mosCache.arcBefore = m_mosCache.arcAfter = m_mosCache.arcRadius = 0.0;
+    m_mosCache.foldBefore = m_mosCache.foldAfter = 0.0;
     if (arcRequested && joints.size() == 2 && n_bones == 2 && bone_len[0] > 1e-8) {
         const auto pivot = bind_jp[chain[1]];
         const auto axis = bone_dir[0];
@@ -2481,7 +2482,14 @@ bool OptimizedSkinCluster::computeMosCache(
                     total += weight.second;
                     if (weight.first == oppositeBone) opposite += weight.second;
                 }
-                if (total > 0.0) m_mosCache.arcVertices[i].oppositeWeight = opposite / total;
+                if (total > 0.0) {
+                    const double weight = opposite / total;
+                    m_mosCache.arcVertices[i].oppositeWeight = weight;
+                    if (params.curveMode == MosParams::lbsRadial && weight > 0.02 && weight < 0.98) {
+                        auto& span = axial < 0.0 ? m_mosCache.foldBefore : m_mosCache.foldAfter;
+                        span = std::max(span, std::abs(axial));
+                    }
+                }
             }
         }
     }
@@ -2828,7 +2836,9 @@ MStatus OptimizedSkinCluster::deformMOS(
             transforms[parent].q, transforms[child].q, m_mosCache.arcBefore, m_mosCache.arcAfter,
             v3_sub(childPivot, parentPivot));
     }
-    const auto arcRegion = ocd_arc::localRegion(arcPose, m_mosCache.arcRadius);
+    auto arcRegion = ocd_arc::localRegion(arcPose, m_mosCache.arcRadius);
+    arcRegion.foldBefore = m_mosCache.foldBefore;
+    arcRegion.foldAfter = m_mosCache.foldAfter;
     const double radialAngle = ocd_arc::radialReferenceAngle(arcPose.angle);
     const auto radialChild = q_mul(q_axis_angle(arcPose.normal, radialAngle - arcPose.angle), arcPose.child);
     if (!radialMode && params.curveMode != MosParams::arcSegments && shapeGuide && params.scaleWeight <= 1e-9 &&
