@@ -275,6 +275,61 @@ inline mos_math::GuideSample sampleLocal(const Pose& pose, const LocalRegion& re
     return {result, coverage};
 }
 
+inline double radialReferenceAngle(double angle) {
+    constexpr double rightAngle = 1.57079632679489661923;
+    constexpr double knee = rightAngle * 5.0 / 6.0;
+    const double t = std::clamp((angle - knee) / (rightAngle - knee), 0.0, 1.0);
+    return angle <= knee ? angle : knee + (rightAngle - knee) * (t + t * t * (1.0 - t));
+}
+
+inline Vec3 radialCorrection(const Pose& pose, const LocalRegion& region, const Bind& bind,
+    double referenceAngle, const Quat& referenceChild, const mos_math::Secondary* before,
+    const mos_math::Secondary* after, const Vec3& manualIn) {
+    const double axial = bind.fraction * (pose.before + pose.after) - pose.before;
+    const double start = axial < 0.0 ? region.anchorPose.before : region.anchorPose.after;
+    const double end = axial < 0.0 ? region.endBefore : region.endAfter;
+    if (end <= start || std::abs(axial) >= end) return {};
+    const double radius = v3_len(bind.radial);
+    if (radius <= 1e-9) return {};
+
+    const double childWeight = std::clamp(axial < 0.0 ? bind.oppositeWeight :
+        1.0 - bind.oppositeWeight, 0.0, 1.0);
+    const auto parentRadial = q_rotate_v3(pose.parent, bind.radial);
+    const auto twist = q_axis_angle(pose.incoming, pose.twistAngle * childWeight);
+    const auto twisted = q_rotate_v3(twist, parentRadial);
+    const auto referenceSwing = q_axis_angle(pose.normal, referenceAngle * childWeight);
+    const auto referenceDirection = v3_scale(q_rotate_v3(referenceSwing, twisted), 1.0 / radius);
+    const auto blendedReference = v3_add(v3_scale(parentRadial, 1.0 - childWeight),
+        v3_scale(q_rotate_v3(referenceChild, bind.radial), childWeight));
+    const double thicknessLoss = std::max(0.0, radius - v3_dot(blendedReference, referenceDirection));
+
+    // Keep the LBS station along the limb. Transport only the direction
+    // of the cross-section correction as the actual pose continues to turn.
+    const auto swing = q_axis_angle(pose.normal, pose.angle * childWeight);
+    const auto radial = q_rotate_v3(swing, twisted);
+    Vec3 correction = v3_scale(radial, thicknessLoss / radius);
+    if (before && after && pose.angle > 1e-8) {
+        const auto axis = q_rotate_v3(swing, pose.incoming);
+        auto inward = q_rotate_v3(swing, pose.inward);
+        const auto frame = q_mul(swing, q_mul(twist, pose.parent));
+        const auto manual = q_rotate_v3(frame, manualIn);
+        const auto projected = v3_norm(v3_sub(manual, v3_scale(axis, v3_dot(manual, axis))));
+        if (v3_len(projected) > 0.0) inward = projected;
+        const auto identity = ocd_math::Mat3::identity();
+        mos_math::BendControl control{axis, inward, v3_cross(axis, inward),
+            referenceAngle / 3.14159265358979323846,
+            std::min(region.anchorPose.before, region.anchorPose.after), true};
+        const auto incoming = mos_math::sampleControl({}, identity, radial, control, *before);
+        control.incoming = false;
+        const auto outgoing = mos_math::sampleControl({}, identity, radial, control, *after);
+        const auto edit = v3_sub(v3_add(v3_scale(incoming, 1.0 - childWeight),
+            v3_scale(outgoing, childWeight)), radial);
+        correction = v3_add(correction, edit);
+    }
+    const double support = 1.0 - smoothUnit((std::abs(axial) - start) / (end - start));
+    return v3_scale(correction, support);
+}
+
 inline Vec3 blendWithLbs(const Pose& pose, const Vec3& lbs, const Vec3& curve, double mix) {
     if (mix <= 0.0) return lbs;
     if (mix >= 1.0) return curve;

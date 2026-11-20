@@ -114,6 +114,7 @@ public:
     struct MosParams {
         double influenceRadius = 1.0;
         static constexpr short arcSegments = 2;
+        static constexpr short lbsRadial = 3;
         int    curveMode = arcSegments;
         bool   endLock = true;
         int    curveSamples = 1024;

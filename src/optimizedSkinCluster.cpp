@@ -412,6 +412,7 @@ MStatus OptimizedSkinCluster::initialize() {
     eAttr.addField("Single Long Curve", 0);
     eAttr.addField("Per-Joint Curves", 1);
     eAttr.addField("OCD Arc Segments", MosParams::arcSegments);
+    eAttr.addField("LBS Radial Compensation", MosParams::lbsRadial);
     eAttr.setKeyable(true);
     eAttr.setStorable(true);
     eAttr.setNiceNameOverride("MOS Curve Mode");
@@ -2289,7 +2290,8 @@ bool OptimizedSkinCluster::computeMosCache(
     const MosParams& params, const MMatrix* bindSpace, unsigned int geometryIndex) {
     const bool direct = bindSpace != nullptr;
     const bool shapeGuide = direct && block.inputValue(aMosShapeGuide).asBool();
-    const bool arcRequested = direct && params.curveMode == MosParams::arcSegments;
+    const bool arcRequested = direct && (params.curveMode == MosParams::arcSegments ||
+        params.curveMode == MosParams::lbsRadial);
     m_mosCache.valid = false;
 
     // [DIAG] 读诊断开关（wc_unity 影响 bind 时 w_c）
@@ -2767,7 +2769,10 @@ bool OptimizedSkinCluster::computeMosCache(
             params.curveMode, m_mosCache.avg_bone_length, ms);
         MGlobal::displayInfo(MString(buf));
         if (arcRequested) {
-            if (m_mosCache.arcVertices.empty())
+            if (params.curveMode == MosParams::lbsRadial) {
+                if (m_mosCache.arcVertices.empty())
+                    MGlobal::displayWarning("[MOS] LBS Radial Compensation requires two connected influences; using LBS.");
+            } else if (m_mosCache.arcVertices.empty())
                 MGlobal::displayWarning("[OCD Arc] A connected two-bone bind with weighted vertices on both sides is required; using MOS cubic.");
             else
                 MGlobal::displayInfo("[OCD Arc] Bound local two-bone offset curves with LBS outside the bend.");
@@ -2782,6 +2787,7 @@ MStatus OptimizedSkinCluster::deformMOS(
     using namespace mathcore;
     const unsigned int count = iter.count();
     const MosParams params = readMosParams(block);
+    const bool radialMode = params.curveMode == MosParams::lbsRadial;
     const bool shapeGuide = block.inputValue(aMosShapeGuide).asBool();
     const bool debug = optSkinDebugLog() || params.debugLog;
     if (!m_mosCache.valid || !m_mosCache.direct || m_mosCache.shapeGuide != shapeGuide ||
@@ -2789,7 +2795,7 @@ MStatus OptimizedSkinCluster::deformMOS(
         !m_mosCache.bindSpace.isEquivalent(worldMat, 1e-12) || m_mosCache.numVertices != count ||
         m_mosCache.params.curveMode != params.curveMode ||
         m_mosCache.params.curveSamples != params.curveSamples) {
-        if (!computeMosCache(block, count, params, &worldMat, multiIndex)) {
+        if (!computeMosCache(block, count, params, &worldMat, multiIndex) && !radialMode) {
             if (debug) MGlobal::displayWarning("[MOS] No usable curve binding; using DLB.");
             return deformDLB(block, iter, worldMat, multiIndex);
         }
@@ -2810,9 +2816,10 @@ MStatus OptimizedSkinCluster::deformMOS(
     unsigned int guideParent = 0, guideChild = 0;
     double guideLength = 0.0;
     ocd_arc::Pose arcPose;
-    const bool useArc = params.curveMode == MosParams::arcSegments && !m_mosCache.arcVertices.empty() &&
-        params.scaleWeight <= 1e-9;
-    if (useArc) {
+    const bool hasLocalBind = m_mosCache.valid && !m_mosCache.arcVertices.empty() && params.scaleWeight <= 1e-9;
+    const bool useArc = params.curveMode == MosParams::arcSegments && hasLocalBind;
+    const bool useRadial = radialMode && hasLocalBind;
+    if (useArc || useRadial) {
         const auto& chain = m_mosCache.curves.front().chain_bones;
         const auto parent = chain[0], child = chain[1];
         const auto childPivot = apply_transform(transforms[child], pivots[child]);
@@ -2822,7 +2829,9 @@ MStatus OptimizedSkinCluster::deformMOS(
             v3_sub(childPivot, parentPivot));
     }
     const auto arcRegion = ocd_arc::localRegion(arcPose, m_mosCache.arcRadius);
-    if (params.curveMode != MosParams::arcSegments && shapeGuide && params.scaleWeight <= 1e-9 &&
+    const double radialAngle = ocd_arc::radialReferenceAngle(arcPose.angle);
+    const auto radialChild = q_mul(q_axis_angle(arcPose.normal, radialAngle - arcPose.angle), arcPose.child);
+    if (!radialMode && params.curveMode != MosParams::arcSegments && shapeGuide && params.scaleWeight <= 1e-9 &&
         m_mosCache.curves.size() == 1) {
         const auto& chain = m_mosCache.curves.front().chain_bones;
         if (chain.size() == 2) {
@@ -2843,7 +2852,7 @@ MStatus OptimizedSkinCluster::deformMOS(
         params.slideOrthoOutWeight_next != 0.0 || params.centerSlideInWeight != 0.0 ||
         params.centerSlideOutWeight != 0.0;
 
-    for (size_t c = 0; c < m_mosCache.curves.size(); ++c) {
+    for (size_t c = 0; !radialMode && c < m_mosCache.curves.size(); ++c) {
         const auto& curve = m_mosCache.curves[c];
         auto& controls = poseCurves[c];
         controls.reserve(curve.cvs_rest.size());
@@ -2901,7 +2910,7 @@ MStatus OptimizedSkinCluster::deformMOS(
         }
     }
 
-    if (params.scaleWeight > 1e-9 && params.scaleMode != 0) {
+    if (!radialMode && params.scaleWeight > 1e-9 && params.scaleMode != 0) {
         std::vector<Vec3> x, y, z;
         if (readBoneLinearParts(block, worldMat, x, y, z)) {
             for (size_t c = 0; c < poseCurves.size(); ++c) {
@@ -2939,11 +2948,32 @@ MStatus OptimizedSkinCluster::deformMOS(
     const double envelope = readEnvelopeFromNode();
     const auto worldInverse = worldMat.inverse();
     const auto deformPoint = [&](const MPoint& point, unsigned int vertex) {
-        if (vertex >= m_mosCache.verts.size() || vertex >= m_vtxCache.vertices.size()) return point;
+        if (vertex >= m_vtxCache.vertices.size() ||
+            (!radialMode && vertex >= m_mosCache.verts.size())) return point;
         const auto& weights = m_vtxCache.vertices[vertex];
         if (weights.empty()) return point;
         const MPoint world = point * worldMat;
         const Vec3 original{world.x, world.y, world.z};
+        const auto linearPosition = [&]() {
+            Vec3 result{};
+            double total = 0.0;
+            for (const auto& weight : weights) {
+                if (weight.first >= transforms.size()) continue;
+                result = v3_add(result, v3_scale(apply_transform(transforms[weight.first], original),
+                    weight.second));
+                total += weight.second;
+            }
+            return total > 0.0 ? v3_scale(result, 1.0 / total) : original;
+        };
+        if (radialMode) {
+            const auto correction = useRadial && vertex < m_mosCache.arcVertices.size()
+                ? ocd_arc::radialCorrection(arcPose, arcRegion,
+                m_mosCache.arcVertices[vertex], radialAngle, radialChild, secondary ? &incoming : nullptr,
+                secondary ? &outgoing : nullptr, guideManualIn) : Vec3{};
+            const auto result = applyEnvelope(original, v3_add(linearPosition(),
+                v3_scale(correction, std::clamp(params.influenceRadius, 0.0, 1.0))), envelope);
+            return MPoint(result.x, result.y, result.z) * worldInverse;
+        }
         Vec3 sampled{};
         double coverage = 0.0;
         const auto& bind = m_mosCache.verts[vertex].per_curve;
@@ -2985,15 +3015,7 @@ MStatus OptimizedSkinCluster::deformMOS(
         Vec3 result = useArc ? v3_scale(arc.position, arcMix) :
             (coverage > 0.0 ? v3_scale(sampled, mix / coverage) : Vec3{});
         if (mix < 1.0) {
-            Vec3 fallback{};
-            double total = 0.0;
-            for (const auto& weight : weights) {
-                if (weight.first >= transforms.size()) continue;
-                fallback = v3_add(fallback, v3_scale(apply_transform(transforms[weight.first], original),
-                    weight.second));
-                total += weight.second;
-            }
-            const auto lbs = total > 0.0 ? v3_scale(fallback, 1.0 / total) : original;
+            const auto lbs = linearPosition();
             result = useArc ? ocd_arc::blendWithLbs(arcPose, lbs, arc.position, mix) :
                 v3_add(result, v3_scale(lbs, 1.0 - mix));
         }
@@ -3110,7 +3132,7 @@ MStatus OptimizedSkinCluster::deformCoRMosSecondary(
     // ---- A. 参数 ----
     const double env = readEnvelopeFromNode();
     MosParams P = readMosParams(block);
-    if (P.curveMode == MosParams::arcSegments) P.curveMode = 0;
+    if (P.curveMode == MosParams::arcSegments || P.curveMode == MosParams::lbsRadial) P.curveMode = 0;
 
     // α=0：完全退化为纯 CoR，跳过 MOS cache 构建
     if (std::abs(P.corMosSecondaryWeight) < 1e-9) {

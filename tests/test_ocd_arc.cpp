@@ -330,6 +330,39 @@ void checkDeepMotionAndLines() {
     require(peak - depth < 0.25, "the inner contour must avoid swelling and retracting during the sweep");
 }
 
+void checkRadialCorrection() {
+    constexpr double span = 6.0;
+    const Vec3 turnAxis{0, 0, 1};
+    double previousAngle = 0.0;
+    for (int degrees = 0; degrees <= 175; ++degrees) {
+        const double angle = degrees * pi / 180.0;
+        const auto pose = buildPose({}, xAxis, identity, q_axis_angle(turnAxis, angle), span, span);
+        const auto region = localRegion(pose, 1.0);
+        const double reference = radialReferenceAngle(angle);
+        require(reference >= previousAngle && reference <= pi / 2, "reference bend must saturate at 90 degrees");
+        previousAngle = reference;
+        const auto referenceChild = q_axis_angle(turnAxis, reference);
+        const auto section = q_axis_angle(turnAxis, 0.5 * angle);
+        const auto direction = q_rotate_v3(section, {0, 1, 0});
+        const auto tangent = q_rotate_v3(section, xAxis);
+        for (double side : {-1.0, 1.0}) {
+            auto bind = bindVertex({0, side, 0}, {}, xAxis, span, span);
+            bind.oppositeWeight = 0.5;
+            const auto offset = radialCorrection(pose, region, bind, reference, referenceChild, nullptr, nullptr, {});
+            require(std::abs(v3_dot(offset, tangent)) < 1e-10, "default compensation must not slide the LBS rings");
+            require(std::abs(side * v3_dot(offset, direction) - (1.0 - std::cos(0.5 * reference))) < 1e-10,
+                "both surfaces must recover only their capped radial thickness loss");
+            bind.oppositeWeight = 0.0;
+            const auto rigid = radialCorrection(pose, region, bind, reference, referenceChild, nullptr, nullptr, {});
+            require(v3_len(rigid) < 1e-10, "single-bone weights have no radial blend loss");
+        }
+        auto outside = bindVertex({4.0, 1, 0}, {}, xAxis, span, span);
+        outside.oppositeWeight = 0.2;
+        const auto offset = radialCorrection(pose, region, outside, reference, referenceChild, nullptr, nullptr, {});
+        require(v3_len(offset) == 0.0, "the LBS baseline must remain exact outside the fixed correction region");
+    }
+}
+
 void checkTwist() {
     const auto twist = q_axis_angle(xAxis, 120.0 * pi / 180.0);
     const auto pose = buildPose({}, xAxis, identity, twist, 4, 4);
@@ -386,6 +419,7 @@ int main() {
     for (double angle : {133.0, 137.0, 140.0, 146.0})
         checkDeepInnerOpening(angle);
     checkDeepMotionAndLines();
+    checkRadialCorrection();
     checkTwist();
 
     const auto pose = buildPose({}, xAxis, identity, q_axis_angle({0, 0, 1}, pi / 2), 4.0, 4.0);
