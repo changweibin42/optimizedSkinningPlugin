@@ -336,8 +336,6 @@ inline Vec3 radialCorrection(const Pose& pose, const LocalRegion& region, const 
     double referenceAngle, const Quat& referenceChild, const mos_math::Secondary* before,
     const mos_math::Secondary* after, const Vec3& manualIn) {
     const double axial = bind.fraction * (pose.before + pose.after) - pose.before;
-    const double start = axial < 0.0 ? region.anchorPose.before : region.anchorPose.after;
-    const double end = axial < 0.0 ? region.endBefore : region.endAfter;
     const double radius = v3_len(bind.radial);
     if (radius <= 1e-9) return {};
 
@@ -389,7 +387,16 @@ inline Vec3 radialCorrection(const Pose& pose, const LocalRegion& region, const 
         }
     }
     correction = narrowFoldCorrection(pose, region, bind, lbs, correction, axial, radius, childWeight);
-    if (before && after && pose.angle > 1e-8 && end > start && std::abs(axial) < end) {
+    // Authored offsets peak at the joint and fade across the painted blend
+    // region. The flat interior of the base correction is not used here.
+    const double beforeSpan = region.foldBefore > 0.0 ? region.foldBefore : region.endBefore;
+    const double afterSpan = region.foldAfter > 0.0 ? region.foldAfter : region.endAfter;
+    const double span = axial < 0.0 ? beforeSpan : afterSpan;
+    const double crossfade = std::min(0.35 * region.radius, 0.25 * std::min(beforeSpan, afterSpan));
+    if (before && after && pose.angle > 1e-8 && crossfade > 1e-8 && std::abs(axial) < span) {
+        const double axialFalloff = 1.0 - smoothUnit(std::abs(axial) / span);
+        const double blendSupport = smoothUnit(std::min(childWeight, 1.0 - childWeight) / 0.04);
+        const double nextMix = smoothUnit(0.5 + 0.5 * axial / crossfade);
         const auto axis = q_rotate_v3(swing, pose.incoming);
         auto inward = q_rotate_v3(swing, pose.inward);
         const auto frame = q_mul(swing, q_mul(twist, pose.parent));
@@ -403,10 +410,9 @@ inline Vec3 radialCorrection(const Pose& pose, const LocalRegion& region, const 
         const auto incoming = mos_math::sampleControl({}, identity, radial, control, *before);
         control.incoming = false;
         const auto outgoing = mos_math::sampleControl({}, identity, radial, control, *after);
-        const auto edit = v3_sub(v3_add(v3_scale(incoming, 1.0 - childWeight),
-            v3_scale(outgoing, childWeight)), radial);
-        const double support = 1.0 - smoothUnit((std::abs(axial) - start) / (end - start));
-        correction = v3_add(correction, v3_scale(edit, support));
+        const auto edit = v3_sub(v3_add(v3_scale(incoming, 1.0 - nextMix),
+            v3_scale(outgoing, nextMix)), radial);
+        correction = v3_add(correction, v3_scale(edit, axialFalloff * blendSupport));
     }
     return correction;
 }

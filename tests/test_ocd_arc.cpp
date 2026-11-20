@@ -449,6 +449,60 @@ void checkNarrowFold() {
     }
 }
 
+void checkSecondaryFalloff() {
+    constexpr double span = 6.0;
+    const auto child = q_axis_angle({0, 0, 1}, 0.5 * pi);
+    const auto pose = buildPose({}, xAxis, identity, child, span, span);
+    auto region = localRegion(pose, 1.0);
+    region.foldBefore = 3.8;
+    region.foldAfter = 4.15;
+
+    struct Channel {
+        double mos_math::Secondary::*value;
+        double azimuth;
+        bool paired = false;
+    };
+    const Channel channels[] = {
+        {&mos_math::Secondary::bulgeInner, 0.0}, {&mos_math::Secondary::bulgeOuter, pi},
+        {&mos_math::Secondary::bulgeSide, pi / 2},
+        {&mos_math::Secondary::centerInner, 0.0}, {&mos_math::Secondary::centerOuter, pi},
+        {&mos_math::Secondary::slideInner, 0.0, true}, {&mos_math::Secondary::slideOuter, pi, true},
+        {&mos_math::Secondary::orthoInner, 0.0, true}, {&mos_math::Secondary::orthoOuter, pi, true},
+    };
+    for (const auto& channel : channels) {
+        for (const double side : {-1.0, 1.0}) {
+            mos_math::Secondary before, after;
+            if (!channel.paired || side < 0.0) before.*channel.value = 0.2;
+            if (!channel.paired || side > 0.0) after.*channel.value = 0.2;
+            const auto displacement = [&](double x, double childWeight) {
+                const Vec3 rest{x, std::cos(channel.azimuth), std::sin(channel.azimuth)};
+                auto bind = bindVertex(rest, {}, xAxis, span, span);
+                bind.oppositeWeight = x < 0.0 ? childWeight : 1.0 - childWeight;
+                const auto lbs = v3_add(v3_scale(rest, 1.0 - childWeight),
+                    v3_scale(q_rotate_v3(child, rest), childWeight));
+                const auto base = radialCorrection(pose, region, bind, lbs, 0.5 * pi, child,
+                    nullptr, nullptr, {});
+                const auto edited = radialCorrection(pose, region, bind, lbs, 0.5 * pi, child,
+                    &before, &after, {});
+                return v3_len(v3_sub(edited, base));
+            };
+            const double width = side < 0.0 ? region.foldBefore : region.foldAfter;
+            const double near = displacement(side * 0.45, 0.5);
+            const double middle = displacement(side * 1.35, 0.5);
+            const double far = displacement(side * 2.7, 0.5);
+            require(near > middle && middle > far && far > 0.0,
+                "each authored channel must decay inside the old flat support");
+            require(displacement(side * (width + 0.1), 0.5) == 0.0,
+                "authored offsets must reach zero at the blend-region boundary");
+            require(displacement(side, side < 0.0 ? 0.0 : 1.0) == 0.0,
+                "single-influence vertices must not receive authored offsets");
+            if (channel.paired)
+                require(displacement(-side * 0.5, 0.5) < 1e-10,
+                    "prev and next controls must stay on their own sides away from the seam");
+        }
+    }
+}
+
 void checkTwist() {
     const auto twist = q_axis_angle(xAxis, 120.0 * pi / 180.0);
     const auto pose = buildPose({}, xAxis, identity, twist, 4, 4);
@@ -507,6 +561,7 @@ int main() {
     checkDeepMotionAndLines();
     checkRadialCorrection();
     checkNarrowFold();
+    checkSecondaryFalloff();
     checkTwist();
 
     const auto pose = buildPose({}, xAxis, identity, q_axis_angle({0, 0, 1}, pi / 2), 4.0, 4.0);
