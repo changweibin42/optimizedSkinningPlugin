@@ -61,6 +61,13 @@ inline double smoothUnit(double value) {
     return t * t * (3.0 - 2.0 * t);
 }
 
+// Smooth the onset of a geometric upper limit without exceeding it.
+inline double fitLimit(double value, double limit, double width) {
+    if (width <= 1e-12) return std::min(value, limit);
+    const double excess = std::max(0.0, width - std::abs(value - limit));
+    return std::min(value, limit) - excess * excess / (4.0 * width);
+}
+
 inline double deepFalloff(double angle) {
     constexpr double degrees = 3.14159265358979323846 / 180.0;
     return smoothUnit((angle - 90.0 * degrees) / (50.0 * degrees));
@@ -141,11 +148,32 @@ inline bool sample(const Pose& pose, const Bind& bind, const mos_math::Secondary
     const double remainingForFillet = tangentBudget - std::max(0.0, offset);
     // Keep a small finite turn when the inner branches approach each other.
     // The regular fillet stays in place wherever it still fits.
-    const double minimumFillet = std::min(0.015 * bindRadius, 0.5 * tangentBudget);
-    const double fittedFillet = std::clamp(remainingForFillet, minimumFillet, fillet);
+    const double sideBlend = bindRadius > 1e-8 ? smoothUnit(std::abs(height) / (0.35 * bindRadius)) : 0.0;
+    const double minimumFillet = std::min((0.015 + 0.06 * sideBlend) * bindRadius, 0.5 * tangentBudget);
+    const double fitWidth = 0.10 * bindRadius * deep;
+    const double fittedFillet = std::max(minimumFillet, fitLimit(remainingForFillet, fillet, fitWidth));
     fillet += (fittedFillet - fillet) * deep;
     if (anchored && offset > 0.0 && bindRadius > 1e-8) {
-        offset = std::min(offset, std::max(0.0, tangentBudget - fillet));
+        // Ease out of the early depth increase before the short tangent
+        // span forces the innermost offset to turn back.
+        constexpr double smoothingStart = 112.0 * degrees;
+        if (pose.angle > smoothingStart) {
+            const double halfCos = std::cos(0.5 * pose.angle);
+            const double extraAngle = pose.angle - smoothingStart;
+            const double referenceFillet = 0.14 * bindRadius;
+            const double referenceCos = std::cos(0.5 * smoothingStart);
+            const double referenceOffset = std::min(offset, std::max(0.0,
+                0.92 * std::min(pose.before, pose.after) / std::tan(0.5 * smoothingStart) - referenceFillet));
+            const double referenceDepth = (referenceOffset + referenceFillet) / referenceCos - referenceFillet;
+            const double depthRate = 0.5 * (referenceDepth + referenceFillet) * std::tan(0.5 * smoothingStart);
+            const double depthReserve = 0.22 * bindRadius;
+            const double depth = referenceDepth - depthReserve * std::expm1(-depthRate * extraAngle / depthReserve);
+            const double roundedOffset = std::max(0.0, (depth + fillet) * halfCos - fillet);
+            const double facing = smoothUnit((offset / bindRadius - 0.65) / 0.35);
+            offset -= std::max(0.0, offset - roundedOffset) * facing;
+        }
+        const double offsetLimit = std::max(0.0, tangentBudget - fillet);
+        offset = std::max(0.0, fitLimit(offset, offsetLimit, fitWidth));
     }
     radial = v3_add(radial, v3_scale(pose.inward, offset - originalOffset));
     const double radius = std::max(-offset, fillet);

@@ -290,6 +290,46 @@ void checkDeepInnerOpening(double degrees) {
     require(measured > 100, "measure the inner opening across multiple rings");
 }
 
+void checkDeepMotionAndLines() {
+    constexpr double span = 6.0;
+    double peak = 0.0, depth = 0.0;
+    for (int degrees = 112; degrees <= 140; ++degrees) {
+        const double angle = degrees * pi / 180.0;
+        const auto rotation = q_axis_angle({0, 0, 1}, angle);
+        const auto pose = buildPose({}, xAxis, identity, rotation, span, span);
+        const auto region = localRegion(pose, 1.0);
+        const auto bend = [&](double x, double azimuth) {
+            const Vec3 rest{x, std::cos(azimuth), std::sin(azimuth)};
+            const double childWeight = smoothUnit(0.5 + x / 5.0);
+            auto bind = bindVertex(rest, {}, xAxis, span, span);
+            bind.oppositeWeight = x < 0.0 ? childWeight : 1.0 - childWeight;
+            const auto arc = sampleLocal(pose, region, bind, {}, {}, {});
+            const auto lbs = v3_add(v3_scale(rest, 1.0 - childWeight),
+                v3_scale(q_rotate_v3(rotation, rest), childWeight));
+            return blendWithLbs(pose, lbs, arc.position, arc.coverage);
+        };
+        const Vec3 bisector{-std::sin(0.5 * angle), std::cos(0.5 * angle), 0};
+        depth = v3_dot(bend(0.0, 0.0), bisector);
+        peak = std::max(peak, depth);
+        if (degrees < 133) continue;
+        for (int side = 1; side <= 6; ++side) {
+            const double azimuth = side * pi / 12.0;
+            auto previous = bend(-2.4, azimuth);
+            Vec3 previousEdge{};
+            for (int ring = 1; ring <= 96; ++ring) {
+                const auto next = bend(-2.4 + 0.05 * ring, azimuth);
+                const auto edge = v3_norm(v3_sub(next, previous));
+                if (ring > 1)
+                    require(v3_dot(previousEdge, edge) > std::cos(25.0 * pi / 180.0),
+                        "inner side edge lines must stay smooth through the bend");
+                previous = next;
+                previousEdge = edge;
+            }
+        }
+    }
+    require(peak - depth < 0.25, "the inner contour must avoid swelling and retracting during the sweep");
+}
+
 void checkTwist() {
     const auto twist = q_axis_angle(xAxis, 120.0 * pi / 180.0);
     const auto pose = buildPose({}, xAxis, identity, twist, 4, 4);
@@ -345,6 +385,7 @@ int main() {
     }
     for (double angle : {133.0, 137.0, 140.0, 146.0})
         checkDeepInnerOpening(angle);
+    checkDeepMotionAndLines();
     checkTwist();
 
     const auto pose = buildPose({}, xAxis, identity, q_axis_angle({0, 0, 1}, pi / 2), 4.0, 4.0);
