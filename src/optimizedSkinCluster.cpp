@@ -76,6 +76,11 @@ MObject OptimizedSkinCluster::aDisplayCoR;
 
 MObject OptimizedSkinCluster::aMosInfluenceRadius;
 MObject OptimizedSkinCluster::aMosCurveMode;
+MObject OptimizedSkinCluster::aMosGuideInfluences;
+MObject OptimizedSkinCluster::aMosGuideControls;
+MObject OptimizedSkinCluster::aMosControlDrivers;
+MObject OptimizedSkinCluster::aMosControlValues;
+MObject OptimizedSkinCluster::aMosDriverInVectors;
 MObject OptimizedSkinCluster::aMosShapeGuide;
 MObject OptimizedSkinCluster::aMosEndLock;
 MObject OptimizedSkinCluster::aMosCurveSamples;
@@ -407,17 +412,49 @@ MStatus OptimizedSkinCluster::initialize() {
     addAttribute(aMosInfluenceRadius);
     attributeAffects(aMosInfluenceRadius, MPxSkinCluster::outputGeom);
 
-    aMosCurveMode = eAttr.create("mosCurveMode", "mosCm", MosParams::arcSegments, &status);
+    aMosCurveMode = eAttr.create("mosCurveMode", "mosCm", MosParams::curveSampling, &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
     eAttr.addField("Single Long Curve", 0);
     eAttr.addField("Per-Joint Curves", 1);
     eAttr.addField("OCD Arc Segments", MosParams::arcSegments);
     eAttr.addField("LBS Radial Compensation", MosParams::lbsRadial);
+    eAttr.addField("MOS / OCD Curve Sampling", MosParams::curveSampling);
     eAttr.setKeyable(true);
     eAttr.setStorable(true);
     eAttr.setNiceNameOverride("MOS Curve Mode");
     addAttribute(aMosCurveMode);
     attributeAffects(aMosCurveMode, MPxSkinCluster::outputGeom);
+
+    MFnTypedAttribute mosArrayAttr;
+    aMosGuideInfluences = mosArrayAttr.create("mosGuideInfluences", "mosGi",
+        MFnData::kIntArray, MObject::kNullObj, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aMosGuideInfluences));
+    CHECK_MSTATUS_AND_RETURN_IT(attributeAffects(aMosGuideInfluences, MPxSkinCluster::outputGeom));
+
+    aMosGuideControls = mosArrayAttr.create("mosGuideControls", "mosGc",
+        MFnData::kDoubleArray, MObject::kNullObj, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aMosGuideControls));
+    CHECK_MSTATUS_AND_RETURN_IT(attributeAffects(aMosGuideControls, MPxSkinCluster::outputGeom));
+
+    aMosControlDrivers = mosArrayAttr.create("mosControlDrivers", "mosCd",
+        MFnData::kDoubleArray, MObject::kNullObj, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aMosControlDrivers));
+    CHECK_MSTATUS_AND_RETURN_IT(attributeAffects(aMosControlDrivers, MPxSkinCluster::outputGeom));
+
+    aMosControlValues = mosArrayAttr.create("mosControlValues", "mosCval",
+        MFnData::kDoubleArray, MObject::kNullObj, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aMosControlValues));
+    CHECK_MSTATUS_AND_RETURN_IT(attributeAffects(aMosControlValues, MPxSkinCluster::outputGeom));
+
+    aMosDriverInVectors = mosArrayAttr.create("mosDriverInVectors", "mosDiv",
+        MFnData::kDoubleArray, MObject::kNullObj, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aMosDriverInVectors));
+    CHECK_MSTATUS_AND_RETURN_IT(attributeAffects(aMosDriverInVectors, MPxSkinCluster::outputGeom));
 
     aMosShapeGuide = nAttr.create("mosShapeGuide", "mosSg", MFnNumericData::kBoolean, true, &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
@@ -708,6 +745,13 @@ MStatus OptimizedSkinCluster::setDependentsDirty(
 
     MObject attr = plug.attribute();
 
+    if (attr == MPxSkinCluster::input || attr == MPxSkinCluster::inputGeom ||
+        attr == MPxSkinCluster::bindPreMatrix || attr == aMosGuideInfluences ||
+        attr == aMosGuideControls || attr == aMosControlDrivers || attr == aMosControlValues ||
+        attr == aMosDriverInVectors) {
+        m_mosSampling.valid = false;
+    }
+
     if (attr == MPxSkinCluster::input || attr == MPxSkinCluster::inputGeom) {
         m_paperCoR.valid = false;
         m_ddmV4.valid = false;
@@ -836,6 +880,16 @@ MStatus OptimizedSkinCluster::preEvaluation(const MDGContext& context,
         m_paperCoR.valid = false;
         m_ddmV4.valid = false;
         if (m_mosCache.direct) m_mosCache.valid = false;
+    }
+    if (evaluationNode.dirtyPlugExists(MPxSkinCluster::inputGeom) ||
+        evaluationNode.dirtyPlugExists(MPxSkinCluster::input) ||
+        evaluationNode.dirtyPlugExists(MPxSkinCluster::bindPreMatrix) ||
+        evaluationNode.dirtyPlugExists(aMosGuideInfluences) ||
+        evaluationNode.dirtyPlugExists(aMosGuideControls) ||
+        evaluationNode.dirtyPlugExists(aMosControlDrivers) ||
+        evaluationNode.dirtyPlugExists(aMosControlValues) ||
+        evaluationNode.dirtyPlugExists(aMosDriverInVectors)) {
+        m_mosSampling.valid = false;
     }
     return MPxSkinCluster::preEvaluation(context, evaluationNode);
 }
@@ -2797,6 +2851,8 @@ MStatus OptimizedSkinCluster::deformMOS(
     using namespace mathcore;
     const unsigned int count = iter.count();
     const MosParams params = readMosParams(block);
+    if (params.curveMode == MosParams::curveSampling)
+        return deformMosCurveSampling(block, iter, worldMat, multiIndex, params);
     const bool radialMode = params.curveMode == MosParams::lbsRadial;
     const bool shapeGuide = block.inputValue(aMosShapeGuide).asBool();
     const bool debug = optSkinDebugLog() || params.debugLog;
@@ -3145,7 +3201,7 @@ MStatus OptimizedSkinCluster::deformCoRMosSecondary(
     // ---- A. 参数 ----
     const double env = readEnvelopeFromNode();
     MosParams P = readMosParams(block);
-    if (P.curveMode == MosParams::arcSegments || P.curveMode == MosParams::lbsRadial) P.curveMode = 0;
+    if (P.curveMode >= MosParams::arcSegments) P.curveMode = 0;
 
     // α=0：完全退化为纯 CoR，跳过 MOS cache 构建
     if (std::abs(P.corMosSecondaryWeight) < 1e-9) {

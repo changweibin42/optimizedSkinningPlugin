@@ -23,6 +23,7 @@
 #include "ddm_v4.h"
 #include "ocd_math.h"
 #include "mos_math.h"
+#include "mos_curve_sampling.h"
 #include "ocd_arc.h"
 #include "optimizedSkinClusterCoR.h"
 
@@ -77,6 +78,11 @@ public:
     // ---- MOS 可调参数 ----
     static MObject aMosInfluenceRadius;
     static MObject aMosCurveMode;
+    static MObject aMosGuideInfluences;
+    static MObject aMosGuideControls;
+    static MObject aMosControlDrivers;
+    static MObject aMosControlValues;
+    static MObject aMosDriverInVectors;
     static MObject aMosShapeGuide;
     static MObject aMosEndLock;
     static MObject aMosCurveSamples;
@@ -115,7 +121,8 @@ public:
         double influenceRadius = 1.0;
         static constexpr short arcSegments = 2;
         static constexpr short lbsRadial = 3;
-        int    curveMode = arcSegments;
+        static constexpr short curveSampling = 4;
+        int    curveMode = curveSampling;
         bool   endLock = true;
         int    curveSamples = 1024;
         bool   debugLog = false;
@@ -338,6 +345,32 @@ private:
     };
     MosCache m_mosCache;
 
+    struct MosSamplingGuide {
+        std::vector<unsigned int> influences;
+        mos_curve_sampling::Guide curve;
+    };
+
+    struct MosSamplingVertex {
+        int guide = -1;
+        double coverage = 0.0;
+        mos_curve_sampling::Attachment attachment;
+    };
+
+    struct MosSamplingCache {
+        bool valid = false;
+        unsigned int geometryIndex = 0;
+        unsigned long long weightVersion = 0;
+        int sampleCount = 0;
+        MMatrix geometryMatrix;
+        std::vector<unsigned int> influenceIds;
+        std::vector<MosSamplingGuide> guides;
+        std::vector<MosSamplingVertex> vertices;
+        std::unordered_map<unsigned int, mathcore::Vec3> manualIn;
+    };
+    MosSamplingCache m_mosSampling;
+
+    MStatus deformMosCurveSampling(MDataBlock& block, MItGeometry& iter,
+        const MMatrix& worldMat, unsigned int geometryIndex, const MosParams& params);
     MosParams readMosParams(MDataBlock& block);
 
     /// 构建 MOS 全量缓存；失败时调用方回退 deformDLB

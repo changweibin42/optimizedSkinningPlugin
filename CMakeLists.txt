@@ -7,8 +7,11 @@ include($ENV{DEVKIT_LOCATION}/cmake/pluginEntry.cmake)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_compile_options(/utf-8)
-add_compile_options(/openmp)
+if(MSVC)
+    add_compile_options(/utf-8 /openmp)
+else()
+    find_package(OpenMP REQUIRED)
+endif()
 
 link_directories($ENV{DEVKIT_LOCATION}/lib)
 
@@ -23,6 +26,8 @@ set(SOURCE_FILES
     src/ddm_v4.cpp
     src/dlb_gpu.cpp
     src/ocd_math.cpp 
+    src/mos_curve_sampling.cpp
+    src/optimizedSkinClusterMos.cpp
     src/optimizedSkinCluster.cpp
     src/optimizedSkinClusterCoR.cpp
     src/optimizedSkinClusterCmd.cpp
@@ -47,3 +52,7 @@ configure_file(src/dlb_gpu_kernel.h.in dlb_gpu_kernel.h @ONLY)
 list(APPEND INCLUDE_DIRS "${CMAKE_CURRENT_BINARY_DIR}")
 
 build_plugin()
+
+if(NOT MSVC)
+    target_link_libraries(${PROJECT_NAME} OpenMP::OpenMP_CXX)
+endif()
