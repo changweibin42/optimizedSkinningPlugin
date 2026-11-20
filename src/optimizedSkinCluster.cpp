@@ -484,7 +484,7 @@ MStatus OptimizedSkinCluster::initialize() {
     addAttribute(aMosOutBulgeWeight);
     attributeAffects(aMosOutBulgeWeight, MPxSkinCluster::outputGeom);
 
-    aMosSideBulgeWeight = nAttr.create("mosSideBulgeWeight", "mosSbw",
+    aMosSideBulgeWeight = nAttr.create("bulgeWeight", "mosSbw",
         MFnNumericData::kDouble, 0.0, &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
     nAttr.setMin(-10.0);
@@ -493,12 +493,12 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setSoftMax(2.0);
     nAttr.setKeyable(true);
     nAttr.setStorable(true);
-    nAttr.setNiceNameOverride("MOS Side Bulge");
+    nAttr.setNiceNameOverride("bulgeWeight");
     addAttribute(aMosSideBulgeWeight);
     attributeAffects(aMosSideBulgeWeight, MPxSkinCluster::outputGeom);
 
     // ---- Slide 组 ----
-    aMosSlideInWeightPrev = nAttr.create("mosSlideInWeightPrev", "mosSlIp",
+    aMosSlideInWeightPrev = nAttr.create("slideInWeight_prev", "mosSlIp",
         MFnNumericData::kDouble, 0.0, &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
     nAttr.setMin(-10.0);
@@ -507,11 +507,11 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setSoftMax(2.0);
     nAttr.setKeyable(true);
     nAttr.setStorable(true);
-    nAttr.setNiceNameOverride("MOS Slide In Prev");
+    nAttr.setNiceNameOverride("slideInWeight_prev");
     addAttribute(aMosSlideInWeightPrev);
     attributeAffects(aMosSlideInWeightPrev, MPxSkinCluster::outputGeom);
 
-    aMosSlideInWeightNext = nAttr.create("mosSlideInWeightNext", "mosSlIn",
+    aMosSlideInWeightNext = nAttr.create("slideInWeight_next", "mosSlIn",
         MFnNumericData::kDouble, 0.0, &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
     nAttr.setMin(-10.0);
@@ -520,11 +520,11 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setSoftMax(2.0);
     nAttr.setKeyable(true);
     nAttr.setStorable(true);
-    nAttr.setNiceNameOverride("MOS Slide In Next");
+    nAttr.setNiceNameOverride("slideInWeight_next");
     addAttribute(aMosSlideInWeightNext);
     attributeAffects(aMosSlideInWeightNext, MPxSkinCluster::outputGeom);
 
-    aMosSlideOutWeightPrev = nAttr.create("mosSlideOutWeightPrev", "mosSlOp",
+    aMosSlideOutWeightPrev = nAttr.create("slideOutWeight_prev", "mosSlOp",
         MFnNumericData::kDouble, 0.0, &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
     nAttr.setMin(-10.0);
@@ -533,11 +533,11 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setSoftMax(2.0);
     nAttr.setKeyable(true);
     nAttr.setStorable(true);
-    nAttr.setNiceNameOverride("MOS Slide Out Prev");
+    nAttr.setNiceNameOverride("slideOutWeight_prev");
     addAttribute(aMosSlideOutWeightPrev);
     attributeAffects(aMosSlideOutWeightPrev, MPxSkinCluster::outputGeom);
 
-    aMosSlideOutWeightNext = nAttr.create("mosSlideOutWeightNext", "mosSlOn",
+    aMosSlideOutWeightNext = nAttr.create("slideOutWeight_next", "mosSlOn",
         MFnNumericData::kDouble, 0.0, &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
     nAttr.setMin(-10.0);
@@ -546,11 +546,11 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setSoftMax(2.0);
     nAttr.setKeyable(true);
     nAttr.setStorable(true);
-    nAttr.setNiceNameOverride("MOS Slide Out Next");
+    nAttr.setNiceNameOverride("slideOutWeight_next");
     addAttribute(aMosSlideOutWeightNext);
     attributeAffects(aMosSlideOutWeightNext, MPxSkinCluster::outputGeom);
 
-    aMosSlideOrthoInWeightPrev = nAttr.create("mosSlideOrthoInWeightPrev", "mosSoIp",
+    aMosSlideOrthoInWeightPrev = nAttr.create("slideOrthoInWeight_prev", "mosSoIp",
         MFnNumericData::kDouble, 0.0, &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
     nAttr.setMin(-10.0);
@@ -559,11 +559,11 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setSoftMax(2.0);
     nAttr.setKeyable(true);
     nAttr.setStorable(true);
-    nAttr.setNiceNameOverride("MOS Slide O-In Prev");
+    nAttr.setNiceNameOverride("slideOrthoInWeight_prev");
     addAttribute(aMosSlideOrthoInWeightPrev);
     attributeAffects(aMosSlideOrthoInWeightPrev, MPxSkinCluster::outputGeom);
 
-    aMosSlideOrthoInWeightNext = nAttr.create("mosSlideOrthoInWeightNext", "mosSoIn",
+    aMosSlideOrthoInWeightNext = nAttr.create("slideOrthoInWeight_next", "mosSoIn",
         MFnNumericData::kDouble, 0.0, &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
     nAttr.setMin(-10.0);
@@ -572,11 +572,11 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setSoftMax(2.0);
     nAttr.setKeyable(true);
     nAttr.setStorable(true);
-    nAttr.setNiceNameOverride("MOS Slide O-In Next");
+    nAttr.setNiceNameOverride("slideOrthoInWeight_next");
     addAttribute(aMosSlideOrthoInWeightNext);
     attributeAffects(aMosSlideOrthoInWeightNext, MPxSkinCluster::outputGeom);
 
-    aMosSlideOrthoOutWeightPrev = nAttr.create("mosSlideOrthoOutWeightPrev", "mosSoOp",
+    aMosSlideOrthoOutWeightPrev = nAttr.create("slideOrthoOutWeight_prev", "mosSoOp",
         MFnNumericData::kDouble, 0.0, &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
     nAttr.setMin(-10.0);
@@ -585,11 +585,11 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setSoftMax(2.0);
     nAttr.setKeyable(true);
     nAttr.setStorable(true);
-    nAttr.setNiceNameOverride("MOS Slide O-Out Prev");
+    nAttr.setNiceNameOverride("slideOrthoOutWeight_prev");
     addAttribute(aMosSlideOrthoOutWeightPrev);
     attributeAffects(aMosSlideOrthoOutWeightPrev, MPxSkinCluster::outputGeom);
 
-    aMosSlideOrthoOutWeightNext = nAttr.create("mosSlideOrthoOutWeightNext", "mosSoOn",
+    aMosSlideOrthoOutWeightNext = nAttr.create("slideOrthoOutWeight_next", "mosSoOn",
         MFnNumericData::kDouble, 0.0, &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
     nAttr.setMin(-10.0);
@@ -598,7 +598,7 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setSoftMax(2.0);
     nAttr.setKeyable(true);
     nAttr.setStorable(true);
-    nAttr.setNiceNameOverride("MOS Slide O-Out Next");
+    nAttr.setNiceNameOverride("slideOrthoOutWeight_next");
     addAttribute(aMosSlideOrthoOutWeightNext);
     attributeAffects(aMosSlideOrthoOutWeightNext, MPxSkinCluster::outputGeom);
 
@@ -657,26 +657,28 @@ MStatus OptimizedSkinCluster::initialize() {
     addAttribute(aMosScaleMode);
     attributeAffects(aMosScaleMode, MPxSkinCluster::outputGeom);
 
-    // ---- Center Slide（当前死代码，下轮清理时一并删除）----
-    aMosCenterSlideInWeight = nAttr.create("mosCenterSlideInWeight", "mosCsi",
+    // ---- Center Slide ----
+    aMosCenterSlideInWeight = nAttr.create("centerSlideInWeight", "mosCsi",
         MFnNumericData::kDouble, 0.0, &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
     nAttr.setMin(-2.0);
     nAttr.setMax(2.0);
     nAttr.setKeyable(false);
+    nAttr.setChannelBox(true);
     nAttr.setStorable(true);
-    nAttr.setNiceNameOverride("MOS Center Slide In");
+    nAttr.setNiceNameOverride("centerSlideInWeight");
     addAttribute(aMosCenterSlideInWeight);
     attributeAffects(aMosCenterSlideInWeight, MPxSkinCluster::outputGeom);
 
-    aMosCenterSlideOutWeight = nAttr.create("mosCenterSlideOutWeight", "mosCso",
+    aMosCenterSlideOutWeight = nAttr.create("centerSlideOutWeight", "mosCso",
         MFnNumericData::kDouble, 0.0, &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
     nAttr.setMin(-2.0);
     nAttr.setMax(2.0);
     nAttr.setKeyable(false);
+    nAttr.setChannelBox(true);
     nAttr.setStorable(true);
-    nAttr.setNiceNameOverride("MOS Center Slide Out");
+    nAttr.setNiceNameOverride("centerSlideOutWeight");
     addAttribute(aMosCenterSlideOutWeight);
     attributeAffects(aMosCenterSlideOutWeight, MPxSkinCluster::outputGeom);
 
