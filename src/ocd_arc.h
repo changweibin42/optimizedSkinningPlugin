@@ -282,33 +282,63 @@ inline double radialReferenceAngle(double angle) {
     return angle <= knee ? angle : knee + (rightAngle - knee) * (t + t * t * (1.0 - t));
 }
 
-inline Vec3 radialCorrection(const Pose& pose, const LocalRegion& region, const Bind& bind,
+inline Vec3 radialCorrection(const Pose& pose, const LocalRegion& region, const Bind& bind, const Vec3& lbs,
     double referenceAngle, const Quat& referenceChild, const mos_math::Secondary* before,
     const mos_math::Secondary* after, const Vec3& manualIn) {
     const double axial = bind.fraction * (pose.before + pose.after) - pose.before;
     const double start = axial < 0.0 ? region.anchorPose.before : region.anchorPose.after;
     const double end = axial < 0.0 ? region.endBefore : region.endAfter;
-    if (end <= start || std::abs(axial) >= end) return {};
     const double radius = v3_len(bind.radial);
     if (radius <= 1e-9) return {};
 
     const double childWeight = std::clamp(axial < 0.0 ? bind.oppositeWeight :
         1.0 - bind.oppositeWeight, 0.0, 1.0);
+    // Follow the minority skin weight along both limbs. Round only the
+    // small interval around equal weights so the ridge has no slope break.
+    constexpr double corner = 0.15;
+    const double imbalance = std::abs(2.0 * childWeight - 1.0);
+    const double weightFalloff = imbalance < corner
+        ? 1.0 - imbalance * imbalance / (corner * (2.0 - corner))
+        : (1.0 - imbalance) / (1.0 - 0.5 * corner);
     const auto parentRadial = q_rotate_v3(pose.parent, bind.radial);
     const auto twist = q_axis_angle(pose.incoming, pose.twistAngle * childWeight);
     const auto twisted = q_rotate_v3(twist, parentRadial);
-    const auto referenceSwing = q_axis_angle(pose.normal, referenceAngle * childWeight);
-    const auto referenceDirection = v3_scale(q_rotate_v3(referenceSwing, twisted), 1.0 / radius);
-    const auto blendedReference = v3_add(v3_scale(parentRadial, 1.0 - childWeight),
-        v3_scale(q_rotate_v3(referenceChild, bind.radial), childWeight));
+    const auto referenceSwing = q_axis_angle(pose.normal, 0.5 * referenceAngle);
+    const auto referenceTwist = q_axis_angle(pose.incoming, 0.5 * pose.twistAngle);
+    const auto referenceDirection = v3_scale(
+        q_rotate_v3(referenceSwing, q_rotate_v3(referenceTwist, parentRadial)), 1.0 / radius);
+    const auto blendedReference = v3_scale(v3_add(parentRadial, q_rotate_v3(referenceChild, bind.radial)), 0.5);
     const double thicknessLoss = std::max(0.0, radius - v3_dot(blendedReference, referenceDirection));
 
     // Keep the LBS station along the limb. Transport only the direction
     // of the cross-section correction as the actual pose continues to turn.
     const auto swing = q_axis_angle(pose.normal, pose.angle * childWeight);
     const auto radial = q_rotate_v3(swing, twisted);
-    Vec3 correction = v3_scale(radial, thicknessLoss / radius);
-    if (before && after && pose.angle > 1e-8) {
+    Vec3 correction = v3_scale(radial, weightFalloff * thicknessLoss / radius);
+    const double deep = deepFalloff(pose.angle);
+    if (deep > 0.0) {
+        const double facing = smoothUnit(v3_dot(twisted, pose.inward) / (0.5 * radius));
+        if (facing > 0.0) {
+            // Near the opposite limb, ease the swelling along the bend
+            // bisector while retaining the component that closes the fold.
+            const auto parentRay = v3_scale(pose.incoming, -1.0);
+            const auto parent = v3_sub(lbs, v3_sub(pose.pivot, pose.pivotDelta));
+            const auto child = v3_sub(lbs, pose.pivot);
+            const auto rayDistance = [](const Vec3& point, const Vec3& ray) {
+                return v3_len(v3_sub(point, v3_scale(ray, std::max(0.0, v3_dot(point, ray)))));
+            };
+            const double contactRadius = std::min(radius, region.radius);
+            if (contactRadius > 1e-9) {
+                const double distance = (1.0 - childWeight) * rayDistance(child, pose.outgoing) +
+                    childWeight * rayDistance(parent, parentRay);
+                const double proximity = smoothUnit((1.15 - distance / contactRadius) / 0.35);
+                const auto bisector = v3_norm(v3_sub(pose.outgoing, pose.incoming));
+                const auto swelling = v3_scale(bisector, std::max(0.0, v3_dot(correction, bisector)));
+                correction = v3_sub(correction, v3_scale(swelling, deep * facing * proximity));
+            }
+        }
+    }
+    if (before && after && pose.angle > 1e-8 && end > start && std::abs(axial) < end) {
         const auto axis = q_rotate_v3(swing, pose.incoming);
         auto inward = q_rotate_v3(swing, pose.inward);
         const auto frame = q_mul(swing, q_mul(twist, pose.parent));
@@ -324,10 +354,10 @@ inline Vec3 radialCorrection(const Pose& pose, const LocalRegion& region, const 
         const auto outgoing = mos_math::sampleControl({}, identity, radial, control, *after);
         const auto edit = v3_sub(v3_add(v3_scale(incoming, 1.0 - childWeight),
             v3_scale(outgoing, childWeight)), radial);
-        correction = v3_add(correction, edit);
+        const double support = 1.0 - smoothUnit((std::abs(axial) - start) / (end - start));
+        correction = v3_add(correction, v3_scale(edit, support));
     }
-    const double support = 1.0 - smoothUnit((std::abs(axial) - start) / (end - start));
-    return v3_scale(correction, support);
+    return correction;
 }
 
 inline Vec3 blendWithLbs(const Pose& pose, const Vec3& lbs, const Vec3& curve, double mix) {

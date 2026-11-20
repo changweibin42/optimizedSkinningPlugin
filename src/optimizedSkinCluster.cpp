@@ -2966,11 +2966,12 @@ MStatus OptimizedSkinCluster::deformMOS(
             return total > 0.0 ? v3_scale(result, 1.0 / total) : original;
         };
         if (radialMode) {
+            const auto lbs = linearPosition();
             const auto correction = useRadial && vertex < m_mosCache.arcVertices.size()
                 ? ocd_arc::radialCorrection(arcPose, arcRegion,
-                m_mosCache.arcVertices[vertex], radialAngle, radialChild, secondary ? &incoming : nullptr,
+                m_mosCache.arcVertices[vertex], lbs, radialAngle, radialChild, secondary ? &incoming : nullptr,
                 secondary ? &outgoing : nullptr, guideManualIn) : Vec3{};
-            const auto result = applyEnvelope(original, v3_add(linearPosition(),
+            const auto result = applyEnvelope(original, v3_add(lbs,
                 v3_scale(correction, std::clamp(params.influenceRadius, 0.0, 1.0))), envelope);
             return MPoint(result.x, result.y, result.z) * worldInverse;
         }

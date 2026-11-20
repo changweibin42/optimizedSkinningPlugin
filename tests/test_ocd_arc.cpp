@@ -334,9 +334,12 @@ void checkRadialCorrection() {
     constexpr double span = 6.0;
     const Vec3 turnAxis{0, 0, 1};
     double previousAngle = 0.0;
+    double previousInner = 1.0;
+    double previousGap = 1.0;
     for (int degrees = 0; degrees <= 175; ++degrees) {
         const double angle = degrees * pi / 180.0;
-        const auto pose = buildPose({}, xAxis, identity, q_axis_angle(turnAxis, angle), span, span);
+        const auto child = q_axis_angle(turnAxis, angle);
+        const auto pose = buildPose({}, xAxis, identity, child, span, span);
         const auto region = localRegion(pose, 1.0);
         const double reference = radialReferenceAngle(angle);
         require(reference >= previousAngle && reference <= pi / 2, "reference bend must saturate at 90 degrees");
@@ -345,21 +348,55 @@ void checkRadialCorrection() {
         const auto section = q_axis_angle(turnAxis, 0.5 * angle);
         const auto direction = q_rotate_v3(section, {0, 1, 0});
         const auto tangent = q_rotate_v3(section, xAxis);
-        for (double side : {-1.0, 1.0}) {
-            auto bind = bindVertex({0, side, 0}, {}, xAxis, span, span);
-            bind.oppositeWeight = 0.5;
-            const auto offset = radialCorrection(pose, region, bind, reference, referenceChild, nullptr, nullptr, {});
-            require(std::abs(v3_dot(offset, tangent)) < 1e-10, "default compensation must not slide the LBS rings");
-            require(std::abs(side * v3_dot(offset, direction) - (1.0 - std::cos(0.5 * reference))) < 1e-10,
-                "both surfaces must recover only their capped radial thickness loss");
-            bind.oppositeWeight = 0.0;
-            const auto rigid = radialCorrection(pose, region, bind, reference, referenceChild, nullptr, nullptr, {});
-            require(v3_len(rigid) < 1e-10, "single-bone weights have no radial blend loss");
+
+        const auto correction = [&](const Vec3& rest, double childWeight) {
+            const auto lbs = v3_add(v3_scale(rest, 1.0 - childWeight),
+                v3_scale(q_rotate_v3(child, rest), childWeight));
+            auto bind = bindVertex(rest, {}, xAxis, span, span);
+            bind.oppositeWeight = rest.x < 0.0 ? childWeight : 1.0 - childWeight;
+            return radialCorrection(pose, region, bind, lbs, reference, referenceChild, nullptr, nullptr, {});
+        };
+        const double referenceLoss = 1.0 - std::cos(0.5 * reference);
+        const auto outer = correction({0, -1, 0}, 0.5);
+        const auto inner = correction({0, 1, 0}, 0.5);
+        require(std::abs(v3_dot(outer, tangent)) < 1e-10 && std::abs(v3_dot(inner, tangent)) < 1e-10,
+            "default compensation must not slide the LBS rings");
+        require(std::abs(-v3_dot(outer, direction) - referenceLoss) < 1e-10,
+            "outer compensation must hold its right-angle magnitude");
+        if (degrees <= 90) {
+            require(std::abs(v3_dot(inner, direction) - referenceLoss) < 1e-10,
+                "the inner surfaces must recover their prescribed thickness through 90 degrees");
+        } else {
+            require(v3_len(inner) <= previousInner + 1e-10,
+                "the central inner correction must ease down as the limbs close");
         }
-        auto outside = bindVertex({4.0, 1, 0}, {}, xAxis, span, span);
-        outside.oppositeWeight = 0.2;
-        const auto offset = radialCorrection(pose, region, outside, reference, referenceChild, nullptr, nullptr, {});
-        require(v3_len(offset) == 0.0, "the LBS baseline must remain exact outside the fixed correction region");
+        previousInner = v3_len(inner);
+        if (degrees == 140)
+            require(previousInner < 0.25 * referenceLoss, "let the LBS center fold through at a deep bend");
+        if (degrees >= 90 && degrees <= 140) {
+            const Vec3 incoming{-0.5, 1.0, 0.0}, outgoing{0.5, 1.0, 0.0};
+            const double incomingWeight = smoothUnit(0.45), outgoingWeight = 1.0 - incomingWeight;
+            const auto skinned = [&](const Vec3& rest, double weight) {
+                const auto lbs = v3_add(v3_scale(rest, 1.0 - weight),
+                    v3_scale(q_rotate_v3(child, rest), weight));
+                return v3_add(lbs, correction(rest, weight));
+            };
+            const double gap = v3_dot(v3_sub(skinned(outgoing, outgoingWeight),
+                skinned(incoming, incomingWeight)), tangent);
+            require(gap < previousGap, "the two inner sides must approach continuously as the joint bends");
+            if (degrees == 140)
+                require(gap < 0.0, "the deep fold should let the two sides overlap");
+            previousGap = gap;
+        }
+
+        require(v3_len(correction({0, 1, 0}, 1.0)) < 1e-10, "single-bone weights have no radial blend loss");
+        require(v3_len(correction({5.0, -1, 0}, 1.0)) < 1e-10, "a rigid tail must remain at exact LBS");
+        if (degrees == 90) {
+            const double weak = v3_len(correction({-4.4, -1, 0}, 0.1));
+            const double strong = v3_len(correction({-3.8, -1, 0}, 0.2));
+            require(weak > 0.0 && std::abs(strong - 2.0 * weak) < 1e-10,
+                "wide weight shoulders must receive linear correction past the old spatial window");
+        }
     }
 }
 
