@@ -339,7 +339,7 @@ def center_response(weights, rotations):
     return np.einsum("nk,kij->nij",weights,rotation_matrix(q))-rotation_matrix(blend)
 
 
-def geometry_residual(bind, original, weights, bend, twist, direction):
+def geometric_profile(bind, original, weights, bend, twist, direction):
     """Construct the two offset limb profiles in the signed bend plane."""
     import numpy as np
     points = np.asarray(bind, dtype=float)
@@ -392,6 +392,37 @@ def geometry_residual(bind, original, weights, bend, twist, direction):
     return target-original
 
 
+def geometry_residual(bind, original, weights, bend, twist, direction):
+    """Interpolate section shape in a rotating frame up to the approved 120-degree pose."""
+    import numpy as np
+    if abs(bend) >= 120 or bend == 0:
+        return geometric_profile(bind, original, weights, bend, twist, direction)
+    fraction = abs(bend)/120
+    anchor = 120 if bend > 0 else -120
+    zeros = np.zeros_like(original)
+    straight = geometric_profile(bind,zeros,weights,0,twist,direction)
+    folded = geometric_profile(bind,zeros,weights,anchor,twist,direction)
+    participation = weights[:,1].copy()
+    if weights.shape[1] == 3:
+        participation += 0.5*weights[:,2]
+    cp, sp = cos(radians(direction)), sin(radians(direction))
+    def swing(points, degrees):
+        angle = np.radians(degrees)*participation
+        c,s = np.cos(angle),np.sin(angle)
+        x,y,z = points.T
+        h,lateral = cp*y+sp*z, -sp*y+cp*z
+        height = s*x+c*h
+        return np.column_stack((c*x-s*h, cp*height-sp*lateral, sp*height+cp*lateral))
+    local = straight + fraction*(swing(folded,-anchor)-straight)
+    linear = swing(local,bend)-original
+    # Ease back onto the deep-bend profile with matching endpoint slope.
+    if abs(bend)>100:
+        t = (abs(bend)-100)/20
+        t = t*t*(3-2*t)
+        linear += t*(geometric_profile(bind,original,weights,bend,twist,direction)-linear)
+    return linear
+
+
 def solve_centers(response, desired, center_limit=None):
     """Damped minimum-norm center displacement in bind-object space."""
     import numpy as np
@@ -411,7 +442,7 @@ def show(three_bone=True, center_limit=4.0):
     from maya.api import OpenMaya as om
     if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "CoRCircularFilletWindow" + ("Three" if three_bone else "Two")
+    win = "CoRCompactMotionWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
@@ -445,6 +476,8 @@ def show(three_bone=True, center_limit=4.0):
         weights = np.array([rig_weights(skin_weight(p[0]), three_bone) for p in bind])
         layout = (("Classic_LBS",-7,16),("DQ_Skin",7,16),
                   ("CoR",-7,0),("DQS_Com",7,0),("CoR_CurveGuided",7,-16),("OCD",-7,-16))
+        visible_meshes = []
+        grid = {}
         for i,(label,offset,row_y) in enumerate(layout):
             base = mc.createNode("transform",name="ref_"+label+"#",parent=group)
             rigs.append(base)
@@ -528,6 +561,29 @@ def show(three_bone=True, center_limit=4.0):
                 sel.add(shape)
                 mesh = om.MFnMesh(sel.getDagPath(0))
 
+            visible_shape = proxy if label in ("CoR","DQS_Com","CoR_CurveGuided") else mc.listRelatives(
+                geo,shapes=True,noIntermediate=True,fullPath=True)[0]
+            path = om.MSelectionList()
+            path.add(visible_shape)
+            visible_meshes.append(om.MFnMesh(path.getDagPath(0)))
+
+        def pack_grid():
+            bounds = [fn.boundingBox for fn in visible_meshes]
+            xmin = min(b.min.x for b in bounds)
+            xmax = max(b.max.x for b in bounds)
+            ymin = min(b.min.y for b in bounds)
+            ymax = max(b.max.y for b in bounds)
+            width,height = xmax-xmin,ymax-ymin
+            gap = 0.45
+            for rig,(_,col,row) in zip(rigs,layout):
+                x = (1 if col>0 else -1)*(width+gap)/2-(xmin+xmax)/2
+                y = row/16*(height+gap)-(ymin+ymax)/2
+                mc.setAttr(rig+".translateX",linear(x))
+                mc.setAttr(rig+".translateY",linear(y))
+                if rig == rigs[-1]:
+                    grid["ocd"] = (x,y)
+            grid["size"] = (2*width+gap,3*height+2*gap)
+
         for j in joints[:-1]:
             mc.connectAttr(joints[-1]+".rotate",j+".rotate")
         sel = om.MSelectionList()
@@ -583,6 +639,8 @@ def show(three_bone=True, center_limit=4.0):
                 delta = solve_centers(center_response(weights,rotations),desired,center_limit)
                 plug.setMObject(om.MFnDoubleArrayData().create(om.MDoubleArray(delta.ravel().tolist())))
             mesh.setPoints([om.MPoint(*p) for p in pose.mesh(bind)],om.MSpace.kObject)
+            if not mc.checkBox(closeup,q=True,value=True):
+                pack_grid()
 
         motion = [slider("弯曲",-150,150,118), slider("扭转",-180,180,0), slider("弯曲方向",-180,180,0)]
 
@@ -628,12 +686,12 @@ def show(three_bone=True, center_limit=4.0):
             oblique = mc.checkBox(sideview,q=True,value=True)
             yaw,elev = (-22,12) if oblique else (0,0)
             if focus:
-                camera_pose(yaw,elev,(-7.8,-13.9,0),40,16)
+                camera_pose(yaw,elev,(grid["ocd"][0]-0.8,grid["ocd"][1]+2.1,0),40,16)
             else:
                 width = mc.control(editor,q=True,width=True) if mc.control(editor,exists=True) else 0
                 height = mc.control(editor,q=True,height=True) if mc.control(editor,exists=True) else 0
                 aspect = width/height if min(width,height)>10 else 1.35
-                camera_pose(yaw,elev,(0,0,0),70,max(31,48*aspect))
+                camera_pose(yaw,elev,(0,0,0),70,max(25.5,grid["size"][0],max(grid["size"][1],23)*aspect)*1.15)
         row = mc.rowLayout(parent=col,numberOfColumns=3)
         closeup = mc.checkBox(parent=row,label="OCD 特写",changeCommand=frame_view)
         sideview = mc.checkBox(parent=row,label="斜视",changeCommand=frame_view)
@@ -652,7 +710,7 @@ def show(three_bone=True, center_limit=4.0):
             # Recenter the cropped movie on the elbow, preserving shot projection.
             rot = om.MEulerRotation(-radians(elev),radians(yaw),0.0).asQuaternion()
             offset = om.MVector(18/scale,(37 if i < 2 else 36)/scale,0).rotateBy(rot)
-            camera_pose(yaw,elev,(-7+offset.x,-16+offset.y,offset.z),depth,854/scale,True)
+            camera_pose(yaw,elev,(grid["ocd"][0]+offset.x,grid["ocd"][1]+offset.y,offset.z),depth,854/scale,True)
             set_values(motion,(bend,0,0))
             example(False)
         def example(after):
@@ -693,8 +751,8 @@ def show(three_bone=True, center_limit=4.0):
             redraw()
         mc.button(parent=col,label="视频参数（补偿）",command=load_video)
         mc.text(parent=col,label="Before / After 保持当前骨姿与机位。关闭窗口清理本次预览。")
-        frame_view()
         redraw()
+        frame_view()
         mc.scriptJob(parent=win,attributeChange=[joints[-1]+".rotate",driver_changed],allChildren=True)
         mc.showWindow(win)
         frame_view()
