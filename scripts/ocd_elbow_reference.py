@@ -417,6 +417,13 @@ def anchor_profile(bind, weights, bend, twist, direction):
         ends = np.array([np.interp([0.,pi],phi[order],v[order],period=2*pi)
                          for v in projected.T]).T
         fraction = np.arccos(np.clip(np.cos(phi),-1.,1.))/pi
+        # The unsigned angle has a cusp at the inner meridian. Ease its
+        # first quarter-turn to zero slope on both sides of that meridian.
+        inner_distance = fraction if bend>0 else 1-fraction
+        width = 0.25
+        u = np.minimum(inner_distance/width,1.0)
+        eased = np.where(inner_distance<width,width*u*u*(2-u),inner_distance)
+        fraction = eased if bend>0 else 1-eased
         even = ends[0]+fraction[:,None]*(ends[1]-ends[0])
         shift = gain[row]*(even-projected)
         ring[:,0] += shift[:,0]
@@ -501,7 +508,7 @@ def show(three_bone=True, center_limit=16.0):
     from maya.api import OpenMaya as om
     if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "CoRInnerWallWindow" + ("Three" if three_bone else "Two")
+    win = "CoRRoundedHoopWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
