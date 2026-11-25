@@ -423,7 +423,7 @@ def section_residual(bind, original, weights, bend, twist, direction):
     return linear
 
 
-def geometry_residual(bind, original, weights, bend, twist, direction):
+def longitudinal_residual(bind, original, weights, bend, twist, direction):
     """Set ring spacing along each limb using the same meridian on ring zero."""
     import numpy as np
     target = section_residual(bind, original, weights, bend, twist, direction) + original
@@ -452,6 +452,41 @@ def geometry_residual(bind, original, weights, bend, twist, direction):
     return target-original
 
 
+def geometry_residual(bind, original, weights, bend, twist, direction):
+    """Redistribute wire crossings around each central hoop in the bend-plane view."""
+    import numpy as np
+    residual = longitudinal_residual(bind,original,weights,bend,twist,direction)
+    if bend == 0:
+        return residual
+    points = np.asarray(bind)[:-2].reshape(-1,SIDES,3)
+    target = (original+residual)[:-2].reshape(points.shape)
+    angles = np.arctan2(points[:,:,2],points[:,:,1])
+    phase = radians(twist)*weights[:-2,1].reshape(-1,SIDES)
+    if weights.shape[1] == 3:
+        phase += radians(twist)*0.35*weights[:-2,2].reshape(-1,SIDES)
+    plane = radians(direction)
+    normal = np.array([0.,cos(plane),sin(plane)])
+    azimuth = angles+phase-plane
+    station = points[:,0,0]
+    # Work in the projected cross-section; retain depth perpendicular to the view.
+    gain = np.minimum(1.,abs(bend)/120)*np.maximum(0.,1-abs(station)/(3*RING_STEP))**2
+    for row in np.flatnonzero(gain>0):
+        phi = azimuth[row]%(2*pi)
+        order = np.argsort(phi)
+        ring = target[row]
+        projected = np.column_stack((ring[:,0],ring@normal))
+        ends = np.array([np.interp([0.,pi],phi[order],v[order],period=2*pi)
+                         for v in projected.T]).T
+        fraction = np.arccos(np.clip(np.cos(phi),-1.,1.))/pi
+        even = ends[0]+fraction[:,None]*(ends[1]-ends[0])
+        shift = gain[row]*(even-projected)
+        ring[:,0] += shift[:,0]
+        ring += shift[:,1,None]*normal
+    result = residual.copy()
+    result[:-2] = target.reshape(-1,3)-original[:-2]
+    return result
+
+
 def solve_centers(response, desired, center_limit=None):
     """Damped minimum-norm center displacement in bind-object space."""
     import numpy as np
@@ -471,7 +506,7 @@ def show(three_bone=True, center_limit=4.0):
     from maya.api import OpenMaya as om
     if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "CoRFixedGridSpacingWindow" + ("Three" if three_bone else "Two")
+    win = "CoRHoopSpacingWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
@@ -591,10 +626,9 @@ def show(three_bone=True, center_limit=4.0):
 
 
         def pack_grid():
-            # Fixed cell pitch covers the projected extents throughout a bend.
-            width = 2*hypot(HALF,1.0)
-            height = hypot(HALF,1.0)+1.0
-            gap = 0.45
+            width = np.ptp(np.asarray(bind)[:,0])
+            height = np.ptp(np.asarray(Elbow(90).mesh(bind))[:,1])
+            gap = 0.20
             for rig,(_,col,row) in zip(rigs,layout):
                 x = (1 if col>0 else -1)*(width+gap)/2
                 y = row/16*(height+gap)
