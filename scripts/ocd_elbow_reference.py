@@ -392,74 +392,13 @@ def geometric_profile(bind, original, weights, bend, twist, direction):
     return target-original
 
 
-def section_residual(bind, original, weights, bend, twist, direction):
-    """Interpolate section shape in a rotating frame up to the approved 120-degree pose."""
+def anchor_profile(bind, weights, bend, twist, direction):
+    """Independent elbow geometry, including the side-hoop distribution."""
     import numpy as np
-    if abs(bend) >= 120 or bend == 0:
-        return geometric_profile(bind, original, weights, bend, twist, direction)
-    fraction = abs(bend)/120
-    anchor = 120 if bend > 0 else -120
-    zeros = np.zeros_like(original)
-    straight = geometric_profile(bind,zeros,weights,0,twist,direction)
-    folded = geometric_profile(bind,zeros,weights,anchor,twist,direction)
-    participation = weights[:,1].copy()
-    if weights.shape[1] == 3:
-        participation += 0.5*weights[:,2]
-    cp, sp = cos(radians(direction)), sin(radians(direction))
-    def swing(points, degrees):
-        angle = np.radians(degrees)*participation
-        c,s = np.cos(angle),np.sin(angle)
-        x,y,z = points.T
-        h,lateral = cp*y+sp*z, -sp*y+cp*z
-        height = s*x+c*h
-        return np.column_stack((c*x-s*h, cp*height-sp*lateral, sp*height+cp*lateral))
-    local = straight + fraction*(swing(folded,-anchor)-straight)
-    linear = swing(local,bend)-original
-    # Ease back onto the deep-bend profile with matching endpoint slope.
-    if abs(bend)>100:
-        t = (abs(bend)-100)/20
-        t = t*t*(3-2*t)
-        linear += t*(geometric_profile(bind,original,weights,bend,twist,direction)-linear)
-    return linear
-
-
-def longitudinal_residual(bind, original, weights, bend, twist, direction):
-    """Set ring spacing along each limb using the same meridian on ring zero."""
-    import numpy as np
-    target = section_residual(bind, original, weights, bend, twist, direction) + original
-    angle = abs(bend)
-    if angle in (0, 120, 150):
-        return target-original
-    low, high = (0,120) if angle<120 else (120,150)
-    sign = 1 if bend>=0 else -1
-    station = np.asarray(bind)[:-2,0]
-    active = (weights[:-2]>0).sum(axis=1)>1
-    center = HALF_RINGS*SIDES + np.arange(len(station))%SIDES
-    zeros = np.zeros_like(original)
-    def along(points, degrees):
-        beta = radians(degrees)
-        plane = radians(direction)
-        axis = np.array([cos(beta),sin(beta)*cos(plane),sin(beta)*sin(plane)])
-        relative = points[:-2]-points[center]
-        return np.where(station>0,relative@axis,relative[:,0])
-    start = geometric_profile(bind,zeros,weights,sign*low,twist,direction)
-    end = geometric_profile(bind,zeros,weights,sign*high,twist,direction)
-    t = (angle-low)/(high-low)
-    correction = (1-t)*along(start,sign*low)+t*along(end,sign*high)-along(target,bend)
-    beta,plane = radians(bend),radians(direction)
-    axis = np.array([cos(beta),sin(beta)*cos(plane),sin(beta)*sin(plane)])
-    target[:-2] += (active*correction)[:,None]*np.where((station>0)[:,None],axis,[1,0,0])
-    return target-original
-
-
-def geometry_residual(bind, original, weights, bend, twist, direction):
-    """Redistribute wire crossings around each central hoop in the bend-plane view."""
-    import numpy as np
-    residual = longitudinal_residual(bind,original,weights,bend,twist,direction)
-    if bend == 0:
-        return residual
+    zeros = np.zeros((len(bind),3))
+    profile = geometric_profile(bind,zeros,weights,bend,twist,direction)
     points = np.asarray(bind)[:-2].reshape(-1,SIDES,3)
-    target = (original+residual)[:-2].reshape(points.shape)
+    target = profile[:-2].reshape(points.shape)
     angles = np.arctan2(points[:,:,2],points[:,:,1])
     phase = radians(twist)*weights[:-2,1].reshape(-1,SIDES)
     if weights.shape[1] == 3:
@@ -482,9 +421,32 @@ def geometry_residual(bind, original, weights, bend, twist, direction):
         shift = gain[row]*(even-projected)
         ring[:,0] += shift[:,0]
         ring += shift[:,1,None]*normal
-    result = residual.copy()
-    result[:-2] = target.reshape(-1,3)-original[:-2]
-    return result
+    return profile
+
+
+def geometry_residual(bind, original, weights, bend, twist, direction):
+    """One material-space trajectory through the approved folded section."""
+    import numpy as np
+    zeros = np.zeros_like(original)
+    straight = geometric_profile(bind,zeros,weights,0,twist,direction)
+    if bend == 0:
+        return straight-original
+    anchor = 120 if bend>0 else -120
+    folded = anchor_profile(bind,weights,anchor,twist,direction)
+    station = np.asarray(bind)[:,0]
+    # Measure each limb relative to its bone; the crease uses the bisector.
+    participation = np.where(station<0,0,np.where(station>0,1,0.5))
+    cp, sp = cos(radians(direction)), sin(radians(direction))
+    def swing(points, degrees):
+        angle = radians(degrees)*participation
+        c,s = np.cos(angle),np.sin(angle)
+        x,y,z = points.T
+        h,lateral = cp*y+sp*z,-sp*y+cp*z
+        height = s*x+c*h
+        return np.column_stack((c*x-s*h,cp*height-sp*lateral,sp*height+cp*lateral))
+    fraction = bend/anchor
+    local = straight + fraction*(swing(folded,-anchor)-straight)
+    return swing(local,bend)-original
 
 
 def solve_centers(response, desired, center_limit=None):
@@ -492,7 +454,7 @@ def solve_centers(response, desired, center_limit=None):
     import numpy as np
     u, singular, vt = np.linalg.svd(response, full_matrices=False)
     components = u.swapaxes(1, 2) @ desired[:, :, None]
-    gain = singular / (singular**2 + 0.015**2)
+    gain = singular / (singular**2 + 0.002**2)
     delta = (vt.swapaxes(1, 2) @ (gain[:, :, None] * components))[:, :, 0]
     if center_limit is not None:
         length = np.linalg.norm(delta, axis=1, keepdims=True)
@@ -500,13 +462,13 @@ def solve_centers(response, desired, center_limit=None):
     return delta
 
 
-def show(three_bone=True, center_limit=4.0):
+def show(three_bone=True, center_limit=16.0):
     """Open a private preview window with native Maya skinCluster references."""
     import maya.cmds as mc
     from maya.api import OpenMaya as om
     if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "CoRHoopSpacingWindow" + ("Three" if three_bone else "Two")
+    win = "CoRContinuousHoopWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
@@ -986,4 +948,5 @@ if __name__ == "__main__":
         self_test()
     else:
         show()
+
 
