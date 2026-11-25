@@ -325,9 +325,12 @@ def fit_preview_centers(mc, om, node, shape, driver, bind, faces):
     rings = 2*HALF_RINGS+1
     def sample():
         return np.array([(p.x,p.y,p.z) for p in mesh.getPoints(om.MSpace.kObject)])
+    node_sel = om.MSelectionList()
+    node_sel.add(node)
+    offset_plug = om.MFnDependencyNode(node_sel.getDependNode(0)).findPlug("corFitOffsets",False)
     def offsets(data):
-        flat = data.ravel().tolist()
-        mc.setAttr(node+".corFitOffsets",len(flat),*flat,type="doubleArray")
+        values = om.MDoubleArray(data.ravel().tolist())
+        offset_plug.setMObject(om.MFnDoubleArrayData().create(values))
     zeros = np.zeros((count,3))
     H = np.zeros((count,3,3))
     rhs = np.zeros((count,3))
