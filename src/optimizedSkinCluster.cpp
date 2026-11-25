@@ -15,6 +15,8 @@
 #include <maya/MFnDagNode.h>
 #include <maya/MDagPath.h>
 #include <maya/MFnTypedAttribute.h>
+#include <maya/MFnDoubleArrayData.h>
+#include <maya/MDoubleArray.h>
 #include <maya/MGlobal.h>
 #include <maya/MDataHandle.h>
 #include <maya/MArrayDataHandle.h>
@@ -63,6 +65,7 @@ MObject OptimizedSkinCluster::aCorCompFalloff;    // 新增
 MObject OptimizedSkinCluster::aCorCompStrengthIn;   // 新增
 MObject OptimizedSkinCluster::aCorCompStrengthOut;  // 新增
 MObject OptimizedSkinCluster::aCorSigma;
+MObject OptimizedSkinCluster::aFitOffsets;
 MObject OptimizedSkinCluster::aCorDebugLog;
 MObject OptimizedSkinCluster::aCorContourIn;
 MObject OptimizedSkinCluster::aCorContourOut;
@@ -184,6 +187,7 @@ MStatus OptimizedSkinCluster::initialize() {
     eAttr.addField("CoR + Compensation", 5);
     eAttr.addField("DDM v4 (2019)", 6);
     eAttr.addField("CoR + Contour", 7);
+    eAttr.addField("CoR Fixed Center Fit", 8);
     eAttr.setKeyable(true);
     eAttr.setStorable(true);
     addAttribute(aAlgorithmType);
@@ -315,6 +319,12 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setNiceNameOverride("CoR Comp Strength (Outer)");
     addAttribute(aCorCompStrengthOut);
     attributeAffects(aCorCompStrengthOut, MPxSkinCluster::outputGeom);
+
+    MFnTypedAttribute fitAttr;
+    aFitOffsets = fitAttr.create("corFitOffsets", "cfo", MFnData::kDoubleArray, MObject::kNullObj, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aFitOffsets));
+    CHECK_MSTATUS_AND_RETURN_IT(attributeAffects(aFitOffsets, MPxSkinCluster::outputGeom));
 
     aCorSigma = nAttr.create("corSigma", "csm",
         MFnNumericData::kDouble, 0.1, &status);
@@ -1618,6 +1628,7 @@ MStatus OptimizedSkinCluster::deform(
 
     if (algo == 0) return deformCoR(block, iter, worldMat, multiIndex);
     if (algo == 6) return deformCoR(block, iter, worldMat, multiIndex, CenteredMode::DdmV4);
+    if (algo == 8) return deformCoR(block, iter, worldMat, multiIndex, CenteredMode::FixedFit);
     if (algo == 7) return deformCoR(block, iter, worldMat, multiIndex, CenteredMode::Contour);
 
     unsigned int nV = iter.count();
@@ -1959,10 +1970,28 @@ MStatus OptimizedSkinCluster::deformCoR(
     if (!status) return reportFailure(status, "reset geometry iterator");
 
     const MMatrix worldInverse = worldMat.inverse();
+    // Fitted offsets are stored in bind-object space. Copy before the parallel loop.
+    std::vector<mathcore::Vec3> fittedOffsets;
+    if (mode == CenteredMode::FixedFit) {
+        const MObject data = block.inputValue(aFitOffsets, &status).data();
+        if (!status) return status;
+        if (!data.isNull()) {
+            MFnDoubleArrayData arrayData(data, &status);
+            if (!status) return status;
+            const MDoubleArray values = arrayData.array(&status);
+            if (!status) return status;
+            if (values.length() && values.length() != 3 * cache.centers.size())
+                return reportFailure(MS::kInvalidParameter, "corFitOffsets length");
+            fittedOffsets.resize(values.length() / 3);
+            for (size_t i = 0; i < fittedOffsets.size(); ++i)
+                fittedOffsets[i] = {values[3*i], values[3*i+1], values[3*i+2]};
+        }
+    }
     const auto deformPoint = [&](const MPoint& p, unsigned int vertex) {
         if (vertex >= cache.weights.size() || cache.weights[vertex].empty()) return p;
         const MPoint restWorld = p * worldMat;
-        const auto& center = cache.centers[vertex];
+        auto center = cache.centers[vertex];
+        if (!fittedOffsets.empty()) center = mathcore::v3_add(center, fittedOffsets[vertex]);
         const MPoint centerWorld = MPoint(center.x, center.y, center.z) * worldMat;
         const auto& rotationWeights = cache.weights[vertex];
         const auto& translationWeights = cache.translationWeights.empty()

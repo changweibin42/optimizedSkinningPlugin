@@ -69,6 +69,7 @@ public:
     static MObject aCorCompStrengthIn;
     static MObject aCorCompStrengthOut;
     static MObject aCorSigma;
+    static MObject aFitOffsets;
     static MObject aCorDebugLog;
     static MObject aCorContourIn, aCorContourOut;
     static MObject aDdmIterations, aDdmLambda, aDdmKappa, aDdmAlpha, aDdmDebugLog;
@@ -165,7 +166,7 @@ private:
     // ================================================================
     // 四种算法的 deform 实现
     // ================================================================
-    enum class CenteredMode { CoR, DdmV4, Contour };
+    enum class CenteredMode { CoR, DdmV4, Contour, FixedFit };
     MStatus deformCoR(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int,
         CenteredMode mode = CenteredMode::CoR);
     MStatus deformDLB(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int,
