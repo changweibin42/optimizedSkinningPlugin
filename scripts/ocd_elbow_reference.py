@@ -339,6 +339,46 @@ def center_response(weights, rotations):
     return np.einsum("nk,kij->nij",weights,rotation_matrix(q))-rotation_matrix(blend)
 
 
+def geometry_residual(bind, original, weights, bend, twist, direction):
+    """Construct the two offset limb profiles in the signed bend plane."""
+    import numpy as np
+    points = np.asarray(bind, dtype=float)
+    station, y, z = points.T
+    plane = radians(direction + (180 if bend < 0 else 0))
+    angle = radians(abs(bend))
+    # End-bone participation counts the half-angle helper at its bend fraction.
+    phase = radians(twist) * (weights[:,1] + (0.35*weights[:,2] if weights.shape[1]>2 else 0))
+    depth = y*np.cos(phase-plane) - z*np.sin(phase-plane)
+    lateral = y*np.sin(phase-plane) + z*np.cos(phase-plane)
+    radius = np.max(np.hypot(y,z))
+    distance = np.abs(station)
+    # Inner offset lines intersect on the bisector. Limit their axial travel
+    # by the span of the mixed-weight region when the limbs approach parallel.
+    mixed = np.count_nonzero(weights>0,axis=1)>1
+    reach = max(radius, distance[mixed].max()) if mixed.any() else radius
+    rigid_edges = distance[(~mixed) & (distance>reach)]
+    support = rigid_edges.min() if rigid_edges.size else reach + radius
+    raw = np.maximum(depth,0) * tan(angle/2)
+    shift = raw / np.sqrt(1+(2*raw/support)**2)
+    # Quadratic relaxation makes the inner longitudinal gap smallest at the
+    # crease. The derivative of the station mapping stays positive.
+    inner_fade = np.maximum(1-distance/support,0)**2
+    inner_travel = shift * inner_fade
+    # On the convex side use a circular join of the bind cross-section.
+    outer = np.minimum(depth,0)
+    fade = np.exp(-distance/radius)
+    outward = distance + inner_travel + outer*sin(angle/2)*fade
+    height = depth + outer*(cos(angle/2)-1)*fade
+    # The softened inner miter needs a matching intersection height so both
+    # halves meet at station zero. Blend back to the bind offset along the limb.
+    if angle > 1e-8:
+        height += (shift/tan(angle/2)-np.maximum(depth,0))*inner_fade
+    x = np.where(station<=0,-outward,cos(angle)*outward-sin(angle)*height)
+    h = np.where(station<=0,height,sin(angle)*outward+cos(angle)*height)
+    target = np.column_stack((x,h*cos(plane)-lateral*sin(plane),h*sin(plane)+lateral*cos(plane)))
+    return target-original
+
+
 def solve_centers(response, desired, center_limit=None):
     """Damped minimum-norm center displacement in bind-object space."""
     import numpy as np
@@ -352,13 +392,13 @@ def solve_centers(response, desired, center_limit=None):
     return delta
 
 
-def show(three_bone=True, center_limit=None):
+def show(three_bone=True, center_limit=4.0):
     """Open a private preview window with native Maya skinCluster references."""
     import maya.cmds as mc
     from maya.api import OpenMaya as om
     if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "OCDDenseCenterWindow" + ("Three" if three_bone else "Two")
+    win = "CoRGeometricElbowWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
@@ -493,8 +533,8 @@ def show(three_bone=True, center_limit=None):
             mc.isolateSelect(panel,addDagObject=rig)
         scroll = mc.scrollLayout(parent=panes,childResizable=True)
         col = mc.columnLayout(parent=scroll,adjustableColumn=True,rowSpacing=3)
-        mc.text(parent=col,label="正视图　左列 / 右列\n上排　LBS / DQS\n中排　CoR / DQS_Com\n下排　OCD / CoR 动态曲线中心")
-        mc.text(parent=col,label="动态中心拟合 · 全截面 OCD 目标")
+        mc.text(parent=col,label="正视图　左列 / 右列\n上排　LBS / DQS\n中排　CoR / DQS_Com\n下排　OCD / 几何 CoR")
+        mc.text(parent=col,label="几何 CoR · 内侧偏移线 / 外侧圆弧")
         handles = []
 
         def slider(label,low,high,value):
@@ -526,8 +566,7 @@ def show(three_bone=True, center_limit=None):
                         helper.setRotation(om.MQuaternion(*half),om.MSpace.kTransform)
                     rotations.append(half)
                 original = np.asarray([(p.x,p.y,p.z) for p in reference.getPoints(om.MSpace.kObject)])
-                base_pose = Elbow(bend,twist,direction)
-                desired = np.asarray(base_pose.mesh(bind)) - original
+                desired = geometry_residual(bind,original,weights,bend,twist,direction)
                 delta = solve_centers(center_response(weights,rotations),desired,center_limit)
                 plug.setMObject(om.MFnDoubleArrayData().create(om.MDoubleArray(delta.ravel().tolist())))
             mesh.setPoints([om.MPoint(*p) for p in pose.mesh(bind)],om.MSpace.kObject)
@@ -621,7 +660,7 @@ def show(three_bone=True, center_limit=None):
             active = (weights>0).sum(axis=1)>1
             before,after = [np.linalg.norm(np.asarray([(p.x,p.y,p.z) for p in fn.getPoints(
                 om.MSpace.kObject)])-target,axis=1) for fn in (reference,guided_mesh)]
-            print("CoR -> rail CoR | active RMS %.5f -> %.5f" %
+            print("CoR -> geometric CoR | active RMS %.5f -> %.5f" %
                   (np.sqrt(np.mean(before[active]**2)),np.sqrt(np.mean(after[active]**2))))
             print("All vertices RMS %.5f -> %.5f | single-influence max error %.5f" %
                   (np.sqrt(np.mean(before**2)),np.sqrt(np.mean(after**2)),after[~active].max()))
