@@ -339,13 +339,13 @@ def center_response(weights, rotations):
     return np.einsum("nk,kij->nij",weights,rotation_matrix(q))-rotation_matrix(blend)
 
 
-def solve_centers(response, desired):
-    """Damped least squares, with a smooth one-cylinder-radius displacement bound."""
+def solve_centers(response, desired, center_limit=2.0):
+    """Damped least squares, with a smooth configurable bind-radius displacement bound."""
     import numpy as np
     transpose = response.transpose(0,2,1)
     system = transpose @ response + 0.08**2 * np.eye(3)
     delta = np.linalg.solve(system, transpose @ desired[:,:,None])[:,:,0]
-    return delta / np.sqrt(1 + (delta*delta).sum(axis=1,keepdims=True))
+    return delta / np.sqrt(1 + (delta*delta).sum(axis=1,keepdims=True)/center_limit**2)
 
 
 def rail_residual(bind, original, pose):
@@ -364,11 +364,13 @@ def rail_residual(bind, original, pose):
     return desired
 
 
-def show(three_bone=True):
+def show(three_bone=True, center_limit=2.0):
     """Open a private preview window with native Maya skinCluster references."""
     import maya.cmds as mc
     from maya.api import OpenMaya as om
-    win = "OCDRailCenterWindow" + ("Three" if three_bone else "Two")
+    if not isfinite(center_limit) or center_limit <= 0:
+        raise ValueError("center_limit must be finite and positive")
+    win = "OCDRailBudgetWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
@@ -504,6 +506,7 @@ def show(three_bone=True):
         scroll = mc.scrollLayout(parent=panes,childResizable=True)
         col = mc.columnLayout(parent=scroll,adjustableColumn=True,rowSpacing=3)
         mc.text(parent=col,label="正视图　左列 / 右列\n上排　LBS / DQS\n中排　CoR / DQS_Com\n下排　OCD / CoR 动态曲线中心")
+        mc.text(parent=col,label="中心偏移上限  %g × 绑定半径" % center_limit)
         handles = []
 
         def slider(label,low,high,value):
@@ -537,7 +540,7 @@ def show(three_bone=True):
                 original = np.asarray([(p.x,p.y,p.z) for p in reference.getPoints(om.MSpace.kObject)])
                 base_pose = Elbow(bend,twist,direction)
                 desired = rail_residual(bind, original, base_pose)
-                delta = solve_centers(center_response(weights,rotations),desired)
+                delta = solve_centers(center_response(weights,rotations),desired,center_limit)
                 plug.setMObject(om.MFnDoubleArrayData().create(om.MDoubleArray(delta.ravel().tolist())))
             mesh.setPoints([om.MPoint(*p) for p in pose.mesh(bind)],om.MSpace.kObject)
 
