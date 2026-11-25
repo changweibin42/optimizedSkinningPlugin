@@ -446,7 +446,40 @@ def geometry_residual(bind, original, weights, bend, twist, direction):
         return np.column_stack((c*x-s*h,cp*height-sp*lateral,sp*height+cp*lateral))
     fraction = bend/anchor
     local = straight + fraction*(swing(folded,-anchor)-straight)
-    return swing(local,bend)-original
+    profile = swing(local,bend)
+    target = profile[:-2].reshape(-1,SIDES,3)
+    points = np.asarray(bind)[:-2].reshape(target.shape)
+    phase = radians(twist)*weights[:-2,1]
+    if weights.shape[1] == 3:
+        phase += radians(twist)*0.35*weights[:-2,2]
+    plane = radians(direction)
+    azimuth = np.arctan2(points[:,:,2],points[:,:,1])+phase.reshape(-1,SIDES)-plane
+    normal = np.array([0.,cos(plane),sin(plane)])
+    # Recover the inner wall height along the actual compressed longitudinal
+    # coordinate. Use the same meridian at the crease and its rigid endpoint.
+    center = HALF_RINGS
+    active = ((weights[:-2]>0).sum(axis=1)>1).reshape(-1,SIDES).any(axis=1)
+    for step in (-1,1):
+        rows = np.arange(center+step,len(target) if step>0 else -1,step)
+        ends = rows[~active[rows]]
+        if not ends.size:
+            continue
+        end = ends[0]
+        beta = radians(bend) if step>0 else 0.
+        tangent = np.array([cos(beta),sin(beta)*cos(plane),sin(beta)*sin(plane)])
+        up = normal*cos(beta)-np.array([sin(beta),0.,0.])
+        span = (target[end]-target[center])@tangent
+        end_height = target[end]@up
+        start_height = target[center]@up
+        for row in rows[active[rows]]:
+            u = np.clip(((target[row]-target[center])@tangent)/
+                        np.where(abs(span)>1e-8,span,1.),0.,1.)
+            # Quadratic approach has a horizontal tangent at the rigid end.
+            wall = end_height+(start_height-end_height)*(1-u)**2
+            inner = np.clip(np.sign(bend)*np.cos(azimuth[row])*2,0.,1.)
+            inner = inner*inner*(3-2*inner)
+            target[row] += ((wall-target[row]@up)*inner)[:,None]*up
+    return profile-original
 
 
 def solve_centers(response, desired, center_limit=None):
@@ -468,7 +501,7 @@ def show(three_bone=True, center_limit=16.0):
     from maya.api import OpenMaya as om
     if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "CoRContinuousHoopWindow" + ("Three" if three_bone else "Two")
+    win = "CoRInnerWallWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
