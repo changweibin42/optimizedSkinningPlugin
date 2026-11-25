@@ -392,7 +392,7 @@ def geometric_profile(bind, original, weights, bend, twist, direction):
     return target-original
 
 
-def geometry_residual(bind, original, weights, bend, twist, direction):
+def section_residual(bind, original, weights, bend, twist, direction):
     """Interpolate section shape in a rotating frame up to the approved 120-degree pose."""
     import numpy as np
     if abs(bend) >= 120 or bend == 0:
@@ -423,6 +423,35 @@ def geometry_residual(bind, original, weights, bend, twist, direction):
     return linear
 
 
+def geometry_residual(bind, original, weights, bend, twist, direction):
+    """Set ring spacing along each limb using the same meridian on ring zero."""
+    import numpy as np
+    target = section_residual(bind, original, weights, bend, twist, direction) + original
+    angle = abs(bend)
+    if angle in (0, 120, 150):
+        return target-original
+    low, high = (0,120) if angle<120 else (120,150)
+    sign = 1 if bend>=0 else -1
+    station = np.asarray(bind)[:-2,0]
+    active = (weights[:-2]>0).sum(axis=1)>1
+    center = HALF_RINGS*SIDES + np.arange(len(station))%SIDES
+    zeros = np.zeros_like(original)
+    def along(points, degrees):
+        beta = radians(degrees)
+        plane = radians(direction)
+        axis = np.array([cos(beta),sin(beta)*cos(plane),sin(beta)*sin(plane)])
+        relative = points[:-2]-points[center]
+        return np.where(station>0,relative@axis,relative[:,0])
+    start = geometric_profile(bind,zeros,weights,sign*low,twist,direction)
+    end = geometric_profile(bind,zeros,weights,sign*high,twist,direction)
+    t = (angle-low)/(high-low)
+    correction = (1-t)*along(start,sign*low)+t*along(end,sign*high)-along(target,bend)
+    beta,plane = radians(bend),radians(direction)
+    axis = np.array([cos(beta),sin(beta)*cos(plane),sin(beta)*sin(plane)])
+    target[:-2] += (active*correction)[:,None]*np.where((station>0)[:,None],axis,[1,0,0])
+    return target-original
+
+
 def solve_centers(response, desired, center_limit=None):
     """Damped minimum-norm center displacement in bind-object space."""
     import numpy as np
@@ -442,7 +471,7 @@ def show(three_bone=True, center_limit=4.0):
     from maya.api import OpenMaya as om
     if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "CoRCompactMotionWindow" + ("Three" if three_bone else "Two")
+    win = "CoRFixedGridSpacingWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
@@ -476,7 +505,6 @@ def show(three_bone=True, center_limit=4.0):
         weights = np.array([rig_weights(skin_weight(p[0]), three_bone) for p in bind])
         layout = (("Classic_LBS",-7,16),("DQ_Skin",7,16),
                   ("CoR",-7,0),("DQS_Com",7,0),("CoR_CurveGuided",7,-16),("OCD",-7,-16))
-        visible_meshes = []
         grid = {}
         for i,(label,offset,row_y) in enumerate(layout):
             base = mc.createNode("transform",name="ref_"+label+"#",parent=group)
@@ -561,23 +589,15 @@ def show(three_bone=True, center_limit=4.0):
                 sel.add(shape)
                 mesh = om.MFnMesh(sel.getDagPath(0))
 
-            visible_shape = proxy if label in ("CoR","DQS_Com","CoR_CurveGuided") else mc.listRelatives(
-                geo,shapes=True,noIntermediate=True,fullPath=True)[0]
-            path = om.MSelectionList()
-            path.add(visible_shape)
-            visible_meshes.append(om.MFnMesh(path.getDagPath(0)))
 
         def pack_grid():
-            bounds = [fn.boundingBox for fn in visible_meshes]
-            xmin = min(b.min.x for b in bounds)
-            xmax = max(b.max.x for b in bounds)
-            ymin = min(b.min.y for b in bounds)
-            ymax = max(b.max.y for b in bounds)
-            width,height = xmax-xmin,ymax-ymin
+            # Fixed cell pitch covers the projected extents throughout a bend.
+            width = 2*hypot(HALF,1.0)
+            height = hypot(HALF,1.0)+1.0
             gap = 0.45
             for rig,(_,col,row) in zip(rigs,layout):
-                x = (1 if col>0 else -1)*(width+gap)/2-(xmin+xmax)/2
-                y = row/16*(height+gap)-(ymin+ymax)/2
+                x = (1 if col>0 else -1)*(width+gap)/2
+                y = row/16*(height+gap)
                 mc.setAttr(rig+".translateX",linear(x))
                 mc.setAttr(rig+".translateY",linear(y))
                 if rig == rigs[-1]:
@@ -639,8 +659,7 @@ def show(three_bone=True, center_limit=4.0):
                 delta = solve_centers(center_response(weights,rotations),desired,center_limit)
                 plug.setMObject(om.MFnDoubleArrayData().create(om.MDoubleArray(delta.ravel().tolist())))
             mesh.setPoints([om.MPoint(*p) for p in pose.mesh(bind)],om.MSpace.kObject)
-            if not mc.checkBox(closeup,q=True,value=True):
-                pack_grid()
+
 
         motion = [slider("弯曲",-150,150,118), slider("扭转",-180,180,0), slider("弯曲方向",-180,180,0)]
 
@@ -691,7 +710,7 @@ def show(three_bone=True, center_limit=4.0):
                 width = mc.control(editor,q=True,width=True) if mc.control(editor,exists=True) else 0
                 height = mc.control(editor,q=True,height=True) if mc.control(editor,exists=True) else 0
                 aspect = width/height if min(width,height)>10 else 1.35
-                camera_pose(yaw,elev,(0,0,0),70,max(25.5,grid["size"][0],max(grid["size"][1],23)*aspect)*1.15)
+                camera_pose(yaw,elev,(0,0,0),70,max(25.5,grid["size"][0],(grid["size"][1]+HALF-1.0)*aspect)*1.15)
         row = mc.rowLayout(parent=col,numberOfColumns=3)
         closeup = mc.checkBox(parent=row,label="OCD 特写",changeCommand=frame_view)
         sideview = mc.checkBox(parent=row,label="斜视",changeCommand=frame_view)
@@ -752,6 +771,7 @@ def show(three_bone=True, center_limit=4.0):
         mc.button(parent=col,label="视频参数（补偿）",command=load_video)
         mc.text(parent=col,label="Before / After 保持当前骨姿与机位。关闭窗口清理本次预览。")
         redraw()
+        pack_grid()
         frame_view()
         mc.scriptJob(parent=win,attributeChange=[joints[-1]+".rotate",driver_changed],allChildren=True)
         mc.showWindow(win)
