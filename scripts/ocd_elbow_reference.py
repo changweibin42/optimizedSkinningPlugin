@@ -312,8 +312,49 @@ def read_rotation(quat, old_bend, old_direction):
     return bend, twist, direction
 
 
-def fit_preview_centers(mc, om, node, shape, driver, bind, faces):
-    """Calibrate fixed centers once, in the preview's bind-object frame."""
+def guided_center_offsets(bind, triangles, sigma, bandwidth):
+    """Two-influence CoR quadrature on the straight bind rail (s = object x)."""
+    import numpy as np
+    if sigma <= 0 or bandwidth <= 0:
+        raise ValueError("Kernel widths must be positive")
+    points = np.asarray(bind, dtype=float)
+    weights = np.array([skin_weight(p[0]) for p in points])
+    samples = []
+    def visit(p, w):
+        differences = w - np.roll(w, -1)
+        first = int(np.argmax(np.abs(differences)))
+        if 2 * differences[first]**2 > 0.1**2:
+            second = (first + 1) % 3
+            mid = (p[first] + p[second]) * 0.5
+            mw = (w[first] + w[second]) * 0.5
+            for index in (second, first):
+                pp, ww = p.copy(), w.copy()
+                pp[index], ww[index] = mid, mw
+                visit(pp, ww)
+            return
+        mean = w.mean()
+        mass = 0.5 * np.linalg.norm(np.cross(p[1]-p[0], p[2]-p[0])) * mean * (1-mean)
+        if mass > 0:
+            samples.append((*p.mean(axis=0), mean, mass))
+    for tri in np.asarray(triangles, dtype=int).reshape(-1, 3):
+        visit(points[tri], weights[tri])
+    delta = np.zeros_like(points)
+    if not samples:
+        return delta
+    sample = np.asarray(samples)
+    centers, sw, mass = sample[:, :3], sample[:, 3], sample[:, 4]
+    for s in np.unique(points[:, 0]):
+        w = skin_weight(s)
+        if 0 < w < 1:
+            original = mass * np.exp(-((w-sw)/sigma)**2)
+            guided = original * np.exp(-0.5*((s-centers[:, 0])/bandwidth)**2)
+            if guided.sum() > 0:
+                delta[points[:, 0] == s] = (np.average(centers, axis=0, weights=guided)
+                                           - np.average(centers, axis=0, weights=original))
+    return delta
+
+
+def guide_preview_centers(mc, om, node, shape, driver, bind, bandwidth):
     import numpy as np
     sel = om.MSelectionList()
     sel.add(shape)
@@ -321,8 +362,6 @@ def fit_preview_centers(mc, om, node, shape, driver, bind, faces):
     sel = om.MSelectionList()
     sel.add(driver)
     xf = om.MFnTransform(sel.getDagPath(0))
-    count = len(bind)
-    rings = 2*HALF_RINGS+1
     def sample():
         return np.array([(p.x,p.y,p.z) for p in mesh.getPoints(om.MSpace.kObject)])
     node_sel = om.MSelectionList()
@@ -331,52 +370,13 @@ def fit_preview_centers(mc, om, node, shape, driver, bind, faces):
     def offsets(data):
         values = om.MDoubleArray(data.ravel().tolist())
         offset_plug.setMObject(om.MFnDoubleArrayData().create(values))
-    zeros = np.zeros((count,3))
-    H = np.zeros((count,3,3))
-    rhs = np.zeros((count,3))
-    for angle in (60,90,120,150):
-        xf.setRotation(om.MQuaternion(*joint_quaternion(angle,0,0)),om.MSpace.kTransform)
-        offsets(zeros)
-        base = sample()
-        target = np.asarray(Elbow(angle).mesh(bind))
-        grid = target[:-2].reshape(rings,SIDES,3)
-        axial = np.gradient(grid,axis=0)
-        hoop = np.roll(grid,-1,axis=1)-np.roll(grid,1,axis=1)
-        normal = np.cross(hoop,axial)
-        normal /= np.maximum(np.linalg.norm(normal,axis=2,keepdims=True),1e-12)
-        half = radians(angle/2)
-        normal[HALF_RINGS,0] = (-sin(half),cos(half),0)
-        n = np.vstack((normal.reshape(-1,3),zeros[-2:]))
-        # Probe the compiled runtime: center sensitivity is exactly affine.
-        columns = []
-        for axis in range(3):
-            probe = zeros.copy()
-            probe[:,axis] = 1
-            offsets(probe)
-            columns.append(np.sum((sample()-base)*n,axis=1))
-        J = np.stack(columns,axis=1)
-        H += J[:,:,None]*J[:,None,:]
-        rhs += J*np.sum((target-base)*n,axis=1)[:,None]
-    if H.max()<1e-6:
-        raise RuntimeError("CoR 中心扰动未产生位移，请确认加载了本分支编译的插件。")
-    edges = sorted({tuple(sorted((a,b))) for f in faces for a,b in zip(f,f[1:]+f[:1])})
-    a,b = np.array(edges).T
-    degree = np.bincount(np.r_[a,b],minlength=count)
-    active = np.array([0<skin_weight(p[0])<1 for p in bind])
-    smoothing = 0.015
-    matrix = H+(0.01+smoothing*degree)[:,None,None]*np.eye(3)
-    inverse = np.linalg.inv(matrix)
-    solution = zeros.copy()
-    for _ in range(240):
-        neighbor = zeros.copy()
-        np.add.at(neighbor,a,solution[b])
-        np.add.at(neighbor,b,solution[a])
-        updated = np.einsum("nij,nj->ni",inverse,rhs+smoothing*neighbor)
-        updated[~active] = 0
-        change = np.max(abs(updated-solution))
-        solution = updated
-        if change<1e-8:
-            break
+    sigma = mc.getAttr(node+".corSigma")
+    solution = guided_center_offsets(bind, mesh.getTriangles()[1], sigma, bandwidth)
+    zeros = np.zeros_like(solution)
+    active = np.array([0 < skin_weight(p[0]) < 1 for p in bind])
+    lengths = np.linalg.norm(solution[active], axis=1)
+    print("Curve CoR | sigma %.5g | axial width %.5g | mean/max center shift %.6g / %.6g" %
+          (sigma, bandwidth, lengths.mean(), lengths.max()))
     offsets(solution)
     metrics = []
     for angle,twist in ((75,0),(105,0),(135,0),(-105,0),(105,45)):
@@ -389,11 +389,11 @@ def fit_preview_centers(mc, om, node, shape, driver, bind, faces):
         def rms(q):
             return float(np.sqrt(np.mean(np.sum((q[active]-target[active])**2,axis=1))))
         metrics.append("%g/%g: %.4f -> %.4f" % (angle,twist,rms(original),rms(fitted)))
-    print("CoR holdout RMS (bend/twist, original -> fitted): "+" | ".join(metrics))
+    print("CoR holdout RMS (bend/twist, original -> curve-guided): "+" | ".join(metrics))
     xf.setRotation(om.MQuaternion(),om.MSpace.kTransform)
 
 
-def show():
+def show(curve_width=RING_STEP):
     """Open a private preview window with native Maya skinCluster references."""
     import maya.cmds as mc
     from maya.api import OpenMaya as om
@@ -428,7 +428,7 @@ def show():
         points = [om.MPoint(*p) for p in bind]
         joints, rigs = [], []
         layout = (("Classic_LBS",-7,16),("DQ_Skin",7,16),
-                  ("CoR",-7,0),("DQS_Com",7,0),("CoR_FixedFit",7,-16),("OCD",-7,-16))
+                  ("CoR",-7,0),("DQS_Com",7,0),("CoR_CurveGuided",7,-16),("OCD",-7,-16))
         for i,(label,offset,row_y) in enumerate(layout):
             base = mc.createNode("transform",name="ref_"+label+"#",parent=group)
             rigs.append(base)
@@ -437,7 +437,7 @@ def show():
             # Evaluate repository deformers at the origin. The visible shape receives
             # their object-space output, independent of the grid cell translation.
             compute = base
-            if label in ("CoR","DQS_Com","CoR_FixedFit"):
+            if label in ("CoR","DQS_Com","CoR_CurveGuided"):
                 compute = mc.createNode("transform",name=label+"_compute#",parent=group)
                 mc.setAttr(compute+".visibility",False)
             geo = mc.createNode("transform",name=label+"_geo#",parent=compute)
@@ -467,7 +467,7 @@ def show():
                                    transformValue=[(prev,1-w),(elbow,w)])
                 for ix,w in ((len(bind)-2,0.0),(len(bind)-1,1.0)):
                     mc.skinPercent(skin,"%s.vtx[%d]" % (geo,ix),transformValue=[(prev,1-w),(elbow,w)])
-            elif label in ("CoR","DQS_Com","CoR_FixedFit"):
+            elif label in ("CoR","DQS_Com","CoR_CurveGuided"):
                 skin = mc.deformer(geo,type="optimizedSkinCluster",name=label+"_skin#")[0]
                 history.append((skin,mc.ls(skin,uuid=True)[0]))
                 for k,joint in enumerate((prev,elbow)):
@@ -477,14 +477,14 @@ def show():
                 for vertex,(station,_,_) in enumerate(bind):
                     w = skin_weight(station)
                     mc.setAttr("%s.weightList[%d].weights[0:1]" % (skin,vertex),1-w,w,size=2)
-                if label=="CoR_FixedFit" and not mc.attributeQuery("corFitOffsets",node=skin,exists=True):
+                if label=="CoR_CurveGuided" and not mc.attributeQuery("corFitOffsets",node=skin,exists=True):
                     raise RuntimeError("请加载本测试分支新编译的插件。")
-                mc.setAttr(skin+".algorithmType",{"CoR":0,"DQS_Com":2,"CoR_FixedFit":8}[label])
+                mc.setAttr(skin+".algorithmType",{"CoR":0,"DQS_Com":2,"CoR_CurveGuided":8}[label])
                 if label=="DQS_Com":
                     mc.setAttr(skin+".dqsCompStrength",1.0)
                 result = mc.listRelatives(geo,shapes=True,noIntermediate=True,fullPath=True)[0]
-                if label=="CoR_FixedFit":
-                    fit_preview_centers(mc,om,skin,result,elbow,bind,faces)
+                if label=="CoR_CurveGuided":
+                    guide_preview_centers(mc,om,skin,result,elbow,bind,curve_width)
                 display = mc.createNode("transform",name=label+"_view#",parent=base)
                 proxy = mc.createNode("mesh",name=label+"_viewShape#",parent=display)
                 mc.connectAttr(result+".outMesh",proxy+".inMesh")
@@ -512,7 +512,7 @@ def show():
             mc.isolateSelect(panel,addDagObject=rig)
         scroll = mc.scrollLayout(parent=panes,childResizable=True)
         col = mc.columnLayout(parent=scroll,adjustableColumn=True,rowSpacing=3)
-        mc.text(parent=col,label="正视图　左列 / 右列\n上排　LBS / DQS\n中排　CoR / DQS_Com\n下排　OCD / CoR Fixed Fit")
+        mc.text(parent=col,label="正视图　左列 / 右列\n上排　LBS / DQS\n中排　CoR / DQS_Com\n下排　OCD / CoR Curve Guided")
         handles = []
 
         def slider(label,low,high,value):
