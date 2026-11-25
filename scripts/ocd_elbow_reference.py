@@ -339,38 +339,26 @@ def center_response(weights, rotations):
     return np.einsum("nk,kij->nij",weights,rotation_matrix(q))-rotation_matrix(blend)
 
 
-def solve_centers(response, desired, center_limit=2.0):
-    """Damped least squares, with a smooth configurable bind-radius displacement bound."""
+def solve_centers(response, desired, center_limit=None):
+    """Damped minimum-norm center displacement in bind-object space."""
     import numpy as np
-    transpose = response.transpose(0,2,1)
-    system = transpose @ response + 0.08**2 * np.eye(3)
-    delta = np.linalg.solve(system, transpose @ desired[:,:,None])[:,:,0]
-    return delta / np.sqrt(1 + (delta*delta).sum(axis=1,keepdims=True)/center_limit**2)
+    u, singular, vt = np.linalg.svd(response, full_matrices=False)
+    components = u.swapaxes(1, 2) @ desired[:, :, None]
+    gain = singular / (singular**2 + 0.015**2)
+    delta = (vt.swapaxes(1, 2) @ (gain[:, :, None] * components))[:, :, 0]
+    if center_limit is not None:
+        length = np.linalg.norm(delta, axis=1, keepdims=True)
+        delta *= np.minimum(1.0, center_limit / np.maximum(length, 1e-12))
+    return delta
 
 
-def rail_residual(bind, original, pose):
-    """Sample eight longitudinal rails and interpolate displacement around each ring."""
-    import numpy as np
-    rings = 2*HALF_RINGS+1
-    stride = SIDES//8
-    indices = np.arange(rings*SIDES).reshape(rings,SIDES)[:,::stride]
-    target = np.asarray(pose.mesh([bind[i] for i in indices.flat])).reshape(rings,8,3)
-    rails = target-original[indices]
-    j = np.arange(SIDES)
-    left = j//stride
-    t = (j%stride)[None,:,None]/stride
-    desired = np.zeros_like(original)
-    desired[:-2] = ((1-t)*rails[:,left]+t*rails[:,(left+1)%8]).reshape(-1,3)
-    return desired
-
-
-def show(three_bone=True, center_limit=2.0):
+def show(three_bone=True, center_limit=None):
     """Open a private preview window with native Maya skinCluster references."""
     import maya.cmds as mc
     from maya.api import OpenMaya as om
-    if not isfinite(center_limit) or center_limit <= 0:
+    if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "OCDRailBudgetWindow" + ("Three" if three_bone else "Two")
+    win = "OCDDenseCenterWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
@@ -506,7 +494,7 @@ def show(three_bone=True, center_limit=2.0):
         scroll = mc.scrollLayout(parent=panes,childResizable=True)
         col = mc.columnLayout(parent=scroll,adjustableColumn=True,rowSpacing=3)
         mc.text(parent=col,label="正视图　左列 / 右列\n上排　LBS / DQS\n中排　CoR / DQS_Com\n下排　OCD / CoR 动态曲线中心")
-        mc.text(parent=col,label="中心偏移上限  %g × 绑定半径" % center_limit)
+        mc.text(parent=col,label="动态中心拟合 · 全截面 OCD 目标")
         handles = []
 
         def slider(label,low,high,value):
@@ -539,7 +527,7 @@ def show(three_bone=True, center_limit=2.0):
                     rotations.append(half)
                 original = np.asarray([(p.x,p.y,p.z) for p in reference.getPoints(om.MSpace.kObject)])
                 base_pose = Elbow(bend,twist,direction)
-                desired = rail_residual(bind, original, base_pose)
+                desired = np.asarray(base_pose.mesh(bind)) - original
                 delta = solve_centers(center_response(weights,rotations),desired,center_limit)
                 plug.setMObject(om.MFnDoubleArrayData().create(om.MDoubleArray(delta.ravel().tolist())))
             mesh.setPoints([om.MPoint(*p) for p in pose.mesh(bind)],om.MSpace.kObject)
@@ -562,7 +550,7 @@ def show(three_bone=True, center_limit=2.0):
             set_values(motion,(b,t,d))
             redraw()
         row = mc.rowLayout(parent=col,numberOfColumns=5)
-        for name,args in (("伸直",(0,)),("90°",(90,)),("片头",(118,)),("深弯",(145,)),("弯＋扭",(105,70,35))):
+        for name,args in (("伸直",(0,)),("120°",(120,)),("片头",(118,)),("深弯",(145,)),("弯＋扭",(105,70,35))):
             mc.button(parent=row,label=name,command=lambda *_,a=args:set_pose(*a))
 
         def camera_pose(yaw,elev,center,depth,width,perspective=False):
@@ -635,6 +623,8 @@ def show(three_bone=True, center_limit=2.0):
                 om.MSpace.kObject)])-target,axis=1) for fn in (reference,guided_mesh)]
             print("CoR -> rail CoR | active RMS %.5f -> %.5f" %
                   (np.sqrt(np.mean(before[active]**2)),np.sqrt(np.mean(after[active]**2))))
+            print("All vertices RMS %.5f -> %.5f | single-influence max error %.5f" %
+                  (np.sqrt(np.mean(before**2)),np.sqrt(np.mean(after**2)),after[~active].max()))
             # Find the actual inner/outer meridians in the signed bend plane.
             azimuth = radians(direction + (180 if bend<0 else 0))
             for ring in range(-2,3):
