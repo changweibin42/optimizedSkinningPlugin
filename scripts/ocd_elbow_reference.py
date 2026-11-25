@@ -312,92 +312,63 @@ def read_rotation(quat, old_bend, old_direction):
     return bend, twist, direction
 
 
-def guided_center_offsets(bind, triangles, sigma, bandwidth):
-    """Two-influence CoR quadrature on the straight bind rail (s = object x)."""
+def rig_weights(w, three_bone):
+    if not three_bone:
+        return (1-w, w)
+    helper = 1.2 * min(w, 1-w)
+    return (1-w-helper/2, w-helper/2, helper)
+
+
+def rotation_matrix(q):
     import numpy as np
-    if sigma <= 0 or bandwidth <= 0:
-        raise ValueError("Kernel widths must be positive")
-    points = np.asarray(bind, dtype=float)
-    weights = np.array([skin_weight(p[0]) for p in points])
-    samples = []
-    def visit(p, w):
-        differences = w - np.roll(w, -1)
-        first = int(np.argmax(np.abs(differences)))
-        if 2 * differences[first]**2 > 0.1**2:
-            second = (first + 1) % 3
-            mid = (p[first] + p[second]) * 0.5
-            mw = (w[first] + w[second]) * 0.5
-            for index in (second, first):
-                pp, ww = p.copy(), w.copy()
-                pp[index], ww[index] = mid, mw
-                visit(pp, ww)
-            return
-        mean = w.mean()
-        mass = 0.5 * np.linalg.norm(np.cross(p[1]-p[0], p[2]-p[0])) * mean * (1-mean)
-        if mass > 0:
-            samples.append((*p.mean(axis=0), mean, mass))
-    for tri in np.asarray(triangles, dtype=int).reshape(-1, 3):
-        visit(points[tri], weights[tri])
-    delta = np.zeros_like(points)
-    if not samples:
-        return delta
-    sample = np.asarray(samples)
-    centers, sw, mass = sample[:, :3], sample[:, 3], sample[:, 4]
-    for s in np.unique(points[:, 0]):
-        w = skin_weight(s)
-        if 0 < w < 1:
-            original = mass * np.exp(-((w-sw)/sigma)**2)
-            guided = original * np.exp(-0.5*((s-centers[:, 0])/bandwidth)**2)
-            if guided.sum() > 0:
-                delta[points[:, 0] == s] = (np.average(centers, axis=0, weights=guided)
-                                           - np.average(centers, axis=0, weights=original))
-    return delta
+    x, y, z, w = np.moveaxis(np.asarray(q), -1, 0)
+    return np.stack((1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w),
+                     2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w),
+                     2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)), axis=-1).reshape(x.shape+(3,3))
 
 
-def guide_preview_centers(mc, om, node, shape, driver, bind, bandwidth):
+def center_response(weights, rotations):
+    """Derivative of posed points with respect to bind centers in object space."""
     import numpy as np
-    sel = om.MSelectionList()
-    sel.add(shape)
-    mesh = om.MFnMesh(sel.getDagPath(0))
-    sel = om.MSelectionList()
-    sel.add(driver)
-    xf = om.MFnTransform(sel.getDagPath(0))
-    def sample():
-        return np.array([(p.x,p.y,p.z) for p in mesh.getPoints(om.MSpace.kObject)])
-    node_sel = om.MSelectionList()
-    node_sel.add(node)
-    offset_plug = om.MFnDependencyNode(node_sel.getDependNode(0)).findPlug("corFitOffsets",False)
-    def offsets(data):
-        values = om.MDoubleArray(data.ravel().tolist())
-        offset_plug.setMObject(om.MFnDoubleArrayData().create(values))
-    sigma = mc.getAttr(node+".corSigma")
-    solution = guided_center_offsets(bind, mesh.getTriangles()[1], sigma, bandwidth)
-    zeros = np.zeros_like(solution)
-    active = np.array([0 < skin_weight(p[0]) < 1 for p in bind])
-    lengths = np.linalg.norm(solution[active], axis=1)
-    print("Curve CoR | sigma %.5g | axial width %.5g | mean/max center shift %.6g / %.6g" %
-          (sigma, bandwidth, lengths.mean(), lengths.max()))
-    offsets(solution)
-    metrics = []
-    for angle,twist in ((75,0),(105,0),(135,0),(-105,0),(105,45)):
-        xf.setRotation(om.MQuaternion(*joint_quaternion(angle,twist,0)),om.MSpace.kTransform)
-        target = np.asarray(Elbow(angle,twist).mesh(bind))
-        offsets(zeros)
-        original = sample()
-        offsets(solution)
-        fitted = sample()
-        def rms(q):
-            return float(np.sqrt(np.mean(np.sum((q[active]-target[active])**2,axis=1))))
-        metrics.append("%g/%g: %.4f -> %.4f" % (angle,twist,rms(original),rms(fitted)))
-    print("CoR holdout RMS (bend/twist, original -> curve-guided): "+" | ".join(metrics))
-    xf.setRotation(om.MQuaternion(),om.MSpace.kTransform)
+    q = np.asarray(rotations, dtype=float)
+    blend = np.zeros((len(weights), 4))
+    for w, rotation in zip(weights.T, q):
+        sign = np.where((blend*rotation).sum(axis=1)<0, -1, 1)
+        blend += (w*sign)[:,None]*rotation
+    blend /= np.linalg.norm(blend,axis=1)[:,None]
+    return np.einsum("nk,kij->nij",weights,rotation_matrix(q))-rotation_matrix(blend)
 
 
-def show(curve_width=RING_STEP):
+def solve_centers(response, desired):
+    """Damped least squares, with a smooth one-cylinder-radius displacement bound."""
+    import numpy as np
+    transpose = response.transpose(0,2,1)
+    system = transpose @ response + 0.08**2 * np.eye(3)
+    delta = np.linalg.solve(system, transpose @ desired[:,:,None])[:,:,0]
+    return delta / np.sqrt(1 + (delta*delta).sum(axis=1,keepdims=True))
+
+
+def rail_residual(bind, original, pose):
+    """Sample eight longitudinal rails and interpolate displacement around each ring."""
+    import numpy as np
+    rings = 2*HALF_RINGS+1
+    stride = SIDES//8
+    indices = np.arange(rings*SIDES).reshape(rings,SIDES)[:,::stride]
+    target = np.asarray(pose.mesh([bind[i] for i in indices.flat])).reshape(rings,8,3)
+    rails = target-original[indices]
+    j = np.arange(SIDES)
+    left = j//stride
+    t = (j%stride)[None,:,None]/stride
+    desired = np.zeros_like(original)
+    desired[:-2] = ((1-t)*rails[:,left]+t*rails[:,(left+1)%8]).reshape(-1,3)
+    return desired
+
+
+def show(three_bone=True):
     """Open a private preview window with native Maya skinCluster references."""
     import maya.cmds as mc
     from maya.api import OpenMaya as om
-    win = "OCDFrameReferenceWindow"
+    win = "OCDRailCenterWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
@@ -426,7 +397,9 @@ def show(curve_width=RING_STEP):
         counts = [len(f) for f in faces]
         indices = [j for f in faces for j in f]
         points = [om.MPoint(*p) for p in bind]
-        joints, rigs = [], []
+        import numpy as np
+        joints, rigs, helpers = [], [], []
+        weights = np.array([rig_weights(skin_weight(p[0]), three_bone) for p in bind])
         layout = (("Classic_LBS",-7,16),("DQ_Skin",7,16),
                   ("CoR",-7,0),("DQS_Com",7,0),("CoR_CurveGuided",7,-16),("OCD",-7,-16))
         for i,(label,offset,row_y) in enumerate(layout):
@@ -453,10 +426,18 @@ def show(curve_width=RING_STEP):
                 mc.setAttr(j+".translateX",linear(dx))
                 mc.setAttr(j+".radius",0.09)
             joints.append(elbow)
+            bones = [prev, elbow]
+            if three_bone:
+                helper = mc.createNode("joint",name=label+"_helper#",parent=prev)
+                mc.setAttr(helper+".translateX",linear(HALF))
+                bones.append(helper)
+                helper_sel = om.MSelectionList()
+                helper_sel.add(helper)
+                helpers.append(om.MFnTransform(helper_sel.getDagPath(0)))
             if i < 2:
                 existing_poses = set(mc.ls(type="dagPose") or [])
-                skin = mc.skinCluster(prev,elbow,geo,toSelectedBones=True,skinMethod=i,
-                                      maximumInfluences=2,normalizeWeights=1,name=label+"_skin#")[0]
+                skin = mc.skinCluster(*(bones+[geo]),toSelectedBones=True,skinMethod=i,
+                                      maximumInfluences=len(bones),normalizeWeights=1,name=label+"_skin#")[0]
                 new_poses = set(mc.ls(type="dagPose") or [])-existing_poses
                 for node in [skin]+sorted(new_poses):
                     history.append((node,mc.ls(node,uuid=True)[0]))
@@ -464,27 +445,37 @@ def show(curve_width=RING_STEP):
                     first = row*SIDES
                     w = skin_weight(bind[first][0])
                     mc.skinPercent(skin,"%s.vtx[%d:%d]" % (geo,first,first+SIDES-1),
-                                   transformValue=[(prev,1-w),(elbow,w)])
+                                   transformValue=list(zip(bones,rig_weights(w,three_bone))))
                 for ix,w in ((len(bind)-2,0.0),(len(bind)-1,1.0)):
-                    mc.skinPercent(skin,"%s.vtx[%d]" % (geo,ix),transformValue=[(prev,1-w),(elbow,w)])
+                    mc.skinPercent(skin,"%s.vtx[%d]" % (geo,ix),transformValue=list(zip(bones,rig_weights(w,three_bone))))
             elif label in ("CoR","DQS_Com","CoR_CurveGuided"):
                 skin = mc.deformer(geo,type="optimizedSkinCluster",name=label+"_skin#")[0]
                 history.append((skin,mc.ls(skin,uuid=True)[0]))
-                for k,joint in enumerate((prev,elbow)):
+                for k,joint in enumerate(bones):
                     mc.connectAttr(joint+".worldMatrix[0]",skin+".matrix[%d]" % k)
                     inverse = mc.getAttr(joint+".worldInverseMatrix[0]")
                     mc.setAttr(skin+".bindPreMatrix[%d]" % k,*inverse,type="matrix")
                 for vertex,(station,_,_) in enumerate(bind):
                     w = skin_weight(station)
-                    mc.setAttr("%s.weightList[%d].weights[0:1]" % (skin,vertex),1-w,w,size=2)
+                    mc.setAttr("%s.weightList[%d].weights[0:%d]" % (skin,vertex,len(bones)-1),
+                               *weights[vertex],size=len(bones))
                 if label=="CoR_CurveGuided" and not mc.attributeQuery("corFitOffsets",node=skin,exists=True):
                     raise RuntimeError("请加载本测试分支新编译的插件。")
                 mc.setAttr(skin+".algorithmType",{"CoR":0,"DQS_Com":2,"CoR_CurveGuided":8}[label])
                 if label=="DQS_Com":
                     mc.setAttr(skin+".dqsCompStrength",1.0)
                 result = mc.listRelatives(geo,shapes=True,noIntermediate=True,fullPath=True)[0]
+                if label=="CoR":
+                    ref_sel = om.MSelectionList()
+                    ref_sel.add(result)
+                    reference = om.MFnMesh(ref_sel.getDagPath(0))
                 if label=="CoR_CurveGuided":
-                    guide_preview_centers(mc,om,skin,result,elbow,bind,curve_width)
+                    node_sel = om.MSelectionList()
+                    node_sel.add(skin)
+                    plug = om.MFnDependencyNode(node_sel.getDependNode(0)).findPlug("corFitOffsets",False)
+                    result_sel = om.MSelectionList()
+                    result_sel.add(result)
+                    guided_mesh = om.MFnMesh(result_sel.getDagPath(0))
                 display = mc.createNode("transform",name=label+"_view#",parent=base)
                 proxy = mc.createNode("mesh",name=label+"_viewShape#",parent=display)
                 mc.connectAttr(result+".outMesh",proxy+".inMesh")
@@ -512,7 +503,7 @@ def show(curve_width=RING_STEP):
             mc.isolateSelect(panel,addDagObject=rig)
         scroll = mc.scrollLayout(parent=panes,childResizable=True)
         col = mc.columnLayout(parent=scroll,adjustableColumn=True,rowSpacing=3)
-        mc.text(parent=col,label="正视图　左列 / 右列\n上排　LBS / DQS\n中排　CoR / DQS_Com\n下排　OCD / CoR Curve Guided")
+        mc.text(parent=col,label="正视图　左列 / 右列\n上排　LBS / DQS\n中排　CoR / DQS_Com\n下排　OCD / CoR 动态曲线中心")
         handles = []
 
         def slider(label,low,high,value):
@@ -537,6 +528,17 @@ def show(curve_width=RING_STEP):
             if q != last_rotation[0]:
                 last_rotation[0] = q
                 driver.setRotation(om.MQuaternion(*q),om.MSpace.kTransform)
+                rotations = [(0,0,0,1), q]
+                if helpers:
+                    half = joint_quaternion(bend*0.5,twist*0.35,direction)
+                    for helper in helpers:
+                        helper.setRotation(om.MQuaternion(*half),om.MSpace.kTransform)
+                    rotations.append(half)
+                original = np.asarray([(p.x,p.y,p.z) for p in reference.getPoints(om.MSpace.kObject)])
+                base_pose = Elbow(bend,twist,direction)
+                desired = rail_residual(bind, original, base_pose)
+                delta = solve_centers(center_response(weights,rotations),desired)
+                plug.setMObject(om.MFnDoubleArrayData().create(om.MDoubleArray(delta.ravel().tolist())))
             mesh.setPoints([om.MPoint(*p) for p in pose.mesh(bind)],om.MSpace.kObject)
 
         motion = [slider("弯曲",-150,150,118), slider("扭转",-180,180,0), slider("弯曲方向",-180,180,0)]
@@ -622,6 +624,24 @@ def show(curve_width=RING_STEP):
             set_values(handles,ZERO)
             redraw()
         mc.button(parent=row,label="全部归零",command=neutral)
+        def report(*_):
+            bend,twist,direction = get_values(motion)
+            target = np.asarray(Elbow(bend,twist,direction).mesh(bind))
+            active = (weights>0).sum(axis=1)>1
+            before,after = [np.linalg.norm(np.asarray([(p.x,p.y,p.z) for p in fn.getPoints(
+                om.MSpace.kObject)])-target,axis=1) for fn in (reference,guided_mesh)]
+            print("CoR -> rail CoR | active RMS %.5f -> %.5f" %
+                  (np.sqrt(np.mean(before[active]**2)),np.sqrt(np.mean(after[active]**2))))
+            # Find the actual inner/outer meridians in the signed bend plane.
+            azimuth = radians(direction + (180 if bend<0 else 0))
+            for ring in range(-2,3):
+                start = (HALF_RINGS+ring)*SIDES
+                phase = azimuth - radians(twist)*skin_weight(bind[start][0])
+                inner = round(phase*SIDES/(2*pi))%SIDES
+                i,o = start+inner,start+(inner+SIDES//2)%SIDES
+                print("ring %+d | inner %.5f -> %.5f | outer %.5f -> %.5f" %
+                      (ring,before[i],after[i],before[o],after[o]))
+        mc.button(parent=col,label="打印当前姿态误差（默认 OCD）",command=report)
         handles.extend(slider(c,-1.0,1.0,0) for c in CHANNELS)
         def load_video(*_):
             set_values(handles,VIDEO)
@@ -809,3 +829,4 @@ if __name__ == "__main__":
         self_test()
     else:
         show()
+
