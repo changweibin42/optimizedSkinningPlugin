@@ -364,11 +364,35 @@ def geometry_residual(bind, original, weights, bend, twist, direction):
     # crease. The derivative of the station mapping stays positive.
     inner_fade = np.maximum(1-distance/support,0)**2
     inner_travel = shift * inner_fade
-    # On the convex side use a circular join of the bind cross-section.
+    outward = distance + inner_travel
+    height = depth.copy()
+    # Cubic Hermite span from the convex bisector to the straight limb.
+    # Mirroring the bisector tangent produces a common tangent at station zero.
+    span = min(support, 1.5*radius)
+    t = np.minimum(distance/span,1)
+    convex = (depth<0) & (distance<span)
+    half = angle/2
+    mid_radius = -depth*cos(half/2)
+    h00 = (1+2*t)*(1-t)**2
+    h10 = t*(1-t)**2
+    h01 = t*t*(3-2*t)
+    h11 = t*t*(t-1)
+    arc_station = -h00*mid_radius*sin(half) + span*(h10*(1+sin(half)**2)*cos(half)+h01+h11)
+    arc_height = -h00*mid_radius*cos(half) - span*h10*(1+sin(half)**2)*sin(half) + h01*depth
+    # Fade the tangent adjustment across the flanks so the neutral meridian
+    # and concave profile keep their station mapping.
+    flank = np.clip(-depth/radius,0,1)
+    base_station = distance - h00*mid_radius*sin(half)
+    base_height = depth + h00*(-mid_radius*cos(half)-depth)
+    outward = np.where(convex, base_station+flank*(arc_station-base_station),outward)
+    height = np.where(convex, base_height+flank*(arc_height-base_height),height)
+    # Rejoin the existing outer limb progressively beyond the first shoulder ring.
+    blend = np.clip((distance-radius*0.7)/(radius*0.55),0,1)
+    blend = blend*blend*(3-2*blend)
     outer = np.minimum(depth,0)
-    fade = np.exp(-distance/radius)
-    outward = distance + inner_travel + outer*sin(angle/2)*fade
-    height = depth + outer*(cos(angle/2)-1)*fade
+    tail = outer*np.exp(-distance/radius)
+    outward += blend*np.where(depth<0,distance+tail*sin(half)-outward,0)
+    height += blend*np.where(depth<0,depth+tail*(cos(half)-1)-height,0)
     # The softened inner miter needs a matching intersection height so both
     # halves meet at station zero. Blend back to the bind offset along the limb.
     if angle > 1e-8:
@@ -398,7 +422,7 @@ def show(three_bone=True, center_limit=4.0):
     from maya.api import OpenMaya as om
     if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "CoRGeometricElbowWindow" + ("Three" if three_bone else "Two")
+    win = "CoRConvexSpanWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
