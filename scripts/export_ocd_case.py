@@ -44,6 +44,41 @@ SCALAR_ATTRS = (
 )
 
 
+def _default_path():
+    """挑一个可写的位置存 JSON。
+
+    依次尝试：场景所在目录、Maya 项目目录、用户主目录、系统临时目录。
+    在受限环境里主目录可能不可写，所以不能只写死一个。
+    """
+    name = "ocd_case.json"
+    candidates = []
+    scene = mc.file(query=True, sceneName=True) or ""
+    if scene:
+        candidates.append(os.path.dirname(scene))
+    try:
+        project = mc.workspace(query=True, rootDirectory=True) or ""
+        if project:
+            candidates.append(project)
+    except Exception:
+        pass
+    candidates.append(os.path.expanduser("~"))
+    import tempfile
+    candidates.append(tempfile.gettempdir())
+
+    for directory in candidates:
+        if not directory:
+            continue
+        try:
+            candidate = os.path.join(directory, name)
+            with open(candidate, "a"):
+                pass
+            os.remove(candidate)
+            return candidate
+        except Exception:
+            continue
+    return name
+
+
 def _attr(node, name):
     try:
         if not mc.attributeQuery(name, node=node, exists=True):
@@ -60,7 +95,10 @@ def _short(name):
 def _find_skin(preferred_shape=None):
     skins = mc.ls(type=SKIN_TYPE) or []
     if not skins:
-        raise RuntimeError("当前场景里没有 %s 节点。" % SKIN_TYPE)
+        raise RuntimeError(
+            "当前场景里没有 %s 节点。\n"
+            "如果插件显示名不同，请把它加到 SKIN_TYPE；"
+            "或者先在 Outliner 里选中蒙皮节点再运行。" % SKIN_TYPE)
     if preferred_shape:
         related = mc.listConnections(preferred_shape + ".inMesh", source=True,
                                      destination=False, type=SKIN_TYPE) or []
@@ -259,7 +297,7 @@ def main(path=None):
     import maya.api.OpenMaya as om
     mc = cmds
 
-    target = path or os.path.join(os.path.expanduser("~"), "ocd_case.json")
+    target = path or _default_path()
 
     preferred = None
     for item in mc.ls(selection=True, long=True) or []:
@@ -365,5 +403,14 @@ def main(path=None):
     return target
 
 
+# 既支持 mayapy 命令行，也支持把整个文件内容粘进 Maya 脚本编辑器执行。
+# 粘进去时 __name__ 不是 "__main__"，所以这里无条件尝试一次。
 if __name__ == "__main__":
     main(sys.argv[1] if len(sys.argv) > 1 else None)
+else:
+    try:
+        main()
+    except Exception as _exc:  # noqa: BLE001 - 让脚本编辑器里能看到原因
+        import traceback
+        traceback.print_exc()
+        print("导出失败，请检查是否选中了带 OCD 蒙皮的网格：", _exc)
