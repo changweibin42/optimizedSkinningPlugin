@@ -339,185 +339,68 @@ def center_response(weights, rotations):
     return np.einsum("nk,kij->nij",weights,rotation_matrix(q))-rotation_matrix(blend)
 
 
-def geometric_profile(bind, original, weights, bend, twist, direction):
-    """Construct the two offset limb profiles in the signed bend plane."""
+def local_edges(bind, faces):
+    """Rest edges weighted by incident surface area / squared edge length."""
     import numpy as np
-    points = np.asarray(bind, dtype=float)
-    station, y, z = points.T
-    plane = radians(direction + (180 if bend < 0 else 0))
-    angle = radians(abs(bend))
-    # End-bone participation counts the half-angle helper at its bend fraction.
-    phase = radians(twist) * (weights[:,1] + (0.35*weights[:,2] if weights.shape[1]>2 else 0))
-    depth = y*np.cos(phase-plane) - z*np.sin(phase-plane)
-    lateral = y*np.sin(phase-plane) + z*np.cos(phase-plane)
-    radius = np.max(np.hypot(y,z))
-    distance = np.abs(station)
-    # Inner offset lines intersect on the bisector. Limit their axial travel
-    # by the span of the mixed-weight region when the limbs approach parallel.
-    mixed = np.count_nonzero(weights>0,axis=1)>1
-    reach = max(radius, distance[mixed].max()) if mixed.any() else radius
-    rigid_edges = distance[(~mixed) & (distance>reach)]
-    support = rigid_edges.min() if rigid_edges.size else reach + radius
-    raw = np.maximum(depth,0) * tan(angle/2)
-    shift = raw / np.sqrt(1+(2*raw/support)**2)
-    # Quadratic relaxation makes the inner longitudinal gap smallest at the
-    # crease. The derivative of the station mapping stays positive.
-    inner_fade = np.maximum(1-distance/support,0)**2
-    inner_travel = shift * inner_fade
-    outward = distance + inner_travel
-    height = depth.copy()
-    # The softened inner miter needs a matching intersection height so both
-    # halves meet at station zero. Blend back to the bind offset along the limb.
-    if angle > 1e-8:
-        height += (shift/tan(angle/2)-np.maximum(depth,0))*inner_fade
-    # Exact circular fillet tangent to both rigid offset lines. Traverse it
-    # by arc length and let the additional length decay to zero at support.
-    # The radius is proportional to meridian depth, so the flank limit is rigid.
-    half = angle/2
-    outer_radius = np.maximum(-depth,0)
-    fillet_radius = outer_radius*(1+0.45*cos(half))
-    tangent_station = 0.45*outer_radius*sin(half)
-    arc_length = fillet_radius*half
-    extra = arc_length-tangent_station
-    progress = distance+extra*(1-inner_fade)
-    remaining = np.maximum(arc_length-progress,0)
-    phi = remaining/np.where(fillet_radius>0,fillet_radius,1)
-    arc_station = tangent_station-fillet_radius*np.sin(phi)+np.maximum(progress-arc_length,0)
-    arc_height = depth+2*fillet_radius*np.sin(phi/2)**2
-    outward = np.where(depth<0,arc_station,outward)
-    height = np.where(depth<0,arc_height,height)
-    x = np.where(station<=0,-outward,cos(angle)*outward-sin(angle)*height)
-    h = np.where(station<=0,height,sin(angle)*outward+cos(angle)*height)
-    target = np.column_stack((x,h*cos(plane)-lateral*sin(plane),h*sin(plane)+lateral*cos(plane)))
-    return target-original
+    p = np.asarray(bind)
+    areas = {}
+    for face in faces:
+        ids = list(face)
+        polygon = p[ids]-p[ids[0]]
+        area = 0.5*np.linalg.norm(np.cross(polygon,np.roll(polygon,-1,axis=0)).sum(axis=0))
+        for a,b in zip(ids,ids[1:]+ids[:1]):
+            key = (min(a,b),max(a,b))
+            areas[key] = areas.get(key,0.) + area/len(ids)
+    edges = np.asarray(list(areas),dtype=int)
+    a,b = edges.T
+    rest = p[b]-p[a]
+    length2 = (rest*rest).sum(axis=1)
+    valid = (length2>0) & (np.asarray(list(areas.values()))>0)
+    stiffness = np.asarray(list(areas.values()))[valid]/length2[valid]
+    return a[valid],b[valid],rest[valid],stiffness
 
 
-def anchor_profile(bind, weights, bend, twist, direction):
-    """Independent elbow geometry, including the side-hoop distribution."""
+def structural_centers(edges, original, weights, rotations, center_limit=None):
+    """Joint least squares on transported bind edges, solved in center space."""
     import numpy as np
-    zeros = np.zeros((len(bind),3))
-    profile = geometric_profile(bind,zeros,weights,bend,twist,direction)
-    points = np.asarray(bind)[:-2].reshape(-1,SIDES,3)
-    target = profile[:-2].reshape(points.shape)
-    angles = np.arctan2(points[:,:,2],points[:,:,1])
-    phase = radians(twist)*weights[:-2,1].reshape(-1,SIDES)
-    if weights.shape[1] == 3:
-        phase += radians(twist)*0.35*weights[:-2,2].reshape(-1,SIDES)
-    plane = radians(direction)
-    normal = np.array([0.,cos(plane),sin(plane)])
-    azimuth = angles+phase-plane
-    station = points[:,0,0]
-    # Work in the projected cross-section; retain depth perpendicular to the view.
-    gain = np.minimum(1.,abs(bend)/120)*np.maximum(0.,1-abs(station)/(3*RING_STEP))**2
-    for row in np.flatnonzero(gain>0):
-        phi = azimuth[row]%(2*pi)
-        order = np.argsort(phi)
-        ring = target[row]
-        projected = np.column_stack((ring[:,0],ring@normal))
-        ends = np.array([np.interp([0.,pi],phi[order],v[order],period=2*pi)
-                         for v in projected.T]).T
-        fraction = np.arccos(np.clip(np.cos(phi),-1.,1.))/pi
-        # Ease toward both hoop extrema. Each endpoint retains its full offset.
-        distance = np.minimum(fraction,1-fraction)
-        width = 0.25
-        u = np.minimum(distance/width,1.0)
-        eased = np.where(distance<width,width*u*u*(2-u),distance)
-        # In bottom projection the hoop width follows sin(theta). Pair it
-        # with a cosine height on both halves to fill both shoulders.
-        blend = np.clip((0.5-distance)/0.12,0.,1.)
-        blend = blend*blend*(3-2*blend)
-        ellipse = np.sin(0.5*pi*distance)**2
-        eased += blend*(ellipse-eased)
-        fraction = np.where(fraction<=0.5,eased,1-eased)
-        even = ends[0]+fraction[:,None]*(ends[1]-ends[0])
-        shift = gain[row]*(even-projected)
-        ring[:,0] += shift[:,0]
-        ring += shift[:,1,None]*normal
-    return profile
-
-
-def geometry_residual(bind, original, weights, bend, twist, direction):
-    """One material-space trajectory through the approved folded section."""
-    import numpy as np
-    zeros = np.zeros_like(original)
-    straight = geometric_profile(bind,zeros,weights,0,twist,direction)
-    if bend == 0:
-        return straight-original
-    anchor = 120 if bend>0 else -120
-    folded = anchor_profile(bind,weights,anchor,twist,direction)
-    station = np.asarray(bind)[:,0]
-    # Measure each limb relative to its bone; the crease uses the bisector.
-    participation = np.where(station<0,0,np.where(station>0,1,0.5))
-    cp, sp = cos(radians(direction)), sin(radians(direction))
-    def swing(points, degrees):
-        angle = radians(degrees)*participation
-        c,s = np.cos(angle),np.sin(angle)
-        x,y,z = points.T
-        h,lateral = cp*y+sp*z,-sp*y+cp*z
-        height = s*x+c*h
-        return np.column_stack((c*x-s*h,cp*height-sp*lateral,sp*height+cp*lateral))
-    fraction = bend/anchor
-    local = straight + fraction*(swing(folded,-anchor)-straight)
-    profile = swing(local,bend)
-    target = profile[:-2].reshape(-1,SIDES,3)
-    points = np.asarray(bind)[:-2].reshape(target.shape)
-    phase = radians(twist)*weights[:-2,1]
-    if weights.shape[1] == 3:
-        phase += radians(twist)*0.35*weights[:-2,2]
-    plane = radians(direction)
-    azimuth = np.arctan2(points[:,:,2],points[:,:,1])+phase.reshape(-1,SIDES)-plane
-    normal = np.array([0.,cos(plane),sin(plane)])
-    # Recover the inner wall height along the actual compressed longitudinal
-    # coordinate. Use the same meridian at the crease and its rigid endpoint.
-    center = HALF_RINGS
-    active = ((weights[:-2]>0).sum(axis=1)>1).reshape(-1,SIDES).any(axis=1)
-    for step in (-1,1):
-        rows = np.arange(center+step,len(target) if step>0 else -1,step)
-        ends = rows[~active[rows]]
-        if not ends.size:
-            continue
-        end = ends[0]
-        beta = radians(bend) if step>0 else 0.
-        tangent = np.array([cos(beta),sin(beta)*cos(plane),sin(beta)*sin(plane)])
-        up = normal*cos(beta)-np.array([sin(beta),0.,0.])
-        span = (target[end]-target[center])@tangent
-        end_height = target[end]@up
-        start_height = target[center]@up
-        for row in rows[active[rows]]:
-            u = np.clip(((target[row]-target[center])@tangent)/
-                        np.where(abs(span)>1e-8,span,1.),0.,1.)
-            # Quadratic approach has a horizontal tangent at the rigid end.
-            wall = end_height+(start_height-end_height)*(1-u)**2
-            inner = np.clip(np.sign(bend)*np.cos(azimuth[row])*2,0.,1.)
-            inner = inner*inner*(3-2*inner)
-            target[row] += ((wall-target[row]@up)*inner)[:,None]*up
-            # Keep the inner and outer poles from the longitudinal solve.
-            # Across the hoop, interpolate the in-plane section on their chord;
-            # cosine spacing and the retained lateral depth give a rounded cap.
-            phi = azimuth[row]%(2*pi)
-            order = np.argsort(phi)
-            ring = target[row]
-            projected = np.column_stack((ring[:,0],ring@normal))
-            ends = np.array([np.interp([0.,pi],phi[order],v[order],period=2*pi)
-                             for v in projected.T]).T
-            chord = ends[0]+(0.5-0.5*np.cos(phi))[:,None]*(ends[1]-ends[0])
-            shift = chord-projected
-            ring[:,0] += shift[:,0]
-            ring += shift[:,1,None]*normal
-    return profile-original
-
-
-def solve_centers(response, desired, center_limit=None):
-    """Damped minimum-norm center displacement in bind-object space."""
-    import numpy as np
-    u, singular, vt = np.linalg.svd(response, full_matrices=False)
-    components = u.swapaxes(1, 2) @ desired[:, :, None]
-    gain = singular / (singular**2 + 0.002**2)
-    delta = (vt.swapaxes(1, 2) @ (gain[:, :, None] * components))[:, :, 0]
+    a,b,rest,k = edges
+    n = len(original)
+    A = center_response(weights,rotations)
+    AT = A.transpose(0,2,1)
+    R = np.einsum("nk,kij->nij",weights,rotation_matrix(rotations))-A
+    def apply(matrix,x):
+        return (matrix@x[:,:,None])[:,:,0]
+    def scatter(values):
+        return np.column_stack([np.bincount(b,weights=v,minlength=n)-
+                                np.bincount(a,weights=v,minlength=n) for v in values.T])
+    degree = np.bincount(a,weights=k,minlength=n)+np.bincount(b,weights=k,minlength=n)
+    ridge = 0.0025*np.maximum(degree,1e-12)
+    target = apply(0.5*(R[a]+R[b]),rest)
+    rhs = apply(AT,scatter(k[:,None]*(target-(original[b]-original[a]))))
+    def system(x):
+        u = apply(A,x)
+        return apply(AT,scatter(k[:,None]*(u[b]-u[a])))+ridge[:,None]*x
+    block = degree[:,None,None]*(AT@A)+ridge[:,None,None]*np.eye(3)
+    inverse = np.linalg.inv(block)
+    x = np.zeros_like(original)
+    r = rhs.copy()
+    d = apply(inverse,r)
+    rz = np.sum(r*d)
+    tolerance = rz*1e-12
+    for _ in range(100):
+        if rz<=tolerance:
+            break
+        hd = system(d)
+        alpha = rz/np.sum(d*hd)
+        x += alpha*d
+        r -= alpha*hd
+        z = apply(inverse,r)
+        next_rz = np.sum(z*r)
+        d = z+(next_rz/rz)*d
+        rz = next_rz
     if center_limit is not None:
-        length = np.linalg.norm(delta, axis=1, keepdims=True)
-        delta *= np.minimum(1.0, center_limit / np.maximum(length, 1e-12))
-    return delta
+        x *= np.minimum(1.,center_limit/np.maximum(np.linalg.norm(x,axis=1,keepdims=True),1e-12))
+    return x
 
 
 def show(three_bone=True, center_limit=16.0):
@@ -526,7 +409,7 @@ def show(three_bone=True, center_limit=16.0):
     from maya.api import OpenMaya as om
     if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "CoRStraightSectionWindow" + ("Three" if three_bone else "Two")
+    win = "CoRLocalStructureWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
@@ -552,6 +435,7 @@ def show(three_bone=True, center_limit=16.0):
     mc.scriptJob(uiDeleted=[win,clean],runOnce=True)
     try:
         bind, faces = cylinder()
+        edges = local_edges(bind,faces)
         counts = [len(f) for f in faces]
         indices = [j for f in faces for j in f]
         points = [om.MPoint(*p) for p in bind]
@@ -676,8 +560,8 @@ def show(three_bone=True, center_limit=16.0):
             mc.isolateSelect(panel,addDagObject=rig)
         scroll = mc.scrollLayout(parent=panes,childResizable=True)
         col = mc.columnLayout(parent=scroll,adjustableColumn=True,rowSpacing=3)
-        mc.text(parent=col,label="正视图　左列 / 右列\n上排　LBS / DQS\n中排　CoR / DQS_Com\n下排　OCD / 几何 CoR")
-        mc.text(parent=col,label="几何 CoR · 内侧偏移线 / 外侧圆弧")
+        mc.text(parent=col,label="正视图　左列 / 右列\n上排　LBS / DQS\n中排　CoR / DQS_Com\n下排　OCD / 局部结构 CoR")
+        mc.text(parent=col,label="局部结构 CoR · 绑定网格边向量")
         handles = []
 
         def slider(label,low,high,value):
@@ -709,8 +593,7 @@ def show(three_bone=True, center_limit=16.0):
                         helper.setRotation(om.MQuaternion(*half),om.MSpace.kTransform)
                     rotations.append(half)
                 original = np.asarray([(p.x,p.y,p.z) for p in reference.getPoints(om.MSpace.kObject)])
-                desired = geometry_residual(bind,original,weights,bend,twist,direction)
-                delta = solve_centers(center_response(weights,rotations),desired,center_limit)
+                delta = structural_centers(edges,original,weights,rotations,center_limit)
                 plug.setMObject(om.MFnDoubleArrayData().create(om.MDoubleArray(delta.ravel().tolist())))
             mesh.setPoints([om.MPoint(*p) for p in pose.mesh(bind)],om.MSpace.kObject)
 
