@@ -383,3 +383,5 @@ tests/ocd_alg5_reference.json
 # Algorithm-5 stage-by-stage pipeline output (tests/maya_ocd_alg5_dump.py)
 tests/_alg5_original.json
 tests/_alg5_truth.json
+tests/_alg5_3b_original.json
+tests/_alg5_3b_truth.json

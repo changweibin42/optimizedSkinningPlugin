@@ -33,15 +33,22 @@ def main():
 
     bind = payload["bind"]
     faces = payload["faces"]
+    three_bone = bool(payload.get("threeBone"))
     edges = ref.local_edges(bind, faces)
-    weights = np.array([[1.0 - ref.skin_weight(p[0]), ref.skin_weight(p[0])]
-                        for p in bind])
+    if three_bone:
+        # 参考实现的有效权重：边界外保留少量次级影响。
+        weights = np.array([ref.preview_influences(p[0], True) for p in bind])
+    else:
+        weights = np.array([[1.0 - ref.skin_weight(p[0]), ref.skin_weight(p[0])]
+                            for p in bind])
 
     out = {"cases": {}}
     for key, case in payload["cases"].items():
         bend = case["bend"]
         original = np.asarray(case["original"])
         rotations = [ref.joint_quaternion(0, 0, 0), ref.joint_quaternion(bend, 0, 0)]
+        if three_bone:
+            rotations.append(ref.joint_quaternion(bend * 0.5, 0, 0))
 
         # 与参考预览完全相同的顺序：guide 是相对位移，outer 决定凸侧参与度。
         outer = ref.outer_participation(bind, weights, bend, 0, 0)

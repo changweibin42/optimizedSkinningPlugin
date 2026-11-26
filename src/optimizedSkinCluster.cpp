@@ -2744,11 +2744,21 @@ MStatus OptimizedSkinCluster::deformOCD(
     const auto& pivots = m_boneInfo.jointPosRest;
     const auto& depths = m_boneInfo.depths;
 
-    // ---- 1. 找唯一的父子骨骼对（铰链） ----
+    // ---- 1. 识别主铰链与（可选的）辅助骨 ----
+    // 参考实现的验证模型是 prev→elbow 两段肢体，另挂一根 helper 骨
+    // 给过渡区保留次级影响。这里取「父子对里权重和最大」的一对作为主铰链，
+    // 其余有权重的骨骼作为辅助骨。超过一根辅助骨时
+    // structural_centers 的三列权重表达不了，回退 DLB。
+    std::vector<double> boneWeight(depths.size(), 0.0);
+    for (const auto& vertex : m_vtxCache.vertices)
+        for (const auto& kv : vertex)
+            if (kv.first < boneWeight.size()) boneWeight[kv.first] += kv.second;
+
     int parentBone = -1, childBone = -1;
+    double bestPairWeight = -1.0;
     for (size_t child = 0; child < depths.size() && child < rest.size(); ++child) {
         if (depths[child] == 0) continue;
-        // 找它的直接父骨骼：depth 小 1 且 rest 位置最近
+        // 直接父骨骼：depth 小 1 且 bind 位置最近。
         int best = -1;
         double bestDistance = 1e300;
         for (size_t candidate = 0; candidate < depths.size() && candidate < rest.size(); ++candidate) {
@@ -2757,18 +2767,32 @@ MStatus OptimizedSkinCluster::deformOCD(
             if (d < bestDistance) { bestDistance = d; best = static_cast<int>(candidate); }
         }
         if (best < 0) continue;
-        if (parentBone >= 0 && (parentBone != best || childBone != static_cast<int>(child))) {
-            if (debug) MGlobal::displayWarning(
-                "[OCD] 骨骼链不是单条两段肢体，回退 DLB。");
-            return deformDLB(block, iter, worldMat, multiIndex);
+        const double pairWeight =
+            std::min(boneWeight[best], boneWeight[child]);
+        if (pairWeight > bestPairWeight) {
+            bestPairWeight = pairWeight;
+            parentBone = best;
+            childBone = static_cast<int>(child);
         }
-        parentBone = best;
-        childBone = static_cast<int>(child);
     }
     if (parentBone < 0 || childBone < 0) {
         if (debug) MGlobal::displayWarning("[OCD] 未找到父子骨骼对，回退 DLB。");
         return deformDLB(block, iter, worldMat, multiIndex);
     }
+
+    // 辅助骨：除主铰链两端外仍有显著权重的骨骼。
+    std::vector<int> helperBones;
+    for (size_t bone = 0; bone < depths.size() && bone < rest.size(); ++bone) {
+        if (static_cast<int>(bone) == parentBone) continue;
+        if (static_cast<int>(bone) == childBone) continue;
+        if (boneWeight[bone] > 1e-6) helperBones.push_back(static_cast<int>(bone));
+    }
+    if (helperBones.size() > 1) {
+        if (debug) MGlobal::displayWarning(
+            "[OCD] 主铰链之外有超过一根参与权重的骨骼，回退 DLB。");
+        return deformDLB(block, iter, worldMat, multiIndex);
+    }
+    const int helperBone = helperBones.empty() ? -1 : helperBones.front();
 
     // ---- 2. 由 bind 空间构造铰链坐标系 ----
     // 参考实现把肢体放在 x 轴、半径 1 的圆柱上；这里做同样的对齐。
@@ -2794,20 +2818,34 @@ MStatus OptimizedSkinCluster::deformOCD(
     // 改用子骨骼的绑定世界旋转导出参考轴：它随 rig 一起旋转，
     // 所以解答对整体平移与旋转是不变的。
     // 绑定世界旋转 = (绑定逆旋转)⁻¹，rest[] 存的是逆向。
-    const Quat bindWorldRotation = [&] {
-        if (childBone >= 0 && static_cast<size_t>(childBone) < rest.size())
-            return q_inverse(rest[childBone].q);
+    // 铰链坐标系挂在入射骨（父骨）上：父骨再转动时局部坐标随之运动。
+    const Quat parentBindRotation = [&] {
+        if (parentBone >= 0 && static_cast<size_t>(parentBone) < rest.size())
+            return q_inverse(rest[parentBone].q);
         return Quat{0.0, 0.0, 0.0, 1.0};
     }();
-    const Vec3 referenceUp = q_rotate_v3(bindWorldRotation, Vec3{0.0, 1.0, 0.0});
+    const Vec3 referenceUp = q_rotate_v3(parentBindRotation, Vec3{0.0, 1.0, 0.0});
     Vec3 basisY = v3_sub(referenceUp, v3_scale(bindAxis, v3_dot(referenceUp, bindAxis)));
     if (v3_len(basisY) < 1e-6) {
         // 参考轴与骨骼轴平行时退回绑定 +Z。
-        const Vec3 referenceSide = q_rotate_v3(bindWorldRotation, Vec3{0.0, 0.0, 1.0});
+        const Vec3 referenceSide = q_rotate_v3(parentBindRotation, Vec3{0.0, 0.0, 1.0});
         basisY = v3_sub(referenceSide, v3_scale(bindAxis, v3_dot(referenceSide, bindAxis)));
     }
     basisY = v3_norm(basisY);
     const Vec3 basisZ = v3_norm(v3_cross(bindAxis, basisY));
+
+    // 局部基矩阵（列为 axis / basisY / basisZ）与它的四元数。
+    // 把世界旋转共轭到局部空间：R_local = Mᵀ·R_world·M。
+    ocd_math::Mat3 frameBasis;
+    frameBasis.m[0] = bindAxis.x; frameBasis.m[1] = basisY.x; frameBasis.m[2] = basisZ.x;
+    frameBasis.m[3] = bindAxis.y; frameBasis.m[4] = basisY.y; frameBasis.m[5] = basisZ.y;
+    frameBasis.m[6] = bindAxis.z; frameBasis.m[7] = basisY.z; frameBasis.m[8] = basisZ.z;
+    const Quat frameQuat = ocd_math::mat3_to_quat(frameBasis);
+    const Quat frameQuatInverse = q_inverse(frameQuat);
+    const auto toLocalRotation = [&](const Quat& worldRotation) {
+        return q_mul(q_mul(frameQuatInverse, worldRotation), frameQuat);
+    };
+
     // ---- 3. 每个顶点在绑定铰链坐标系下的 station / 径向 ----
     MPointArray points;
     iter.allPositions(points);
@@ -2836,50 +2874,91 @@ MStatus OptimizedSkinCluster::deformOCD(
         return deformDLB(block, iter, worldMat, multiIndex);
     }
 
-    // ---- 4. 当前姿态的弯曲角 / 弯曲平面 ----
-    // 参考实现用 joint_quaternion(bend, twist, direction) 描述姿态：
-    //   direction=0 时绕 +Z 弯曲（弯面 = 世界 XY 平面），
-    //   direction 增大时弯面绕骨骼轴旋转。
-    // 这里从父子骨骼的世界旋转里反解出同一对量。
-    const Quat relativeRot = q_mul(Cs[childBone].q, q_inverse(Cs[parentBone].q));
-    const Vec3 posedAxisParent = q_rotate_v3(Cs[parentBone].q, bindAxis);
-    const Vec3 posedAxisChild = q_rotate_v3(Cs[childBone].q, bindAxis);
-    const Vec3 bendNormal = v3_cross(posedAxisParent, posedAxisChild);
-    const double bendSine = v3_len(bendNormal);
+    // ---- 4. 姿态：全部在父骨相对帧里解析 ----
+    // 只用子骨相对父骨的局部旋转，再把它共轭进铰链局部基。
+    // 这样 bend / twist / direction 与父骨在绑定之后的旋转、平移无关。
+    // （旧版把「已随父骨运动的世界轴」投影到「绑定基」上，父骨一转
+    //   direction 就会变，弯面与纵向滑动也跟着变。）
+    // 子骨相对父骨的「局部旋转」才是父骨不变量。
+    // 直接用 Cs_child · Cs_parent⁻¹ 是错的：Cs 都是「绑定世界 → 当前世界」，
+    // 父骨一转，两项都带上了同一个左乘项，并不互相抵消；只有绕同一轴旋转
+    // 时两者恰好可交换，所以纯 Z 旋转的测试会假通过。
+    // 正确做法： poseLocal = poseParent⁻¹ · poseChild，再除以绑定时的局部旋转。
+    // Cs 是世界空间算子（pose · bind⁻¹），会带上整条 rig 的摆放旋转。
+    // 因此要先把它共轭子骨自身的局部帧，得到与摆放无关的局部旋转；
+    // 再用绑定时的父子局部旋转把它变成「相对父骨」，最后进铰链局部基。
+    // 绑定时子骨在父骨局部帧下的旋转。
+    const auto bindLocalRotation = [&](int bone) -> Quat {
+        if (bone < 0 || static_cast<size_t>(bone) >= rest.size())
+            return Quat{0.0, 0.0, 0.0, 1.0};
+        return q_mul(q_inverse(parentBindRotation), q_inverse(rest[bone].q));
+    };
+    // 相对父骨的旋转，对「整条 rig 的摆放」与「绑定后的父骨动画」都不变。
+    //
+    // pose = bind · Cs，所以父子局部位姿是 Cs_p⁻¹ · Lbind · Cs_c，
+    // 除以绑定局部 Lbind 得：
+    //     relative = Cs_p⁻¹ · Lbind · Cs_c · Lbind⁻¹
+    // 少了中间的 Lbind 就会把两种情形各弄坏一个。
+    // Cs 是「pose · bind⁻¹」，所以骨骼的世界位姿旋转是 Cs · bind。
+    // 弄反这个乘序会把整条 rig 的摆放旋转带进解析，表现为
+    // 摆放不同 bend/direction 就不同。
+    const auto bonePoseRotation = [&](int bone) -> Quat {
+        return q_mul(Cs[bone].q, q_inverse(rest[bone].q));
+    };
+    const auto hingeRotation = [&](int bone) -> Quat {
+        if (bone < 0 || static_cast<size_t>(bone) >= rest.size())
+            return Quat{0.0, 0.0, 0.0, 1.0};
+        const Quat bindLocal = bindLocalRotation(bone);
+        // 子骨在父骨局部帧里的当前位姿。
+        const Quat poseLocal = q_mul(q_inverse(bonePoseRotation(parentBone)),
+                                     bonePoseRotation(bone));
+        const Quat relative = q_mul(poseLocal, q_inverse(bindLocal));
+        // 父骨局部帧 → 绑定世界 → 铰链局部基。
+        const Quat inWorld = q_mul(q_mul(parentBindRotation, relative),
+                                   q_inverse(parentBindRotation));
+        return toLocalRotation(inWorld);
+    };
+    const Quat relativeLocal = hingeRotation(childBone);
+    // 局部基里骨骼轴就是 +X，于是当前子骨轴与弯面法线都是常规量。
+    const Vec3 axisLocal{1.0, 0.0, 0.0};
+    const Vec3 currentAxisLocal = q_rotate_v3(relativeLocal, axisLocal);
+    const Vec3 normalLocal = v3_cross(axisLocal, currentAxisLocal);
+    const double bendSine = v3_len(normalLocal);
     double bendDegrees = 0.0;
     double directionDegrees = 0.0;
     if (bendSine > 1e-8) {
-        bendDegrees = std::atan2(bendSine, v3_dot(posedAxisParent, posedAxisChild)) *
+        bendDegrees = std::atan2(bendSine, v3_dot(axisLocal, currentAxisLocal)) *
             180.0 / 3.14159265358979323846;
-        // 弯面绕骨骼轴的方位角：以 basisZ 为 0，朝 -basisY 增大。
-        const Vec3 unitNormal = v3_scale(bendNormal, 1.0 / bendSine);
-        directionDegrees = std::atan2(-v3_dot(unitNormal, basisY),
-            v3_dot(unitNormal, basisZ)) * 180.0 / 3.14159265358979323846;
+        // 弯面方位角：以 basisZ 为 0，朝 -basisY 增大。
+        const Vec3 unitNormal = v3_scale(normalLocal, 1.0 / bendSine);
+        directionDegrees = std::atan2(-unitNormal.y, unitNormal.z) *
+            180.0 / 3.14159265358979323846;
     }
-    // 扭转角：从完整相对旋转里剥离 swing，取绕骨骼轴的旋转量
-    const Vec3 currentAxis = q_rotate_v3(Cs[childBone].q, bindAxis);
-    Quat swing = q_between(bindAxis, currentAxis);
-    const Quat twistQuat = q_mul(q_inverse(swing), relativeRot);
-    double twistDegrees = 2.0 * std::atan2(twistQuat.x * bindAxis.x + twistQuat.y * bindAxis.y +
-        twistQuat.z * bindAxis.z, twistQuat.w) * 180.0 / 3.14159265358979323846;
+    // 扭转：从相对旋转里剥离 swing，取绕骨骼轴的分量。
+    const Quat swingLocal = q_between(axisLocal, currentAxisLocal);
+    const Quat twistQuat = q_mul(q_inverse(swingLocal), relativeLocal);
+    double twistDegrees = 2.0 * std::atan2(twistQuat.x, twistQuat.w) *
+        180.0 / 3.14159265358979323846;
     if (!std::isfinite(twistDegrees)) twistDegrees = 0.0;
 
     const double twistWeight = block.inputValue(aOcdTwistWeight, &status).asDouble();
     if (!status) return status;
     twistDegrees *= std::clamp(twistWeight, 0.0, 1.0);
 
-    // ---- 5. 每个顶点在链上的权重（parent/child/其余） ----
+    // ---- 5. 每个顶点在链上的权重（parent / child / helper） ----
+    // 第三列对应 helper 骨本身（不是「其余骨骼权重之和」），
+    // 否则下游用它乘上真实 helper 旋转时会错。
     std::vector<std::array<double, 3>> chainWeights(nV);
     for (unsigned int i = 0; i < nV; ++i) {
-        double wParent = 0.0, wChild = 0.0, wOther = 0.0;
+        double wParent = 0.0, wChild = 0.0, wHelper = 0.0;
         for (const auto& kv : m_vtxCache.vertices[i]) {
             if (static_cast<int>(kv.first) == parentBone) wParent += kv.second;
             else if (static_cast<int>(kv.first) == childBone) wChild += kv.second;
-            else wOther += kv.second;
+            else if (static_cast<int>(kv.first) == helperBone) wHelper += kv.second;
         }
-        const double sum = wParent + wChild + wOther;
-        if (sum > 1e-9) { wParent /= sum; wChild /= sum; wOther /= sum; }
-        chainWeights[i] = {wParent, wChild, wOther};
+        const double sum = wParent + wChild + wHelper;
+        if (sum > 1e-9) { wParent /= sum; wChild /= sum; wHelper /= sum; }
+        chainWeights[i] = {wParent, wChild, wHelper};
     }
 
     // ---- 6. 统一到铰链局部坐标系（关节在原点、骨骼沿 +X、半径 1） ----
@@ -2909,17 +2988,25 @@ MStatus OptimizedSkinCluster::deformOCD(
         return v3_add(bindChildPivot, localOffsetToWorld(local));
     };
 
-    // 局部基矩阵（列为 axis / basisY / basisZ）与它的四元数，用于把世界旋转
-    // 共轭到局部空间：R_local = Mᵀ·R_world·M。不共轭的话
-    // A_i = Σw·R_k − R_blend 作用在局部向量上是错的。
-    ocd_math::Mat3 frameBasis;
-    frameBasis.m[0] = bindAxis.x; frameBasis.m[1] = basisY.x; frameBasis.m[2] = basisZ.x;
-    frameBasis.m[3] = bindAxis.y; frameBasis.m[4] = basisY.y; frameBasis.m[5] = basisZ.y;
-    frameBasis.m[6] = bindAxis.z; frameBasis.m[7] = basisY.z; frameBasis.m[8] = basisZ.z;
-    const Quat frameQuat = ocd_math::mat3_to_quat(frameBasis);
-    const Quat frameQuatInverse = q_inverse(frameQuat);
-    const auto toLocalRotation = [&](const Quat& worldRotation) {
-        return q_mul(q_mul(frameQuatInverse, worldRotation), frameQuat);
+    // 父骨的当前位姿（bind → pose）。铰链局部坐标系挂在它上面，
+    // 所以目标位置要经过它才能落到当前世界，而逆变换用来把
+    // 已随父骨运动的点拉回绑定帧。
+    const RigidTransform& parentPose = Cs[parentBone];
+    const RigidTransform parentPoseInverse{
+        q_inverse(parentPose.q),
+        q_rotate_v3(q_inverse(parentPose.q), v3_scale(parentPose.t, -1.0))};
+    const auto localToPosePoint = [&](const Vec3& local) {
+        return apply_transform(parentPose, localPointToWorld(local));
+    };
+    const auto poseToLocalPoint = [&](const Vec3& world) {
+        return toLocalPoint(apply_transform(parentPoseInverse, world));
+    };
+    // 对象空间向量 → 世界空间向量（Maya 行向量约定：p' = p * M）。
+    const auto objectVectorToWorld = [&](const Vec3& local) {
+        return Vec3{
+            local.x * worldMat[0][0] + local.y * worldMat[1][0] + local.z * worldMat[2][0],
+            local.x * worldMat[0][1] + local.y * worldMat[1][1] + local.z * worldMat[2][1],
+            local.x * worldMat[0][2] + local.y * worldMat[1][2] + local.z * worldMat[2][2]};
     };
 
     // 绑定顶点在局部空间的位置：参考实现的 s / y / z。
@@ -2971,7 +3058,9 @@ MStatus OptimizedSkinCluster::deformOCD(
         elbowPose.values = hingeParams.values;
         const ocd_hinge::Elbow elbow(elbowPose);
         for (unsigned int i = 0; i < nV; ++i) {
-            guide[i] = localPointToWorld(
+            // 形状在局部帧里建好，再经父骨当前位姿放回世界；
+            // 否则父骨转动后肘部会留在绑定位置不跟随。
+            guide[i] = localToPosePoint(
                 elbow.point(bindLocal[i].x, bindLocal[i].y, bindLocal[i].z));
         }
     }
@@ -3047,7 +3136,8 @@ MStatus OptimizedSkinCluster::deformOCD(
             const Vec3 center = i < baseCenters.size() ? baseCenters[i] : frames[i].rest;
             const auto transform = cor_paper::vertexTransform(
                 center, rotationWeights[i], rotationWeights[i], Cs);
-            originalLocal[i] = toLocalPoint(apply_transform(transform, frames[i].rest));
+            // CoR 输出已经随父骨运动；先撤掉父骨当前姿态，再换进绑定铰链局部空间。
+            originalLocal[i] = poseToLocalPoint(apply_transform(transform, frames[i].rest));
         }
 
         // 求解用的边表与内外侧参与度：全部在局部空间。
@@ -3062,17 +3152,19 @@ MStatus OptimizedSkinCluster::deformOCD(
             stationsLocal[i] = bindLocal[i].x;
             depthsLocal[i] = bindLocal[i].y;
             lateralsLocal[i] = bindLocal[i].z;
-            // 参考实现的权重是 (parent, child, helper)；本插件无 helper 骨。
+            // 参考实现的权重就是 (parent, child, helper)。
             hingeWeights[i] = {chainWeights[i][0], chainWeights[i][1], chainWeights[i][2]};
         }
         guide = ocd_hinge::hingeDisplacement(stationsLocal, depthsLocal, lateralsLocal,
             originalLocal, hingeWeights, hingeParams);
 
         ocd_centers::Settings settings;
-        // 旋转共轭到局部空间，与 original/guide/edges 保持同一坐标系。
-        settings.rotations = {toLocalRotation(Cs[parentBone].q),
-                              toLocalRotation(Cs[childBone].q),
-                              Quat{0.0, 0.0, 0.0, 1.0}};
+        // 用「相对父骨」的旋转。绝对旋转会让中心修正随父骨方向变化，
+        // 而它本应只取决于弯曲量。参考实现里 prev 不动，
+        // 所以它的 [单位, 弯曲, helper] 与这里的 [单位, 相对弯曲, 相对 helper] 等价。
+        settings.rotations = {Quat{0.0, 0.0, 0.0, 1.0},
+                              relativeLocal,
+                              hingeRotation(helperBone)};
         MStatus limitStatus;
         double centerLimit = block.inputValue(aOcdCenterLimit, &limitStatus).asDouble();
         if (!limitStatus || centerLimit <= 0.0) centerLimit = 16.0;
@@ -3102,9 +3194,14 @@ MStatus OptimizedSkinCluster::deformOCD(
 
         for (unsigned int i = 0; i < nV; ++i) {
             const Vec3 base = i < baseCenters.size() ? baseCenters[i] : frames[i].rest;
-            // 注入值是对象空间向量，直接叠加；否则把局部偏移换算成向量再加。
-            centers[i] = v3_add(base, injected.empty()
-                ? localOffsetToWorld(offsetsLocal[i]) : injected[i]);
+            if (injected.empty()) {
+                centers[i] = v3_add(base, localOffsetToWorld(offsetsLocal[i]));
+            }
+            else {
+                // 属性按对象空间声明，而 centres 是世界空间；
+                // 必须先乘 worldMat 的线性部分，否则对象有旋转/缩放时含义不同。
+                centers[i] = v3_add(base, objectVectorToWorld(injected[i]));
+            }
         }
     }
 
@@ -3153,7 +3250,6 @@ MStatus OptimizedSkinCluster::deformOCD(
     }
 
     (void)multiIndex;
-    (void)relativeRot;
     return MS::kSuccess;
 }
 

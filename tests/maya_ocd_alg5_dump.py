@@ -26,11 +26,13 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 sys.path.insert(0, HERE)
 
 import ocd_elbow_reference as ref
+# 1285f9a 版才有 rig_weights / preview_influences（三骨有效权重）。
+import ocd_elbow_reference_latest as ref_latest
 
 BENDS = (118.0, 150.0)
 
 
-def build_rig(mc, om, bind, faces, label):
+def build_rig(mc, om, bind, faces, label, three_bone=False):
     holder = mc.createNode("transform", name="dump_%s_holder#" % label)
     geo = mc.createNode("transform", name="dump_%s_geo#" % label, parent=holder)
     selection = om.MSelectionList()
@@ -46,21 +48,37 @@ def build_rig(mc, om, bind, faces, label):
     for joint, dx in ((prev, -ref.HALF), (elbow, ref.HALF), (tip, ref.HALF)):
         mc.setAttr(joint + ".translateX", dx)
         mc.setAttr(joint + ".radius", 0.09)
-    return {"holder": holder, "geo": geo, "shape": shape,
-            "prev": prev, "elbow": elbow}
+    rig = {"holder": holder, "geo": geo, "shape": shape,
+           "prev": prev, "elbow": elbow, "helper": None}
+    if three_bone:
+        # 参考实现的 helper：prev 的另一个子骨，位置与 elbow 重合。
+        helper = mc.createNode("joint", name="dump_%s_helper#" % label, parent=prev)
+        mc.setAttr(helper + ".translateX", ref.HALF)
+        mc.setAttr(helper + ".radius", 0.09)
+        rig["helper"] = helper
+    return rig
 
 
 def attach_skin(mc, rig, algorithm, bind):
     skin = mc.deformer(rig["shape"], type="optimizedSkinCluster",
                        name="dump_skin#")[0]
-    for k, joint in enumerate((rig["prev"], rig["elbow"])):
+    joints = [rig["prev"], rig["elbow"]]
+    if rig["helper"] is not None:
+        joints.append(rig["helper"])
+    for k, joint in enumerate(joints):
         mc.connectAttr(joint + ".worldMatrix[0]", "%s.matrix[%d]" % (skin, k))
         inverse = mc.getAttr(joint + ".worldInverseMatrix[0]")
         mc.setAttr("%s.bindPreMatrix[%d]" % (skin, k), *inverse, type="matrix")
+    three_bone = rig["helper"] is not None
     for vertex, (station, _, _) in enumerate(bind):
-        w = ref.skin_weight(station)
-        mc.setAttr("%s.weightList[%d].weights[0:1]" % (skin, vertex),
-                   1.0 - w, w, size=2)
+        if three_bone:
+            weights = ref_latest.rig_weights(ref.skin_weight(station), True)
+        else:
+            w = ref.skin_weight(station)
+            weights = (1.0 - w, w)
+        last = len(weights) - 1
+        mc.setAttr("%s.weightList[%d].weights[0:%d]" % (skin, vertex, last),
+                   *weights, size=len(weights))
     mc.setAttr(skin + ".algorithmType", algorithm)
     result = mc.listRelatives(rig["geo"], shapes=True,
                               noIntermediate=True, fullPath=True)[0]
@@ -79,6 +97,13 @@ def pose_elbow(mc, om, rig, bend):
     selection.add(rig["elbow"])
     om.MFnTransform(selection.getDagPath(0)).setRotation(
         om.MQuaternion(*ref.joint_quaternion(bend, 0, 0)), om.MSpace.kTransform)
+    if rig["helper"] is not None:
+        # 参考实现里 helper 只转一半的弯曲。
+        helper_sel = om.MSelectionList()
+        helper_sel.add(rig["helper"])
+        om.MFnTransform(helper_sel.getDagPath(0)).setRotation(
+            om.MQuaternion(*ref.joint_quaternion(bend * 0.5, 0, 0)),
+            om.MSpace.kTransform)
     mc.refresh(force=True)
 
 
@@ -98,7 +123,7 @@ def max_deviation(first, second):
     return worst
 
 
-def run(mode, path):
+def run(mode, path, three_bone=False):
     import maya.standalone
     maya.standalone.initialize(name="python")
     try:
@@ -111,11 +136,12 @@ def run(mode, path):
 
         if mode == "dump":
             payload = {"bind": bind,
+                       "threeBone": bool(three_bone),
                        "faces": [list(f) for f in faces],
                        "vertices": len(bind),
                        "cases": {}}
             for bend in BENDS:
-                rig = build_rig(mc, om, bind, faces, "dump")
+                rig = build_rig(mc, om, bind, faces, "dump", three_bone)
                 _, result = attach_skin(mc, rig, 0, bind)
                 pose_elbow(mc, om, rig, bend)
                 payload["cases"][str(bend)] = {
@@ -136,13 +162,13 @@ def run(mode, path):
             case = truth["cases"][str(bend)]
             delta = case["delta"]
 
-            inj = build_rig(mc, om, bind, faces, "injected")
+            inj = build_rig(mc, om, bind, faces, "injected", three_bone)
             inj_skin, inj_result = attach_skin(mc, inj, 5, bind)
             pose_elbow(mc, om, inj, bend)
             set_offsets(om, inj_skin, [v for row in delta for v in row])
             injected = read_points(om, inj_result)
 
-            auto = build_rig(mc, om, bind, faces, "auto")
+            auto = build_rig(mc, om, bind, faces, "auto", three_bone)
             _, auto_result = attach_skin(mc, auto, 5, bind)
             pose_elbow(mc, om, auto, bend)
             solved = read_points(om, auto_result)
@@ -165,8 +191,10 @@ def run(mode, path):
 
 if __name__ == "__main__":
     if "--dump" in sys.argv:
-        sys.exit(run("dump", sys.argv[sys.argv.index("--dump") + 1]))
+        three = "--three-bone" in sys.argv
+        sys.exit(run("dump", sys.argv[sys.argv.index("--dump") + 1], three))
     if "--inject" in sys.argv:
-        sys.exit(run("inject", sys.argv[sys.argv.index("--inject") + 1]))
+        three = "--three-bone" in sys.argv
+        sys.exit(run("inject", sys.argv[sys.argv.index("--inject") + 1], three))
     print(__doc__)
     sys.exit(2)
