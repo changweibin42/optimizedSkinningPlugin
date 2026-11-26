@@ -237,7 +237,9 @@ def show():
         col = mc.columnLayout(parent=scroll, adjustableColumn=True, rowSpacing=3)
         mc.text(parent=col,
                 label="左：Python 参考　　中：插件 OCD (3)　　右：插件 OCD+CoR (5)\n"
-                      "三格共用同一根驱动骨骼与同一份绑定网格；求值均在原点。")
+                      "三格共用同一根驱动骨骼与同一份绑定网格；求值均在原点。\n"
+                      "注：OCD+CoR 的 guide 来自 hinge_section，与参考一致不读 11 个补偿通道，"
+                      "所以滑块只影响左两格。")
         report = mc.text(parent=col, label="", align="left")
 
         handles = []

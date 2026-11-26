@@ -347,9 +347,11 @@ std::vector<Vec3> structuralCenters(const Edges& edges,
 
     std::vector<Vec3> rotatedDetail(n);
     for (size_t i = 0; i < n; ++i) rotatedDetail[i] = applyMat(R[i], detailScatter[i]);
+    // lap(original) 与顶点无关，只算一次。之前写在循环里导致每帧 O(n * edgeCount)。
+    const std::vector<Vec3> lapOriginal = lap(original);
     std::vector<Vec3> curvatureInput(n);
     for (size_t i = 0; i < n; ++i)
-        curvatureInput[i] = v3_scale(v3_sub(rotatedDetail[i], lap(original)[i]), compliance[i]);
+        curvatureInput[i] = v3_scale(v3_sub(rotatedDetail[i], lapOriginal[i]), compliance[i]);
     const std::vector<Vec3> curvatureRhs = lap(curvatureInput);
 
     // elasticTarget：目标的边方向残差
@@ -371,15 +373,18 @@ std::vector<Vec3> structuralCenters(const Edges& edges,
     for (size_t i = 0; i < n; ++i) rhs[i] = applyMat(transposeMat(response[i]), rhs[i]);
 
     // ---- 预条件块：diag_i = (degree + 2·degree + compliance·lapDegree² + …) ----
+    // 先把按边累计的两项算成逐顶点数组，避免在顶点循环里扫全部边。
+    std::vector<double> diagFromA(n, 0.0), diagFromB(n, 0.0);
+    for (size_t e = 0; e < edgeCount; ++e) {
+        const double weightSquared = longitudinal[e] * longitudinal[e];
+        diagFromA[edges.a[e]] += weightSquared * compliance[edges.b[e]];
+        diagFromB[edges.b[e]] += weightSquared * compliance[edges.a[e]];
+    }
     std::vector<Mat3> blockInverse(n);
     for (size_t i = 0; i < n; ++i) {
-        double diag = degree[i] + 2.0 * degree[i] + compliance[i] * lapDegree[i] * lapDegree[i];
-        for (size_t e = 0; e < edgeCount; ++e) {
-            if (edges.a[e] == i)
-                diag += longitudinal[e] * longitudinal[e] * compliance[edges.b[e]];
-            if (edges.b[e] == i)
-                diag += longitudinal[e] * longitudinal[e] * compliance[edges.a[e]];
-        }
+        const double diag = degree[i] + 2.0 * degree[i]
+            + compliance[i] * lapDegree[i] * lapDegree[i]
+            + diagFromA[i] + diagFromB[i];
         const Mat3 ata = mulMat(transposeMat(response[i]), response[i]);
         Mat3 block;
         for (int k = 0; k < 9; ++k) block.m[k] = diag * ata.m[k];

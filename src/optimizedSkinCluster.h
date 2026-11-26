@@ -69,6 +69,9 @@ public:
     static MObject aOcdAvoidOverlap;
     // OCD+Corrected CoR 的中心修正上限（世界单位）。
     static MObject aOcdCenterLimit;
+    // 可选的中心偏移注入（对象空间向量）。
+    // 非空时直接矩阵这些偏移，跳过求解，用于与参考实现逐级对拍。
+    static MObject aOcdCenterOffsets;
     // OCD 的 11 个补偿通道，顺序与参考实现的 CHANNELS 一致。
     static constexpr int ocdChannelCount = 11;
     static MObject aOcdCenterSlideIn;

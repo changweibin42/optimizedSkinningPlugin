@@ -379,3 +379,7 @@ CTestTestfile.cmake
 tests/ocd_reference_dump.json
 tests/ocd_centers_dump.json
 tests/ocd_alg5_reference.json
+
+# Algorithm-5 stage-by-stage pipeline output (tests/maya_ocd_alg5_dump.py)
+tests/_alg5_original.json
+tests/_alg5_truth.json

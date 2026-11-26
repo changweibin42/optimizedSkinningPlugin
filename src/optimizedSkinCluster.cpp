@@ -62,6 +62,7 @@ MObject OptimizedSkinCluster::aCorMosSecondaryWeight;
 MObject OptimizedSkinCluster::aOcdTwistWeight;
 MObject OptimizedSkinCluster::aOcdAvoidOverlap;
 MObject OptimizedSkinCluster::aOcdCenterLimit;
+MObject OptimizedSkinCluster::aOcdCenterOffsets;
 MObject OptimizedSkinCluster::aOcdCenterSlideIn;
 MObject OptimizedSkinCluster::aOcdCenterSlideOut;
 MObject OptimizedSkinCluster::aOcdSlideInPrev;
@@ -305,6 +306,16 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setNiceNameOverride("OCD Corrected CoR Limit");
     addAttribute(aOcdCenterLimit);
     attributeAffects(aOcdCenterLimit, MPxSkinCluster::outputGeom);
+
+    MFnTypedAttribute offsetAttr;
+    aOcdCenterOffsets = offsetAttr.create("ocdCenterOffsets", "ocdcf",
+        MFnData::kDoubleArray, MObject::kNullObj, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    offsetAttr.setStorable(true);
+    offsetAttr.setKeyable(false);
+    offsetAttr.setNiceNameOverride("OCD Corrected CoR Offsets (debug)");
+    CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aOcdCenterOffsets));
+    CHECK_MSTATUS_AND_RETURN_IT(attributeAffects(aOcdCenterOffsets, MPxSkinCluster::outputGeom));
 
     // ---- OCD 11 个补偿通道（对应参考实现的 Channel Box 滑块） ----
     // 单位与参考实现一致；0 表示不施加该次级编辑。
@@ -2778,14 +2789,22 @@ MStatus OptimizedSkinCluster::deformOCD(
     // 参考实现把 direction 当作「绕骨骼轴在绑定帧内旋转弯面」，由 Elbow
     // 内部处理，因此这里只固定绑定帧，不做任何姿态投影。
     //
-    // basisY 必须是骨骼轴之外、且尽量接近世界 +Y 的径向方向：参考实现的
-    // 弯面就是世界 XY 平面，直接把世界 +Y 投影到与轴垂直的平面即可。
-    const Vec3 worldUp{0.0, 1.0, 0.0};
-    Vec3 basisY = v3_sub(worldUp, v3_scale(bindAxis, v3_dot(worldUp, bindAxis)));
+    // 弯面的参考轴不能用世界 +Y：那样把整条 rig 旋转一下，
+    // direction 就会变，弯面、内外侧参与度与纵向滑动都会跟着变。
+    // 改用子骨骼的绑定世界旋转导出参考轴：它随 rig 一起旋转，
+    // 所以解答对整体平移与旋转是不变的。
+    // 绑定世界旋转 = (绑定逆旋转)⁻¹，rest[] 存的是逆向。
+    const Quat bindWorldRotation = [&] {
+        if (childBone >= 0 && static_cast<size_t>(childBone) < rest.size())
+            return q_inverse(rest[childBone].q);
+        return Quat{0.0, 0.0, 0.0, 1.0};
+    }();
+    const Vec3 referenceUp = q_rotate_v3(bindWorldRotation, Vec3{0.0, 1.0, 0.0});
+    Vec3 basisY = v3_sub(referenceUp, v3_scale(bindAxis, v3_dot(referenceUp, bindAxis)));
     if (v3_len(basisY) < 1e-6) {
-        // 骨骼轴与世界 +Y 平行时退回世界 +Z 投影。
-        const Vec3 fallback{0.0, 0.0, 1.0};
-        basisY = v3_sub(fallback, v3_scale(bindAxis, v3_dot(fallback, bindAxis)));
+        // 参考轴与骨骼轴平行时退回绑定 +Z。
+        const Vec3 referenceSide = q_rotate_v3(bindWorldRotation, Vec3{0.0, 0.0, 1.0});
+        basisY = v3_sub(referenceSide, v3_scale(bindAxis, v3_dot(referenceSide, bindAxis)));
     }
     basisY = v3_norm(basisY);
     const Vec3 basisZ = v3_norm(v3_cross(bindAxis, basisY));
@@ -2863,35 +2882,60 @@ MStatus OptimizedSkinCluster::deformOCD(
         chainWeights[i] = {wParent, wChild, wOther};
     }
 
-    // ---- 6. 归一化到参考实现的单位（半径 1、station/R） ----
+    // ---- 6. 统一到铰链局部坐标系（关节在原点、骨骼沿 +X、半径 1） ----
+    //
+    // 参考实现的 bind 网格就活在这个规范空间里，而 buildEdges /
+    // outerParticipation / structural_centers 都以该空间为前提：
+    //   · outerParticipation 用绝对 y/z 判断内侧/外侧
+    //   · structural_centers 用 rest 边的 x 分量判断纵向拉伸
+    // 之前直接把世界坐标送进求解器，模型一旦不平移对齐到原点、或肘部不是沿
+    // 世界 X 轴，内外侧参与度与纵向滑动都会算错。这里把参与求解的量全部换算
+    // 到同一套局部坐标，世界坐标只用于最后写回。
     const double radius = maxRadius;
-    std::vector<double> stationsU(nV), depthsU(nV), lateralsU(nV);
+
+    const auto toLocalPoint = [&](const Vec3& world) {
+        const Vec3 offset = v3_sub(world, bindChildPivot);
+        return Vec3{ v3_dot(offset, bindAxis) / radius,
+                     v3_dot(offset, basisY) / radius,
+                     v3_dot(offset, basisZ) / radius };
+    };
+    // 位移与中心偏移都是向量：换回世界时不能叠加关节平移。
+    const auto localOffsetToWorld = [&](const Vec3& local) {
+        return v3_add(v3_scale(bindAxis, local.x * radius),
+            v3_add(v3_scale(basisY, local.y * radius),
+                   v3_scale(basisZ, local.z * radius)));
+    };
+    const auto localPointToWorld = [&](const Vec3& local) {
+        return v3_add(bindChildPivot, localOffsetToWorld(local));
+    };
+
+    // 局部基矩阵（列为 axis / basisY / basisZ）与它的四元数，用于把世界旋转
+    // 共轭到局部空间：R_local = Mᵀ·R_world·M。不共轭的话
+    // A_i = Σw·R_k − R_blend 作用在局部向量上是错的。
+    ocd_math::Mat3 frameBasis;
+    frameBasis.m[0] = bindAxis.x; frameBasis.m[1] = basisY.x; frameBasis.m[2] = basisZ.x;
+    frameBasis.m[3] = bindAxis.y; frameBasis.m[4] = basisY.y; frameBasis.m[5] = basisZ.y;
+    frameBasis.m[6] = bindAxis.z; frameBasis.m[7] = basisY.z; frameBasis.m[8] = basisZ.z;
+    const Quat frameQuat = ocd_math::mat3_to_quat(frameBasis);
+    const Quat frameQuatInverse = q_inverse(frameQuat);
+    const auto toLocalRotation = [&](const Quat& worldRotation) {
+        return q_mul(q_mul(frameQuatInverse, worldRotation), frameQuat);
+    };
+
+    // 绑定顶点在局部空间的位置：参考实现的 s / y / z。
+    std::vector<Vec3> bindLocal(nV);
+    std::vector<Vec3> bindWorld(nV);
     for (unsigned int i = 0; i < nV; ++i) {
-        const Vec3 relative = v3_sub(frames[i].rest, bindChildPivot);
-        // 参考实现的 s 沿肢体，正负跟随骨骼轴
-        stationsU[i] = frames[i].station / radius;
-        // y 取径向在 basisY 上的分量，z 取 basisZ 上的分量
-        depthsU[i] = v3_dot(frames[i].radial, basisY) / radius;
-        lateralsU[i] = v3_dot(frames[i].radial, basisZ) / radius;
-        (void)relative;
+        bindWorld[i] = frames[i].rest;
+        bindLocal[i] = toLocalPoint(frames[i].rest);
     }
 
-    // ---- 7. 目标形状 ----
-    // 参考实现的两条路径并不等价：
-    //   算法 3 (OCD)              -> Elbow.point，直接给出目标截面
-    //   算法 5 (OCD+CorrectedCoR) -> hinge_displacement 作为 guide，
-    //                                再由 structural_centers 解中心修正
-    std::vector<Vec3> guide(nV);
-    std::vector<ocd_hinge::HingeWeight> hingeWeights(nV);
-    for (unsigned int i = 0; i < nV; ++i) {
-        // 参考实现的权重是 (parent, child, helper)；本插件无 helper 骨。
-        hingeWeights[i] = {chainWeights[i][0], chainWeights[i][1], chainWeights[i][2]};
-    }
+    // ---- 7. 补偿通道与目标形状 ----
     ocd_hinge::HingeParams hingeParams;
     hingeParams.bend = bendDegrees;
     hingeParams.twist = twistDegrees;
     hingeParams.direction = directionDegrees;
-    hingeParams.radius = radius;
+    hingeParams.radius = 1.0;      // 局部坐标已按半径归一，这里必须是 1
     {
         // 11 个补偿通道按参考实现的 CHANNELS 顺序读取。
         MObject* const channelAttrs[ocdChannelCount] = {
@@ -2908,77 +2952,53 @@ MStatus OptimizedSkinCluster::deformOCD(
             hingeParams.values[channel] = channelStatus ? value : 0.0;
         }
     }
+    const bool avoidOverlap = [&] {
+        MStatus avoidStatus;
+        const bool value = block.inputValue(aOcdAvoidOverlap, &avoidStatus).asBool();
+        return avoidStatus ? value : false;
+    }();
+
+    // 算法 3：世界空间目标位置。算法 5：局部空间相对位移（guide）。
+    std::vector<Vec3> guide(nV);
 
     if (!correctCenters) {
-        // 算法 3：Elbow::point 是唯一会应用 11 个补偿通道的路径。
+        // 算法 3 (OCD)：Elbow::point 是唯一会应用 11 个补偿通道的路径。
         ocd_hinge::Pose elbowPose;
         elbowPose.bend = bendDegrees;
         elbowPose.twist = twistDegrees;
         elbowPose.direction = directionDegrees;
-        elbowPose.avoidOverlap = block.inputValue(aOcdAvoidOverlap, &status).asBool();
-        if (!status) elbowPose.avoidOverlap = false;
+        elbowPose.avoidOverlap = avoidOverlap;
         elbowPose.values = hingeParams.values;
         const ocd_hinge::Elbow elbow(elbowPose);
         for (unsigned int i = 0; i < nV; ++i) {
-            // Elbow 以半径 1 计算，输出换回世界单位。
-            const Vec3 target = elbow.point(stationsU[i], depthsU[i], lateralsU[i]);
-            const Vec3 scaled = v3_scale(target, radius);
-            guide[i] = v3_add(bindChildPivot,
-                v3_add(v3_scale(bindAxis, scaled.x),
-                    v3_add(v3_scale(basisY, scaled.y), v3_scale(basisZ, scaled.z))));
+            guide[i] = localPointToWorld(
+                elbow.point(bindLocal[i].x, bindLocal[i].y, bindLocal[i].z));
         }
     }
-    else {
-        // 算法 5：参考实现把 hinge_displacement 的输出当作 guide，
-        // 中心修正由 structural_centers 求解，见下一步。
-        ocd_hinge::Pose elbowPose;
-        elbowPose.bend = bendDegrees;
-        elbowPose.twist = twistDegrees;
-        elbowPose.direction = directionDegrees;
-        elbowPose.avoidOverlap = block.inputValue(aOcdAvoidOverlap, &status).asBool();
-        if (!status) elbowPose.avoidOverlap = false;
-        elbowPose.values = hingeParams.values;
-        const ocd_hinge::Elbow elbow(elbowPose);
-        // "original" 是 CoR 求值后的位置；参考实现喂给 hinge_displacement 的
-        // 就是当前姿态的输出，因此这里先用 Elbow 基础截面得到它。
-        std::vector<Vec3> originalNormalized(nV);
-        for (unsigned int i = 0; i < nV; ++i) {
-            const Vec3 target = elbow.point(stationsU[i], depthsU[i], lateralsU[i]);
-            originalNormalized[i] = target;
-        }
-        const auto displacement = ocd_hinge::hingeDisplacement(
-            stationsU, depthsU, lateralsU, originalNormalized, hingeWeights, hingeParams);
-        for (unsigned int i = 0; i < nV; ++i) {
-            const Vec3 combinedNormalized = v3_add(originalNormalized[i], displacement[i]);
-            const Vec3 scaled = v3_scale(combinedNormalized, radius);
-            guide[i] = v3_add(bindChildPivot,
-                v3_add(v3_scale(bindAxis, scaled.x),
-                    v3_add(v3_scale(basisY, scaled.y), v3_scale(basisZ, scaled.z))));
-        }
-    }
-    // ---- 8. 若需要中心修正，解 structural_centers ----
+
+    // ---- 8. 算法 5：original = 零偏移时当前姿态的 CoR 输出，guide = 目标位移 ----
     std::vector<Vec3> centers(nV, Vec3{0.0, 0.0, 0.0});
     if (correctCenters) {
-        // 收集网格面（bind 空间）
-        MFnMesh meshFns;
+        // 网格面。与 bindLocal 同源（对象空间），只用来构造边表与三角形。
+        std::vector<std::vector<unsigned int>> faces;
         MObject meshObject;
         {
-            auto geometry = block.inputArrayValue(MPxSkinCluster::input, &status);
-            if (status && geometry.jumpToElement(multiIndex)) {
-                auto input = geometry.inputValue(&status);
-                if (status) meshObject = input.child(MPxSkinCluster::inputGeom).asMesh();
+            MStatus meshStatus;
+            auto geometry = block.inputArrayValue(MPxSkinCluster::input, &meshStatus);
+            if (meshStatus && geometry.jumpToElement(multiIndex)) {
+                auto input = geometry.inputValue(&meshStatus);
+                if (meshStatus) meshObject = input.child(MPxSkinCluster::inputGeom).asMesh();
             }
         }
-        std::vector<std::vector<unsigned int>> faces;
         if (!meshObject.isNull()) {
             MFnMesh mesh(meshObject, &status);
             if (status) {
                 const int polygons = mesh.numPolygons(&status);
                 if (status && polygons > 0) {
                     faces.reserve(polygons);
-                    for (int f = 0; f < polygons; ++f) {
+                    for (int polygon = 0; polygon < polygons; ++polygon) {
                         MIntArray vertices;
-                        mesh.getPolygonVertices(f, vertices);
+                        mesh.getPolygonVertices(polygon, vertices);
                         std::vector<unsigned int> face;
                         face.reserve(vertices.length());
                         for (unsigned int k = 0; k < vertices.length(); ++k)
@@ -2988,41 +3008,103 @@ MStatus OptimizedSkinCluster::deformOCD(
                 }
             }
         }
-        if (!faces.empty()) {
-            std::vector<Vec3> bindPoints(nV);
-            for (unsigned int i = 0; i < nV; ++i) bindPoints[i] = frames[i].rest;
-            const auto edges = ocd_centers::buildEdges(bindPoints, faces);
-            const auto outer = ocd_centers::outerParticipation(
-                bindPoints, chainWeights, bendDegrees, twistDegrees, directionDegrees);
 
-            ocd_centers::Settings settings;
-            // rotations 的列需与 chainWeights 的三列对齐
-            settings.rotations = {Cs[parentBone].q, Cs[childBone].q, Quat{0, 0, 0, 1}};
-            settings.centerLimit = block.inputValue(aOcdCenterLimit, &status).asDouble();
-            if (!status) settings.centerLimit = 16.0;
-            const auto offsets = ocd_centers::structuralCenters(
-                edges, bindPoints, chainWeights, settings, guide, outer);
+        if (faces.empty()) {
+            // 没有拓扑就无法构造边表；退化为普通 CoR（等价于偏移为零）。
+            if (debug) MGlobal::displayWarning(
+                "[OCD] corrected CoR needs polygon topology; falling back to CoR.");
+            return deformCoR(block, iter, worldMat, multiIndex);
+        }
 
-            // structural_centers 返回的是偏移量；参考实现把它叠加到标准 CoR
-            // 中心（cor_paper::computeCenters）之上，再交给 vertexTransform。
-            std::vector<cor_paper::Weights> rotationWeights(nV);
-            std::vector<cor_paper::Triangle> triangles;
-            triangles.reserve(faces.size());
-            for (const auto& face : faces) {
-                if (face.size() < 3) continue;
-                for (size_t k = 1; k + 1 < face.size(); ++k)
-                    triangles.push_back({face[0], face[k], face[k + 1]});
+        // 每个顶点的 CoR 权重，以及 computeCenters 需要的三角形表。
+        std::vector<cor_paper::Weights> rotationWeights(nV);
+        for (unsigned int i = 0; i < nV; ++i) {
+            for (const auto& kv : m_vtxCache.vertices[i])
+                rotationWeights[i].push_back({kv.first, kv.second});
+            std::sort(rotationWeights[i].begin(), rotationWeights[i].end(),
+                [](const auto& a, const auto& b) { return a.first < b.first; });
+        }
+        std::vector<cor_paper::Triangle> triangles;
+        triangles.reserve(faces.size() * 2);
+        for (const auto& face : faces) {
+            for (size_t k = 1; k + 1 < face.size(); ++k)
+                triangles.push_back({face[0], face[k], face[k + 1]});
+        }
+
+        double sigma = 0.1;
+        {
+            MStatus sigmaStatus;
+            const double value = block.inputValue(aCorSigma, &sigmaStatus).asDouble();
+            if (sigmaStatus && value > 0.0) sigma = value;
+        }
+        // 标准 CoR 中心（世界/对象空间），与 deformCoR 使用同一份定义。
+        const auto baseCenters = cor_paper::computeCenters(
+            bindWorld, rotationWeights, triangles, sigma);
+
+        // original：把中心偏移归零，在当前骨骼姿态下求 CoR，再换到局部空间。
+        std::vector<Vec3> originalLocal(nV);
+        for (unsigned int i = 0; i < nV; ++i) {
+            const Vec3 center = i < baseCenters.size() ? baseCenters[i] : frames[i].rest;
+            const auto transform = cor_paper::vertexTransform(
+                center, rotationWeights[i], rotationWeights[i], Cs);
+            originalLocal[i] = toLocalPoint(apply_transform(transform, frames[i].rest));
+        }
+
+        // 求解用的边表与内外侧参与度：全部在局部空间。
+        const auto edges = ocd_centers::buildEdges(bindLocal, faces);
+        const auto outer = ocd_centers::outerParticipation(
+            bindLocal, chainWeights, bendDegrees, twistDegrees, directionDegrees);
+
+        // guide 是相对位移（hinge 目标 − 当前 CoR 输出），不是绝对位置。
+        std::vector<double> stationsLocal(nV), depthsLocal(nV), lateralsLocal(nV);
+        std::vector<ocd_hinge::HingeWeight> hingeWeights(nV);
+        for (unsigned int i = 0; i < nV; ++i) {
+            stationsLocal[i] = bindLocal[i].x;
+            depthsLocal[i] = bindLocal[i].y;
+            lateralsLocal[i] = bindLocal[i].z;
+            // 参考实现的权重是 (parent, child, helper)；本插件无 helper 骨。
+            hingeWeights[i] = {chainWeights[i][0], chainWeights[i][1], chainWeights[i][2]};
+        }
+        guide = ocd_hinge::hingeDisplacement(stationsLocal, depthsLocal, lateralsLocal,
+            originalLocal, hingeWeights, hingeParams);
+
+        ocd_centers::Settings settings;
+        // 旋转共轭到局部空间，与 original/guide/edges 保持同一坐标系。
+        settings.rotations = {toLocalRotation(Cs[parentBone].q),
+                              toLocalRotation(Cs[childBone].q),
+                              Quat{0.0, 0.0, 0.0, 1.0}};
+        MStatus limitStatus;
+        double centerLimit = block.inputValue(aOcdCenterLimit, &limitStatus).asDouble();
+        if (!limitStatus || centerLimit <= 0.0) centerLimit = 16.0;
+        // 属性按世界单位暴露；求解空间是半径归一，故换算成「肢体半径的倍数」。
+        settings.centerLimit = centerLimit / radius;
+
+        std::vector<Vec3> offsetsLocal = ocd_centers::structuralCenters(
+            edges, originalLocal, chainWeights, settings, guide, outer);
+
+        // 可选的注入偏移（对象空间向量），用于与参考实现逐级对拍。
+        std::vector<Vec3> injected;
+        {
+            MStatus offsetStatus;
+            const MObject data = block.inputValue(aOcdCenterOffsets, &offsetStatus).data();
+            if (offsetStatus && !data.isNull()) {
+                MFnDoubleArrayData arrayData(data, &offsetStatus);
+                if (offsetStatus) {
+                    const MDoubleArray values = arrayData.array(&offsetStatus);
+                    if (offsetStatus && values.length() == 3 * nV) {
+                        injected.resize(nV);
+                        for (unsigned int i = 0; i < nV; ++i)
+                            injected[i] = {values[3 * i], values[3 * i + 1], values[3 * i + 2]};
+                    }
+                }
             }
-            for (unsigned int i = 0; i < nV; ++i) {
-                for (const auto& kv : m_vtxCache.vertices[i])
-                    rotationWeights[i].push_back({kv.first, kv.second});
-                std::sort(rotationWeights[i].begin(), rotationWeights[i].end(),
-                    [](const auto& a, const auto& b) { return a.first < b.first; });
-            }
-            const auto baseCenters = cor_paper::computeCenters(
-                bindPoints, rotationWeights, triangles, 0.1);
-            for (unsigned int i = 0; i < nV && i < baseCenters.size(); ++i)
-                centers[i] = v3_add(baseCenters[i], offsets[i]);
+        }
+
+        for (unsigned int i = 0; i < nV; ++i) {
+            const Vec3 base = i < baseCenters.size() ? baseCenters[i] : frames[i].rest;
+            // 注入值是对象空间向量，直接叠加；否则把局部偏移换算成向量再加。
+            centers[i] = v3_add(base, injected.empty()
+                ? localOffsetToWorld(offsetsLocal[i]) : injected[i]);
         }
     }
 
