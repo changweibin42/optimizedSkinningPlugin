@@ -2,10 +2,11 @@
 """Dump reference values from ocd_elbow_reference.py for C++ port comparison."""
 import json
 import math
+import os
 import sys
 
 sys.path.insert(0, "tests")
-import ocd_elbow_reference_new as ref
+import ocd_elbow_reference_latest as ref
 
 out = {}
 
@@ -101,7 +102,8 @@ def dump_section():
 dump_elbow()
 dump_hinge()
 dump_section()
-with open("ocd_reference_dump.json", "w", encoding="utf-8") as f:
+out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocd_reference_dump.json")
+with open(out_path, "w", encoding="utf-8") as f:
     json.dump(out, f)
 print("elbow rows:", len(out["elbow"]))
 print("hinge cases:", len(out["hinge"]))

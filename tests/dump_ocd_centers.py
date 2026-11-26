@@ -2,12 +2,13 @@
 """Dump structural_centers / outer_participation reference values for C++ port."""
 import json
 import math
+import os
 import sys
 
 import numpy as np
 
 sys.path.insert(0, "tests")
-import ocd_elbow_reference_new as ref
+import ocd_elbow_reference_latest as ref
 
 HALF, HALF_RINGS, SIDES = ref.HALF, ref.HALF_RINGS, ref.SIDES
 
@@ -55,7 +56,8 @@ def cases():
 
 
 data = {"cases": cases()}
-with open("ocd_centers_dump.json", "w", encoding="utf-8") as f:
+out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocd_centers_dump.json")
+with open(out_path, "w", encoding="utf-8") as f:
     json.dump(data, f)
 print("cases:", len(data["cases"]))
 print("verts:", len(data["cases"][0]["bind"]))

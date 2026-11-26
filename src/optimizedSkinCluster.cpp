@@ -2771,13 +2771,25 @@ MStatus OptimizedSkinCluster::deformOCD(
     }
     const Vec3 bindAxis = v3_scale(bindAxisRaw, 1.0 / segmentLength);
 
-    // bind 坐标系基：x = 骨骼轴，y/z 取其正交补
-    Vec3 basisY = v3_cross(bindAxis, Vec3{0.0, 1.0, 0.0});
-    if (v3_len(basisY) < 1e-6) basisY = v3_cross(bindAxis, Vec3{1.0, 0.0, 0.0});
+    // bind 坐标系基，与参考实现的规范空间一一对应：
+    //   x = 骨骼轴（参考实现的 +X）
+    //   y = 绑定弯曲平面内的径向（参考实现的 +Y）
+    //   z = 弯曲平面法线 / 侧向（参考实现的 +Z）
+    // 参考实现把 direction 当作「绕骨骼轴在绑定帧内旋转弯面」，由 Elbow
+    // 内部处理，因此这里只固定绑定帧，不做任何姿态投影。
+    //
+    // basisY 必须是骨骼轴之外、且尽量接近世界 +Y 的径向方向：参考实现的
+    // 弯面就是世界 XY 平面，直接把世界 +Y 投影到与轴垂直的平面即可。
+    const Vec3 worldUp{0.0, 1.0, 0.0};
+    Vec3 basisY = v3_sub(worldUp, v3_scale(bindAxis, v3_dot(worldUp, bindAxis)));
+    if (v3_len(basisY) < 1e-6) {
+        // 骨骼轴与世界 +Y 平行时退回世界 +Z 投影。
+        const Vec3 fallback{0.0, 0.0, 1.0};
+        basisY = v3_sub(fallback, v3_scale(bindAxis, v3_dot(fallback, bindAxis)));
+    }
     basisY = v3_norm(basisY);
     const Vec3 basisZ = v3_norm(v3_cross(bindAxis, basisY));
-
-    // ---- 3. 每个顶点在铰链坐标系下的 station / 径向（bind 空间） ----
+    // ---- 3. 每个顶点在绑定铰链坐标系下的 station / 径向 ----
     MPointArray points;
     iter.allPositions(points);
     if (points.length() < nV) return MS::kSuccess;
@@ -2805,7 +2817,11 @@ MStatus OptimizedSkinCluster::deformOCD(
         return deformDLB(block, iter, worldMat, multiIndex);
     }
 
-    // ---- 4. 当前姿态的弯曲角 / 扭转角 / 弯曲平面 ----
+    // ---- 4. 当前姿态的弯曲角 / 弯曲平面 ----
+    // 参考实现用 joint_quaternion(bend, twist, direction) 描述姿态：
+    //   direction=0 时绕 +Z 弯曲（弯面 = 世界 XY 平面），
+    //   direction 增大时弯面绕骨骼轴旋转。
+    // 这里从父子骨骼的世界旋转里反解出同一对量。
     const Quat relativeRot = q_mul(Cs[childBone].q, q_inverse(Cs[parentBone].q));
     const Vec3 posedAxisParent = q_rotate_v3(Cs[parentBone].q, bindAxis);
     const Vec3 posedAxisChild = q_rotate_v3(Cs[childBone].q, bindAxis);
@@ -2814,19 +2830,13 @@ MStatus OptimizedSkinCluster::deformOCD(
     double bendDegrees = 0.0;
     double directionDegrees = 0.0;
     if (bendSine > 1e-8) {
-        bendDegrees = std::atan2(bendSine, v3_dot(posedAxisParent, posedAxisChild)) * 180.0 /
-            3.14159265358979323846;
-        // 弯曲方向：把弯曲法线投到 bind 的 y/z 平面
-        const Vec3 unitNormal = v3_scale(bendNormal, 1.0 / bendSine);
-        directionDegrees = std::atan2(v3_dot(unitNormal, basisZ), v3_dot(unitNormal, basisY)) *
+        bendDegrees = std::atan2(bendSine, v3_dot(posedAxisParent, posedAxisChild)) *
             180.0 / 3.14159265358979323846;
+        // 弯面绕骨骼轴的方位角：以 basisZ 为 0，朝 -basisY 增大。
+        const Vec3 unitNormal = v3_scale(bendNormal, 1.0 / bendSine);
+        directionDegrees = std::atan2(-v3_dot(unitNormal, basisY),
+            v3_dot(unitNormal, basisZ)) * 180.0 / 3.14159265358979323846;
     }
-    // 带符号弯曲：法线朝向决定正负
-    if (bendSine > 1e-8) {
-        const double sign = v3_dot(bendNormal, basisY) < 0.0 ? -1.0 : 1.0;
-        (void)sign;
-    }
-
     // 扭转角：从完整相对旋转里剥离 swing，取绕骨骼轴的旋转量
     const Vec3 currentAxis = q_rotate_v3(Cs[childBone].q, bindAxis);
     Quat swing = q_between(bindAxis, currentAxis);
@@ -2866,7 +2876,11 @@ MStatus OptimizedSkinCluster::deformOCD(
         (void)relative;
     }
 
-    // ---- 7. OCD 目标位置 ----
+    // ---- 7. 目标形状 ----
+    // 参考实现的两条路径并不等价：
+    //   算法 3 (OCD)              -> Elbow.point，直接给出目标截面
+    //   算法 5 (OCD+CorrectedCoR) -> hinge_displacement 作为 guide，
+    //                                再由 structural_centers 解中心修正
     std::vector<Vec3> guide(nV);
     std::vector<ocd_hinge::HingeWeight> hingeWeights(nV);
     for (unsigned int i = 0; i < nV; ++i) {
@@ -2895,28 +2909,53 @@ MStatus OptimizedSkinCluster::deformOCD(
         }
     }
 
-    // 用 Elbow::point 逐顶点求目标形状：这是唯一会应用 11 个补偿通道的路径。
-    // 参考实现里 hinge_displacement 只覆盖基础铰链形状，补偿通道在 Elbow.point 内。
-    ocd_hinge::Pose elbowPose;
-    elbowPose.bend = bendDegrees;
-    elbowPose.twist = twistDegrees;
-    elbowPose.direction = directionDegrees;
-    elbowPose.avoidOverlap = block.inputValue(aOcdAvoidOverlap, &status).asBool();
-    if (!status) elbowPose.avoidOverlap = false;
-    elbowPose.values = hingeParams.values;
-    const ocd_hinge::Elbow elbow(elbowPose);
-    for (unsigned int i = 0; i < nV; ++i) {
-        // Elbow 以半径 1 计算，输出换回世界单位。
-        const Vec3 target = elbow.point(stationsU[i], depthsU[i], lateralsU[i]);
-        const Vec3 scaled = v3_scale(target, radius);
-        guide[i] = v3_add(bindChildPivot,
-            v3_add(v3_scale(bindAxis, scaled.x),
-                v3_add(v3_scale(basisY, scaled.y), v3_scale(basisZ, scaled.z))));
+    if (!correctCenters) {
+        // 算法 3：Elbow::point 是唯一会应用 11 个补偿通道的路径。
+        ocd_hinge::Pose elbowPose;
+        elbowPose.bend = bendDegrees;
+        elbowPose.twist = twistDegrees;
+        elbowPose.direction = directionDegrees;
+        elbowPose.avoidOverlap = block.inputValue(aOcdAvoidOverlap, &status).asBool();
+        if (!status) elbowPose.avoidOverlap = false;
+        elbowPose.values = hingeParams.values;
+        const ocd_hinge::Elbow elbow(elbowPose);
+        for (unsigned int i = 0; i < nV; ++i) {
+            // Elbow 以半径 1 计算，输出换回世界单位。
+            const Vec3 target = elbow.point(stationsU[i], depthsU[i], lateralsU[i]);
+            const Vec3 scaled = v3_scale(target, radius);
+            guide[i] = v3_add(bindChildPivot,
+                v3_add(v3_scale(bindAxis, scaled.x),
+                    v3_add(v3_scale(basisY, scaled.y), v3_scale(basisZ, scaled.z))));
+        }
     }
-
-    (void)twistQuat;
-    (void)swing;
-
+    else {
+        // 算法 5：参考实现把 hinge_displacement 的输出当作 guide，
+        // 中心修正由 structural_centers 求解，见下一步。
+        ocd_hinge::Pose elbowPose;
+        elbowPose.bend = bendDegrees;
+        elbowPose.twist = twistDegrees;
+        elbowPose.direction = directionDegrees;
+        elbowPose.avoidOverlap = block.inputValue(aOcdAvoidOverlap, &status).asBool();
+        if (!status) elbowPose.avoidOverlap = false;
+        elbowPose.values = hingeParams.values;
+        const ocd_hinge::Elbow elbow(elbowPose);
+        // "original" 是 CoR 求值后的位置；参考实现喂给 hinge_displacement 的
+        // 就是当前姿态的输出，因此这里先用 Elbow 基础截面得到它。
+        std::vector<Vec3> originalNormalized(nV);
+        for (unsigned int i = 0; i < nV; ++i) {
+            const Vec3 target = elbow.point(stationsU[i], depthsU[i], lateralsU[i]);
+            originalNormalized[i] = target;
+        }
+        const auto displacement = ocd_hinge::hingeDisplacement(
+            stationsU, depthsU, lateralsU, originalNormalized, hingeWeights, hingeParams);
+        for (unsigned int i = 0; i < nV; ++i) {
+            const Vec3 combinedNormalized = v3_add(originalNormalized[i], displacement[i]);
+            const Vec3 scaled = v3_scale(combinedNormalized, radius);
+            guide[i] = v3_add(bindChildPivot,
+                v3_add(v3_scale(bindAxis, scaled.x),
+                    v3_add(v3_scale(basisY, scaled.y), v3_scale(basisZ, scaled.z))));
+        }
+    }
     // ---- 8. 若需要中心修正，解 structural_centers ----
     std::vector<Vec3> centers(nV, Vec3{0.0, 0.0, 0.0});
     if (correctCenters) {
