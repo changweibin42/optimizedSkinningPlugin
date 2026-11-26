@@ -429,10 +429,28 @@ def structural_centers(edges, original, weights, rotations, guide, center_limit=
     degree = np.bincount(a,weights=k,minlength=n)+np.bincount(b,weights=k,minlength=n)
     ridge = 0.00006*np.maximum(degree,1e-12)
     target = apply(0.5*(R[a]+R[b]),rest)
+    # Tensile stretch pulls both endpoints along their own transported rest
+    # tangent. This transports material around a bend instead of cutting the
+    # corner with a force along the chord. Compressed edges exert no traction.
+    prediction = original+guide
+    length = np.linalg.norm(rest,axis=1)
+    extension = np.maximum(np.linalg.norm(prediction[b]-prediction[a],axis=1)-length,0.)
+    traction = (k*extension/length)[:,None]*rest
+    # Transport traction in the local limb frame. Squared weights reduce
+    # frame averaging across the hinge without an abrupt dominant-bone switch.
+    transport_weights = weights**3
+    transport_weights /= transport_weights.sum(axis=1,keepdims=True)
+    frame = np.einsum("nk,kij->nij",transport_weights,rotation_matrix(rotations))
+    frame -= center_response(transport_weights,rotations)
+    left = apply(frame[a],traction)
+    right = apply(frame[b],traction)
+    pull = np.column_stack([np.bincount(a,weights=l,minlength=n)-
+                            np.bincount(b,weights=r,minlength=n)
+                            for l,r in zip(left.T,right.T)])
     # Soft position term selects the joint-scale fold; edge transport retains
     # local detail. Degree scaling keeps the two terms comparable locally.
     guide_mass = 2.0*degree[:,None]
-    rhs = apply(AT,scatter(k[:,None]*(target-(original[b]-original[a])))+guide_mass*guide)
+    rhs = apply(AT,scatter(k[:,None]*(target-(original[b]-original[a])))+guide_mass*guide+7.0*pull)
     def system(x):
         u = apply(A,x)
         return apply(AT,scatter(k[:,None]*(u[b]-u[a]))+guide_mass*u)+ridge[:,None]*x
@@ -465,7 +483,7 @@ def show(three_bone=True, center_limit=16.0):
     from maya.api import OpenMaya as om
     if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "CoRFoldStructureWindow" + ("Three" if three_bone else "Two")
+    win = "CoRTangentSlideWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
