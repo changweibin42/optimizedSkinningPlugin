@@ -376,12 +376,15 @@ def hinge_displacement(bind, original, weights, bend, twist, direction):
     u = np.minimum(distance/support,1.)
     inner_travel = shift*(1-u)
 
-    outward = distance + inner_travel
+    # Relax the inner shoulders while anchoring the crease and the rigid end.
+    # This material-space envelope allows opposing surfaces to share space.
+    release = 0.28*sin(angle/2)**2 * (4*u*(1-u))**2
+    outward = distance + inner_travel*(1-release)
     height = depth.copy()
     # The softened inner miter needs a matching intersection height so both
     # halves meet at station zero. Blend back to the bind offset along the limb.
     if angle > 1e-8:
-        height += (shift/tan(angle/2)-np.maximum(depth,0))*(1-u)
+        height += (shift/tan(angle/2)-np.maximum(depth,0))*(1-u)*(1-release)
     # Exact circular fillet tangent to both rigid offset lines. Traverse it
     # by arc length and let the additional length decay to zero at support.
     # The radius is proportional to meridian depth, so the flank limit is rigid.
@@ -533,7 +536,7 @@ def show(three_bone=True, center_limit=16.0):
     from maya.api import OpenMaya as om
     if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "CoRReachBendWindow" + ("Three" if three_bone else "Two")
+    win = "CoRRelaxedFoldWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
