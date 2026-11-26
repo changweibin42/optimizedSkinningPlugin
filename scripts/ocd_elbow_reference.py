@@ -339,6 +339,59 @@ def center_response(weights, rotations):
     return np.einsum("nk,kij->nij",weights,rotation_matrix(q))-rotation_matrix(blend)
 
 
+def hinge_displacement(bind, original, weights, bend, twist, direction):
+    """Construct the two offset limb profiles in the signed bend plane."""
+    import numpy as np
+    points = np.asarray(bind, dtype=float)
+    station, y, z = points.T
+    plane = radians(direction + (180 if bend < 0 else 0))
+    angle = radians(abs(bend))
+    # End-bone participation counts the half-angle helper at its bend fraction.
+    phase = radians(twist) * (weights[:,1] + (0.35*weights[:,2] if weights.shape[1]>2 else 0))
+    depth = y*np.cos(phase-plane) - z*np.sin(phase-plane)
+    lateral = y*np.sin(phase-plane) + z*np.cos(phase-plane)
+    radius = np.max(np.hypot(y,z))
+    distance = np.abs(station)
+    # Inner offset lines intersect on the bisector. Limit their axial travel
+    # by the span of the mixed-weight region when the limbs approach parallel.
+    mixed = np.count_nonzero(weights>0,axis=1)>1
+    reach = max(radius, distance[mixed].max()) if mixed.any() else radius
+    rigid_edges = distance[(~mixed) & (distance>reach)]
+    support = rigid_edges.min() if rigid_edges.size else reach + radius
+    raw = np.maximum(depth,0) * tan(angle/2)
+    shift = raw / np.sqrt(1+(2*raw/support)**2)
+    # Quadratic relaxation makes the inner longitudinal gap smallest at the
+    # crease. The derivative of the station mapping stays positive.
+    inner_fade = np.maximum(1-distance/support,0)**2
+    inner_travel = shift * inner_fade
+    outward = distance + inner_travel
+    height = depth.copy()
+    # The softened inner miter needs a matching intersection height so both
+    # halves meet at station zero. Blend back to the bind offset along the limb.
+    if angle > 1e-8:
+        height += (shift/tan(angle/2)-np.maximum(depth,0))*inner_fade
+    # Exact circular fillet tangent to both rigid offset lines. Traverse it
+    # by arc length and let the additional length decay to zero at support.
+    # The radius is proportional to meridian depth, so the flank limit is rigid.
+    half = angle/2
+    outer_radius = np.maximum(-depth,0)
+    fillet_radius = outer_radius*(1+0.45*cos(half))
+    tangent_station = 0.45*outer_radius*sin(half)
+    arc_length = fillet_radius*half
+    extra = arc_length-tangent_station
+    progress = distance+extra*(1-inner_fade)
+    remaining = np.maximum(arc_length-progress,0)
+    phi = remaining/np.where(fillet_radius>0,fillet_radius,1)
+    arc_station = tangent_station-fillet_radius*np.sin(phi)+np.maximum(progress-arc_length,0)
+    arc_height = depth+2*fillet_radius*np.sin(phi/2)**2
+    outward = np.where(depth<0,arc_station,outward)
+    height = np.where(depth<0,arc_height,height)
+    x = np.where(station<=0,-outward,cos(angle)*outward-sin(angle)*height)
+    h = np.where(station<=0,height,sin(angle)*outward+cos(angle)*height)
+    target = np.column_stack((x,h*cos(plane)-lateral*sin(plane),h*sin(plane)+lateral*cos(plane)))
+    return target-original
+
+
 def local_edges(bind, faces):
     """Rest edges weighted by incident surface area / squared edge length."""
     import numpy as np
@@ -360,7 +413,7 @@ def local_edges(bind, faces):
     return a[valid],b[valid],rest[valid],stiffness
 
 
-def structural_centers(edges, original, weights, rotations, center_limit=None):
+def structural_centers(edges, original, weights, rotations, guide, center_limit=None):
     """Joint least squares on transported bind edges, solved in center space."""
     import numpy as np
     a,b,rest,k = edges
@@ -374,13 +427,16 @@ def structural_centers(edges, original, weights, rotations, center_limit=None):
         return np.column_stack([np.bincount(b,weights=v,minlength=n)-
                                 np.bincount(a,weights=v,minlength=n) for v in values.T])
     degree = np.bincount(a,weights=k,minlength=n)+np.bincount(b,weights=k,minlength=n)
-    ridge = 0.0025*np.maximum(degree,1e-12)
+    ridge = 0.00006*np.maximum(degree,1e-12)
     target = apply(0.5*(R[a]+R[b]),rest)
-    rhs = apply(AT,scatter(k[:,None]*(target-(original[b]-original[a]))))
+    # Soft position term selects the joint-scale fold; edge transport retains
+    # local detail. Degree scaling keeps the two terms comparable locally.
+    guide_mass = 2.0*degree[:,None]
+    rhs = apply(AT,scatter(k[:,None]*(target-(original[b]-original[a])))+guide_mass*guide)
     def system(x):
         u = apply(A,x)
-        return apply(AT,scatter(k[:,None]*(u[b]-u[a])))+ridge[:,None]*x
-    block = degree[:,None,None]*(AT@A)+ridge[:,None,None]*np.eye(3)
+        return apply(AT,scatter(k[:,None]*(u[b]-u[a]))+guide_mass*u)+ridge[:,None]*x
+    block = (degree+guide_mass[:,0])[:,None,None]*(AT@A)+ridge[:,None,None]*np.eye(3)
     inverse = np.linalg.inv(block)
     x = np.zeros_like(original)
     r = rhs.copy()
@@ -409,7 +465,7 @@ def show(three_bone=True, center_limit=16.0):
     from maya.api import OpenMaya as om
     if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "CoRLocalStructureWindow" + ("Three" if three_bone else "Two")
+    win = "CoRFoldStructureWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
@@ -593,7 +649,8 @@ def show(three_bone=True, center_limit=16.0):
                         helper.setRotation(om.MQuaternion(*half),om.MSpace.kTransform)
                     rotations.append(half)
                 original = np.asarray([(p.x,p.y,p.z) for p in reference.getPoints(om.MSpace.kObject)])
-                delta = structural_centers(edges,original,weights,rotations,center_limit)
+                guide = hinge_displacement(bind,original,weights,bend,twist,direction)
+                delta = structural_centers(edges,original,weights,rotations,guide,center_limit)
                 plug.setMObject(om.MFnDoubleArrayData().create(om.MDoubleArray(delta.ravel().tolist())))
             mesh.setPoints([om.MPoint(*p) for p in pose.mesh(bind)],om.MSpace.kObject)
 
