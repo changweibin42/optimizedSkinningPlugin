@@ -467,11 +467,28 @@ def structural_centers(edges, original, weights, rotations, guide, outer, center
     # Soft position term selects the joint-scale fold; edge transport retains
     # local detail. Degree scaling keeps the two terms comparable locally.
     guide_mass = 2.0*degree[:,None]
-    rhs = apply(AT,scatter(k[:,None]*(target-(original[b]-original[a])))+guide_mass*guide+7.0*pull)
+    # Penalize abrupt changes along a limb, preserving the rotated rest
+    # differential. Directional edge weights avoid flattening the hoop.
+    rest_k = k*axial**2
+    current_length = np.linalg.norm(prediction[b]-prediction[a],axis=1)
+    longitudinal = rest_k*length/np.maximum(current_length,0.15*length)
+    def lap(x):
+        return scatter(longitudinal[:,None]*(x[b]-x[a]))
+    lap_degree = (np.bincount(a,weights=longitudinal,minlength=n)+
+                  np.bincount(b,weights=longitudinal,minlength=n))
+    compliance = 8.0*np.minimum(1.,4.*abs(weights[:,0]-weights[:,1]))**2/np.maximum(lap_degree,1e-12)
+    rest_detail = scatter(rest_k[:,None]*rest)
+    curvature_rhs = lap(compliance[:,None]*(apply(R,rest_detail)-lap(original)))
+    rhs = apply(AT,scatter(k[:,None]*(target-(original[b]-original[a])))+
+                guide_mass*guide+7.0*pull+curvature_rhs)
     def system(x):
         u = apply(A,x)
-        return apply(AT,scatter(k[:,None]*(u[b]-u[a]))+guide_mass*u)+ridge[:,None]*x
-    block = (degree+guide_mass[:,0])[:,None,None]*(AT@A)+ridge[:,None,None]*np.eye(3)
+        elastic = scatter(k[:,None]*(u[b]-u[a]))+guide_mass*u
+        return apply(AT,elastic+lap(compliance[:,None]*lap(u)))+ridge[:,None]*x
+    diag = (degree+guide_mass[:,0]+compliance*lap_degree**2+
+            np.bincount(a,weights=longitudinal**2*compliance[b],minlength=n)+
+            np.bincount(b,weights=longitudinal**2*compliance[a],minlength=n))
+    block = diag[:,None,None]*(AT@A)+ridge[:,None,None]*np.eye(3)
     inverse = np.linalg.inv(block)
     x = np.zeros_like(original)
     r = rhs.copy()
@@ -500,7 +517,7 @@ def show(three_bone=True, center_limit=16.0):
     from maya.api import OpenMaya as om
     if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "CoRConvexSlideWindow" + ("Three" if three_bone else "Two")
+    win = "CoRLocalBendWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
@@ -786,6 +803,16 @@ def show(three_bone=True, center_limit=16.0):
                   (np.sqrt(np.mean(before**2)),np.sqrt(np.mean(after**2)),after[~active].max()))
             # Find the actual inner/outer meridians in the signed bend plane.
             azimuth = radians(direction + (180 if bend<0 else 0))
+            posed = np.asarray([(p.x,p.y,p.z) for p in guided_mesh.getPoints(om.MSpace.kObject)])
+            rings = posed[:-2].reshape(-1,SIDES,3)
+            for step in (-1,1):
+                strip = rings[HALF_RINGS+step*np.arange(5)]
+                edges = np.diff(strip,axis=0)
+                tangents = edges/np.maximum(np.linalg.norm(edges,axis=2,keepdims=True),1e-12)
+                turns = np.degrees(np.arccos(np.clip((tangents[1:]*tangents[:-1]).sum(axis=2),-1,1)))
+                ring_idx, meridian = np.unravel_index(np.argmax(turns),turns.shape)
+                print("local turn | ring %+d | meridian %d | %.2f deg" %
+                      (step*(1+ring_idx),meridian,turns[ring_idx,meridian]))
             for ring in range(-2,3):
                 start = (HALF_RINGS+ring)*SIDES
                 phase = azimuth - radians(twist)*skin_weight(bind[start][0])
