@@ -413,7 +413,20 @@ def local_edges(bind, faces):
     return a[valid],b[valid],rest[valid],stiffness
 
 
-def structural_centers(edges, original, weights, rotations, guide, center_limit=None):
+def outer_participation(bind, weights, bend, twist, direction):
+    """Continuous convex-side participation in the elbow's bind frame."""
+    import numpy as np
+    _,y,z = np.asarray(bind).T
+    phase = radians(twist)*weights[:,1]
+    if weights.shape[1]==3:
+        phase += radians(twist)*0.35*weights[:,2]
+    phi = phase-radians(direction)
+    depth = y*np.cos(phi)-z*np.sin(phi)
+    u = np.clip(-np.sign(bend)*depth/np.maximum(np.hypot(y,z),1e-12),0,1)
+    return u*u*(3-2*u)
+
+
+def structural_centers(edges, original, weights, rotations, guide, outer, center_limit=None):
     """Joint least squares on transported bind edges, solved in center space."""
     import numpy as np
     a,b,rest,k = edges
@@ -435,8 +448,12 @@ def structural_centers(edges, original, weights, rotations, guide, center_limit=
     prediction = original+guide
     length = np.linalg.norm(rest,axis=1)
     extension = np.maximum(np.linalg.norm(prediction[b]-prediction[a],axis=1)-length,0.)
-    traction = (k*extension/length)[:,None]*rest
-    # Transport traction in the local limb frame. Squared weights reduce
+    # Only longitudinal tensile strain on the convex surface drives slide.
+    # Cross-section stretch must not pull neighboring meridians into a fold.
+    axial = rest[:,0]/length
+    extension = length*np.tanh(extension/length)
+    traction = (k*extension/length*axial**2*np.minimum(outer[a],outer[b]))[:,None]*rest
+    # Transport traction in the local limb frame. Cubed weights reduce
     # frame averaging across the hinge without an abrupt dominant-bone switch.
     transport_weights = weights**3
     transport_weights /= transport_weights.sum(axis=1,keepdims=True)
@@ -483,7 +500,7 @@ def show(three_bone=True, center_limit=16.0):
     from maya.api import OpenMaya as om
     if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "CoRTangentSlideWindow" + ("Three" if three_bone else "Two")
+    win = "CoRConvexSlideWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
@@ -668,7 +685,8 @@ def show(three_bone=True, center_limit=16.0):
                     rotations.append(half)
                 original = np.asarray([(p.x,p.y,p.z) for p in reference.getPoints(om.MSpace.kObject)])
                 guide = hinge_displacement(bind,original,weights,bend,twist,direction)
-                delta = structural_centers(edges,original,weights,rotations,guide,center_limit)
+                outer = outer_participation(bind,weights,bend,twist,direction)
+                delta = structural_centers(edges,original,weights,rotations,guide,outer,center_limit)
                 plug.setMObject(om.MFnDoubleArrayData().create(om.MDoubleArray(delta.ravel().tolist())))
             mesh.setPoints([om.MPoint(*p) for p in pose.mesh(bind)],om.MSpace.kObject)
 
