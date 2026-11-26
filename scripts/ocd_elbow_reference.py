@@ -795,27 +795,36 @@ def show(three_bone=True, center_limit=16.0):
             bend,twist,direction = get_values(motion)
             target = np.asarray(Elbow(bend,twist,direction).mesh(bind))
             active = (weights>0).sum(axis=1)>1
-            before,after = [np.linalg.norm(np.asarray([(p.x,p.y,p.z) for p in fn.getPoints(
-                om.MSpace.kObject)])-target,axis=1) for fn in (reference,guided_mesh)]
+            meshes = [np.asarray([(p.x,p.y,p.z) for p in fn.getPoints(om.MSpace.kObject)])
+                      for fn in (reference,guided_mesh)]
+            before,after = [np.linalg.norm(points-target,axis=1) for points in meshes]
+            print("pose | bend %.2f | twist %.2f | direction %.2f" % (bend,twist,direction))
             print("CoR -> geometric CoR | active RMS %.5f -> %.5f" %
                   (np.sqrt(np.mean(before[active]**2)),np.sqrt(np.mean(after[active]**2))))
             print("All vertices RMS %.5f -> %.5f | single-influence max error %.5f" %
                   (np.sqrt(np.mean(before**2)),np.sqrt(np.mean(after**2)),after[~active].max()))
             # Find the actual inner/outer meridians in the signed bend plane.
             azimuth = radians(direction + (180 if bend<0 else 0))
-            posed = np.asarray([(p.x,p.y,p.z) for p in guided_mesh.getPoints(om.MSpace.kObject)])
-            rings = posed[:-2].reshape(-1,SIDES,3)
+            rings = [v[:-2].reshape(-1,SIDES,3) for v in (*meshes,target)]
+            roll = weights[:,1].copy()
+            if weights.shape[1] == 3:
+                roll += 0.35*weights[:,2]
+            inner_phase = azimuth-radians(twist)*roll[0:-2:SIDES]
             for step in (-1,1):
-                strip = rings[HALF_RINGS+step*np.arange(5)]
-                edges = np.diff(strip,axis=0)
-                tangents = edges/np.maximum(np.linalg.norm(edges,axis=2,keepdims=True),1e-12)
-                turns = np.degrees(np.arccos(np.clip((tangents[1:]*tangents[:-1]).sum(axis=2),-1,1)))
-                ring_idx, meridian = np.unravel_index(np.argmax(turns),turns.shape)
-                print("local turn | ring %+d | meridian %d | %.2f deg" %
-                      (step*(1+ring_idx),meridian,turns[ring_idx,meridian]))
+                rows = HALF_RINGS+step*np.arange(5)
+                turns = []
+                for grid in rings:
+                    edge = np.diff(grid[rows],axis=0)
+                    tangent = edge/np.maximum(np.linalg.norm(edge,axis=2,keepdims=True),1e-12)
+                    turns.append(np.degrees(np.arccos(np.clip((tangent[1:]*tangent[:-1]).sum(axis=2),-1,1))))
+                cosine = np.cos(2*pi*np.arange(SIDES)/SIDES-inner_phase[rows[1:-1],None])
+                for label,sector in (("inner",cosine>0.25),("outer",cosine< -0.25),("flank",abs(cosine)<=0.25)):
+                    pos = np.unravel_index(np.argmax(np.where(sector,turns[1],-1)),cosine.shape)
+                    print("turn %s | ring %+d meridian %d | CoR %.2f | optimized %.2f | OCD %.2f deg" %
+                          (label,step*(pos[0]+1),pos[1],*(v[pos] for v in turns)))
             for ring in range(-2,3):
                 start = (HALF_RINGS+ring)*SIDES
-                phase = azimuth - radians(twist)*skin_weight(bind[start][0])
+                phase = inner_phase[HALF_RINGS+ring]
                 inner = round(phase*SIDES/(2*pi))%SIDES
                 i,o = start+inner,start+(inner+SIDES//2)%SIDES
                 print("ring %+d | inner %.5f -> %.5f | outer %.5f -> %.5f" %
