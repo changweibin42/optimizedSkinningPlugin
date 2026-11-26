@@ -394,7 +394,13 @@ def hinge_displacement(bind, original, weights, bend, twist, direction):
     tangent_station = 0.45*outer_radius*sin(half)
     arc_length = fillet_radius*half
     extra = arc_length-tangent_station
-    progress = distance+extra*(1-inner_fade)
+    # Gather convex-side material toward the hinge along its existing arc.
+    # The remapping is increasing and matches rigid arc travel at support.
+    side = outer_radius/np.maximum(np.hypot(y,z),1e-12)
+    gather = 0.85*sin(half)*side**2
+    material = distance*(1-gather*(1-u)**2)
+    join = u**3*(4-3*u)
+    progress = material+extra*join
     remaining = np.maximum(arc_length-progress,0)
     phi = remaining/np.where(fillet_radius>0,fillet_radius,1)
     arc_station = tangent_station-fillet_radius*np.sin(phi)+np.maximum(progress-arc_length,0)
@@ -536,7 +542,7 @@ def show(three_bone=True, center_limit=16.0):
     from maya.api import OpenMaya as om
     if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "CoRRelaxedFoldWindow" + ("Three" if three_bone else "Two")
+    win = "CoRConvexGatherWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
@@ -827,6 +833,13 @@ def show(three_bone=True, center_limit=16.0):
             # Find the actual inner/outer meridians in the signed bend plane.
             azimuth = radians(direction + (180 if bend<0 else 0))
             rings = [v[:-2].reshape(-1,SIDES,3) for v in (*meshes,target)]
+            outer_center = round((direction+(180 if bend>=0 else 0))*SIDES/360)%SIDES
+            grid_points = meshes[1][:-2].reshape(-1,SIDES,3)
+            if abs(twist)<1e-6:
+                meridian = grid_points[:,outer_center]
+                gaps = np.linalg.norm(meridian-meridian[HALF_RINGS],axis=1)
+                print("outer distance to crease | -2 %.5f | -1 %.5f | +1 %.5f | +2 %.5f" %
+                      tuple(gaps[HALF_RINGS+np.array([-2,-1,1,2])]))
             for row in (-5,-4,-3):
                 ids = (HALF_RINGS+row)*SIDES+np.arange(SIDES)
                 travel = meshes[1][ids,0]-np.asarray(bind)[ids,0]
