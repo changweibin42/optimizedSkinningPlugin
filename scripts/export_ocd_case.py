@@ -15,14 +15,22 @@ r"""把当前场景里的 OCD（算法 5）用例导出成一份可重放的 JSO
 导出内容（同一个当前姿态）：
 
 * 绑定网格：rest 顶点、面、对象矩阵
-* 每个顶点的完整权重列
-* 骨骼：matrix[] 的实际顺序、名字、当前世界矩阵、bindPreMatrix
+* **每个顶点的稀疏权重**：存成 {influenceIndex: weight}，不是按位置摊平
+* 骨骼：matrix[] 的实际顺序、名字、当前世界矩阵、bindPreMatrix，
+  以及由 bindPreMatrix 的逆算出的 bind 位置
 * 铰链：插件自报的 parent / child / helper（ocdHingeReport）
-* 节点属性：算法、中心限额、扭转权重、11 个补偿通道、注入的中心偏移
-* **算法 0 / 3 / 5 三份顶点输出**：区分「基础 CoR 已折」与「引导位移没实现」
-* 按铰链轴分环的对照表：环距不均匀时归一化的斜率才是「开始弯的速度」
+* 节点属性：算法、中心限额、扭转权重、补偿通道、注入的中心偏移
+* **算法 0 / 3 / 5 三份顶点输出**
+* 按铰链轴分环的对照表
 
-注意：绑定点取自蒙皮的**输入几何**（rest 位姿），不是当前变形结果。
+三个曾经出过错的地方，这里都按正确语义处理：
+
+1. weightList[i].weights 是 multi 属性的**稀疏**数组，multiIndices 就是
+   influence 索引。只存非零项，且必须带索引，不能按出现顺序当列。
+2. bindPreMatrix 已经是「绑定世界矩阵的逆」，bind 位置直接读它的平移
+   （行向量约定下在 12..14），不需要再求逆。
+3. 环宽取相邻 station 的**中位间隔**，不是最小间隔；浮点噪声否则会把
+   一个环拆成很多假环。
 """
 import json
 import math
@@ -31,7 +39,6 @@ import sys
 
 SKIN_TYPE = "optimizedSkinCluster"
 
-# 11 个补偿通道，导出全部属性便于核对。
 CHANNEL_ATTRS = (
     "ocdInnerFalloff", "ocdInnerShift", "ocdInnerTilt",
     "ocdOuterFalloff", "ocdOuterShift", "ocdOuterTilt",
@@ -42,41 +49,6 @@ SCALAR_ATTRS = (
     "ocdAvoidOverlap", "corDebugLog", "ocdHingeParent", "ocdHingeChild",
     "ocdHingeReport",
 )
-
-
-def _default_path():
-    """挑一个可写的位置存 JSON。
-
-    依次尝试：场景所在目录、Maya 项目目录、用户主目录、系统临时目录。
-    在受限环境里主目录可能不可写，所以不能只写死一个。
-    """
-    name = "ocd_case.json"
-    candidates = []
-    scene = mc.file(query=True, sceneName=True) or ""
-    if scene:
-        candidates.append(os.path.dirname(scene))
-    try:
-        project = mc.workspace(query=True, rootDirectory=True) or ""
-        if project:
-            candidates.append(project)
-    except Exception:
-        pass
-    candidates.append(os.path.expanduser("~"))
-    import tempfile
-    candidates.append(tempfile.gettempdir())
-
-    for directory in candidates:
-        if not directory:
-            continue
-        try:
-            candidate = os.path.join(directory, name)
-            with open(candidate, "a"):
-                pass
-            os.remove(candidate)
-            return candidate
-        except Exception:
-            continue
-    return name
 
 
 def _attr(node, name):
@@ -92,6 +64,35 @@ def _short(name):
     return name.split("|")[-1]
 
 
+def _default_path():
+    name = "ocd_case.json"
+    candidates = []
+    scene = mc.file(query=True, sceneName=True) or ""
+    if scene:
+        candidates.append(os.path.dirname(scene))
+    try:
+        project = mc.workspace(query=True, rootDirectory=True) or ""
+        if project:
+            candidates.append(project)
+    except Exception:
+        pass
+    candidates.append(os.path.expanduser("~"))
+    import tempfile
+    candidates.append(tempfile.gettempdir())
+    for directory in candidates:
+        if not directory:
+            continue
+        try:
+            candidate = os.path.join(directory, name)
+            with open(candidate, "a"):
+                pass
+            os.remove(candidate)
+            return candidate
+        except Exception:
+            continue
+    return name
+
+
 def _find_skin(preferred_shape=None):
     skins = mc.ls(type=SKIN_TYPE) or []
     if not skins:
@@ -103,7 +104,6 @@ def _find_skin(preferred_shape=None):
         related = mc.listConnections(preferred_shape + ".inMesh", source=True,
                                      destination=False, type=SKIN_TYPE) or []
         if not related:
-            # 选中网格时，蒙皮节点可能挂在它的历史里。
             related = [node for node in mc.listHistory(preferred_shape) or []
                        if mc.nodeType(node) == SKIN_TYPE]
         if related:
@@ -155,18 +155,15 @@ def _mesh_arrays(shape, om):
     mesh = om.MFnMesh(selection.getDagPath(0))
     points = [[float(p.x), float(p.y), float(p.z)]
               for p in mesh.getPoints(om.MSpace.kObject)]
-    # API 2.0 里 numPolygons 是属性；1.0 才是方法。
     count = mesh.numPolygons() if callable(mesh.numPolygons) else mesh.numPolygons
     faces = []
     for polygon in range(count):
-        # API 2.0: getPolygonVertices(polygon) -> tuple
         vertices = mesh.getPolygonVertices(polygon)
         faces.append([int(v) for v in vertices])
     return points, faces
 
 
 def _evaluate(shape, algorithm, skin, om):
-    """把 algorithmType 临时改成目标值，取出该算法的对象空间顶点。"""
     original = mc.getAttr(skin + ".algorithmType")
     try:
         mc.setAttr(skin + ".algorithmType", algorithm)
@@ -180,78 +177,114 @@ def _evaluate(shape, algorithm, skin, om):
         mc.refresh(force=True)
 
 
-def _flatten(values):
-    """Maya 有时把 multi 属性读成嵌套元组/列表，摊平成一维 float。"""
-    out = []
-    stack = [values] if not isinstance(values, (list, tuple)) else list(values)
-    while stack:
-        item = stack.pop(0)
-        if isinstance(item, (list, tuple)):
-            stack = list(item) + stack
-        else:
-            out.append(float(item))
-    return out
+def _sparse_weights(skin, vertex_count):
+    """返回 (sparse, dense)。
 
-
-def _weights(skin, vertex_count):
-    rows = []
+    weightList[v].weights 是**稀疏** multi 属性：multiIndices 给出实际的
+    influence 索引，值按这些索引排列。旧版把它按出现顺序摊平成列，结果是
+    顶点 0 只有 influence 1 有权重时，把 1.0 记到了第 0 列、又补一个 0.0
+    到第 1 列——列与骨骼完全错位。
+    """
+    sparse = []      # 每顶点 {index: weight}
     for vertex in range(vertex_count):
+        entry = {}
         try:
-            row = _flatten(
-                mc.getAttr("%s.weightList[%d].weights" % (skin, vertex)))
+            plug = "%s.weightList[%d].weights" % (skin, vertex)
+            indices = mc.getAttr(plug, multiIndices=True) or []
+            for index in indices:
+                try:
+                    value = mc.getAttr("%s[%d]" % (plug, index))
+                except Exception:
+                    continue
+                if isinstance(value, (list, tuple)):
+                    value = value[0] if value else 0.0
+                value = float(value)
+                if abs(value) > 0.0:
+                    entry[int(index)] = value
         except Exception:
-            row = []
-        rows.append(row)
-    width = max((len(row) for row in rows), default=0)
-    return [row + [0.0] * (width - len(row)) for row in rows]
+            entry = {}
+        sparse.append(entry)
+    return sparse
+
+
+def _mat_inverse(m):
+    """4x4 行主序矩阵求逆（Maya MMatrix 约定）。"""
+    a = [[float(m[r * 4 + c]) for c in range(4)] for r in range(4)]
+    # 增广矩阵
+    aug = [row[:] + [1.0 if i == j else 0.0 for j in range(4)]
+           for i, row in enumerate(a)]
+    for col in range(4):
+        pivot = max(range(col, 4), key=lambda r: abs(aug[r][col]))
+        if abs(aug[pivot][col]) < 1e-12:
+            raise ValueError("bindPreMatrix 奇异，无法求逆")
+        aug[col], aug[pivot] = aug[pivot], aug[col]
+        scale = aug[col][col]
+        aug[col] = [v / scale for v in aug[col]]
+        for row in range(4):
+            if row == col:
+                continue
+            factor = aug[row][col]
+            if factor != 0.0:
+                aug[row] = [v - factor * w for v, w in zip(aug[row], aug[col])]
+    return [aug[r][4 + c] for r in range(4) for c in range(4)]
+
+
+def _bind_positions(bones):
+    """由 bindPreMatrix 的逆求 bind 世界矩阵，再读它的位置。
+
+    实测确认：bindPreMatrix == 绑定姿态的 worldInverseMatrix，所以它的
+    平移是位置取负（shoulder 在 x=-6 时 bindPreMatrix 的平移是 +6）。
+    直接读 bindPreMatrix 的平移会得到反号的坐标，必须先求逆。
+    """
+    for bone in bones:
+        world = _mat_inverse(bone["bindPreMatrix"])
+        bone["bindWorldMatrix"] = world
+        bone["bindPosition"] = [world[12], world[13], world[14]]
+        # bind 世界矩阵的第一列 = 该骨绑定姿态的局部 X 轴（行向量约定）。
+        axis = [world[0], world[4], world[8]]
+        length = math.sqrt(sum(v * v for v in axis))
+        bone["bindAxis"] = ([v / length for v in axis] if length > 1e-9
+                            else [1.0, 0.0, 0.0])
+    return bones
 
 
 def _hinge_frame(bones, report):
-    """铰链父骨的绑定 X 轴与位置（从 bindPreMatrix 的逆读取）。
-
-    bindPreMatrix 是 bind 世界矩阵的逆，行主序，平移在 12..14。
-    """
     parent = None
     if report:
         for bone in bones:
-            if ("parent=" + _short(bone["name"])) in report.replace("|", ""):
+            if ("parent=" + bone["short"]) in report:
                 parent = bone
                 break
         if parent is None:
             for bone in bones:
-                if _short(bone["name"]) in report:
+                if bone["short"] in report:
                     parent = bone
                     break
-    if parent is None and bones:
-        parent = bones[0]
-
     axis, origin = [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]
     if parent is not None:
-        inverse = mc.getAttr("%s.bindPreMatrix[%d]" % (parent["_skin"],
-                                                      parent["index"]))
-        origin = [float(inverse[12]), float(inverse[13]), float(inverse[14])]
-        # 逆矩阵的第一行 = 原始 bind 矩阵第一列（Maya 行向量约定下的 X 轴）。
-        candidate = [float(inverse[0]), float(inverse[1]), float(inverse[2])]
-        length = math.sqrt(sum(v * v for v in candidate))
-        if length > 1e-9:
-            axis = [v / length for v in candidate]
-    return axis, origin
+        axis = list(parent["bindAxis"])
+        origin = list(parent["bindPosition"])
+    return axis, origin, (parent["short"] if parent else None)
 
 
-def _ring_table(bind_points, axis, origin, cor_points, final_points):
-    """按铰链轴上的 station 分环，给出每环位移与归一化斜率。"""
+def _ring_table(bind_points, axis, origin, cor_points, final_points,
+                sparse, ring_hint=None):
     stations = [sum((point[i] - origin[i]) * axis[i] for i in range(3))
                 for point in bind_points]
     if not stations:
         return []
-    ordered = sorted(stations)
-    gaps = [b - a for a, b in zip(ordered, ordered[1:]) if b - a > 1e-9]
+    uniq = sorted({round(s, 5) for s in stations})
+    gaps = [b - a for a, b in zip(uniq, uniq[1:]) if b - a > 1e-6]
     if not gaps:
         return []
-    width = min(gaps) * 0.5
+    # 用**中位**间隔，不是最小间隔：浮点噪声否则会拆出几百个假环。
+    gaps.sort()
+    width = gaps[len(gaps) // 2]
+    if width <= 0:
+        return []
     buckets = {}
     for vertex, station in enumerate(stations):
-        key = int(math.floor(station / width + 0.5))
+        key = int(math.floor((station - uniq[0]) / width + 0.5))
         buckets.setdefault(key, []).append(vertex)
 
     def distance(a, b):
@@ -263,6 +296,17 @@ def _ring_table(bind_points, axis, origin, cor_points, final_points):
         total = [distance(final_points[v], bind_points[v]) for v in members]
         cor = [distance(cor_points[v], bind_points[v]) for v in members]
         extra = [distance(final_points[v], cor_points[v]) for v in members]
+        # 有效权重：该环上出现过的 influence 权重范围，能直接看出单骨/混权。
+        counts = {}
+        for index in sparse[members[0]]:
+            counts[index] = []
+        for vertex in members:
+            for index, value in sparse[vertex].items():
+                counts.setdefault(index, []).append(value)
+        spread = {}
+        for index, values in counts.items():
+            if values:
+                spread[str(index)] = [min(values), max(values)]
         mean = lambda values: sum(values) / len(values)
         table.append({
             "ring": key,
@@ -273,6 +317,8 @@ def _ring_table(bind_points, axis, origin, cor_points, final_points):
             "meanCorShift": mean(cor),
             "meanOcdExtra": mean(extra),
             "maxOcdExtra": max(extra),
+            "weightSpread": spread,
+            "mixed": int(sum(1 for v in members if len(sparse[v]) > 1)),
             "vertices": members,
         })
     for previous, current in zip(table, table[1:]):
@@ -318,23 +364,27 @@ def main(path=None):
 
     rest_shape, rest_transform = _rest_geometry(skin)
     bind_points, faces = _mesh_arrays(rest_shape, om)
+    count = len(bind_points)
 
     cor_points = _evaluate(deformed, 0, skin, om)
     ocd_points = _evaluate(deformed, 3, skin, om)
     final_points = _evaluate(deformed, 5, skin, om)
-    if not (len(cor_points) == len(bind_points) == len(final_points)):
+    if not (len(cor_points) == count == len(final_points)):
         raise RuntimeError("顶点数不一致：rest=%d cor=%d final=%d"
-                           % (len(bind_points), len(cor_points), len(final_points)))
+                           % (count, len(cor_points), len(final_points)))
 
     bones = []
     for index, node in _influences(skin):
-        entry = {"index": index, "name": node, "short": _short(node),
-                 "_skin": skin}
-        entry["worldMatrix"] = [float(v) for v in
-                                mc.getAttr("%s.worldMatrix[0]" % node)]
-        entry["bindPreMatrix"] = [float(v) for v in
-                                  mc.getAttr("%s.bindPreMatrix[%d]" % (skin, index))]
-        bones.append(entry)
+        bones.append({
+            "index": index,
+            "name": node,
+            "short": _short(node),
+            "worldMatrix": [float(v) for v in
+                            mc.getAttr("%s.worldMatrix[0]" % node)],
+            "bindPreMatrix": [float(v) for v in
+                              mc.getAttr("%s.bindPreMatrix[%d]" % (skin, index))],
+        })
+    _bind_positions(bones)
 
     attributes = {}
     for name in SCALAR_ATTRS:
@@ -348,28 +398,28 @@ def main(path=None):
             channels[name] = value
 
     report = attributes.get("ocdHingeReport") or ""
-    axis, origin = _hinge_frame(bones, report)
-    for bone in bones:
-        bone.pop("_skin", None)
+    axis, origin, hinge_parent = _hinge_frame(bones, report)
 
-    weights = _weights(skin, len(bind_points))
-    rings = _ring_table(bind_points, axis, origin, cor_points, final_points)
+    sparse = _sparse_weights(skin, count)
+    rings = _ring_table(bind_points, axis, origin, cor_points, final_points,
+                        sparse)
 
     payload = {
         "mayaVersion": mc.about(version=True),
         "scene": mc.file(query=True, sceneName=True) or "(untitled)",
         "skin": skin,
         "shapes": {"rest": rest_shape, "deformed": deformed},
-        "mesh": {"vertexCount": len(bind_points), "faces": faces,
+        "mesh": {"vertexCount": count, "faces": faces,
                  "bindPoints": bind_points,
                  "worldMatrix": [float(v) for v in
                                  mc.getAttr(rest_transform + ".worldMatrix[0]")]},
         "bones": bones,
-        "weights": weights,
+        "weightsSparse": [{str(k): v for k, v in row.items()} for row in sparse],
         "attributes": attributes,
         "channels": channels,
         "ocdCenterOffsets": _attr(skin, "ocdCenterOffsets"),
-        "hinge": {"report": report, "axis": axis, "origin": origin},
+        "hinge": {"report": report, "axis": axis, "origin": origin,
+                  "parent": hinge_parent},
         "points": {"cor": cor_points, "ocd": ocd_points, "final": final_points},
         "rings": rings,
     }
@@ -377,40 +427,51 @@ def main(path=None):
     with open(target, "w") as handle:
         json.dump(payload, handle)
 
-    print("=" * 78)
+    # ---- 控制台摘要 ----
+    print("=" * 80)
     print("导出:", target, "(%.2f MB)" % (os.path.getsize(target) / 1048576.0))
     print("场景:", payload["scene"])
-    print("网格: %d 顶点 / %d 面   蒙皮: %s" % (len(bind_points), len(faces), skin))
+    print("网格: %d 顶点 / %d 面   蒙皮: %s" % (count, len(faces), skin))
     print("骨骼 (%d):" % len(bones))
     for bone in bones:
-        print("  [%d] %s" % (bone["index"], bone["short"]))
+        print("  [%d] %-22s bind=%s" % (bone["index"], bone["short"],
+                                        [round(v, 3) for v in bone["bindPosition"]]))
     print("铰链报告:", report or "(空：把 corDebugLog 设为 1，再刷新一次视图)")
+    print("铰链轴/原点:", [round(v, 3) for v in axis],
+          [round(v, 3) for v in origin])
     print("中心限额:", attributes.get("ocdCenterLimit", "n/a"),
           " 扭转权重:", attributes.get("ocdTwistWeight", "n/a"))
-    print("注入的中心偏移:", "有 %d 个数" % len(payload["ocdCenterOffsets"])
-          if payload["ocdCenterOffsets"] else "无")
-    print("-" * 78)
-    print("%3s %9s %5s %9s %9s %9s %9s %9s"
-          % ("环", "station", "顶点", "总位移", "CoR位移", "OCD增量",
-             "斜率总", "斜率OCD"))
+
+    # 稀疏权重的真实形状
+    sizes = {}
+    for row in sparse:
+        sizes[len(row)] = sizes.get(len(row), 0) + 1
+    print("每顶点有效 influence 数分布:", dict(sorted(sizes.items())))
+    per_influence = {}
+    for row in sparse:
+        for index in row:
+            per_influence[index] = per_influence.get(index, 0) + 1
+    print("每个 influence 影响到的顶点数:", dict(sorted(per_influence.items())))
+
+    print("-" * 80)
+    print("%4s %8s %5s %8s %9s %9s %9s %6s"
+          % ("环", "station", "顶点", "|cor-B|", "|fin-B|", "OCD增量", "混权数", "环宽"))
     for row in rings:
-        print("%3d %9.4f %5d %9.4f %9.4f %9.4f %9.4f %9.4f"
+        print("%4d %8.3f %5d %8.4f %9.4f %9.4f %9d"
               % (row["ring"], row["station"], row["count"],
-                 row["meanTotalShift"], row["meanCorShift"],
-                 row["meanOcdExtra"], row["slopeTotal"], row["slopeOcd"]))
-    print("=" * 78)
-    print("把这个 JSON 发给我。看「斜率总 / 斜率OCD」哪几环突变就是红圈。")
+                 row["meanCorShift"], row["meanTotalShift"],
+                 row["meanOcdExtra"], row["mixed"]))
+    print("=" * 80)
+    print("把这个 JSON 发给我。")
     return target
 
 
-# 既支持 mayapy 命令行，也支持把整个文件内容粘进 Maya 脚本编辑器执行。
-# 粘进去时 __name__ 不是 "__main__"，所以这里无条件尝试一次。
 if __name__ == "__main__":
     main(sys.argv[1] if len(sys.argv) > 1 else None)
 else:
     try:
         main()
-    except Exception as _exc:  # noqa: BLE001 - 让脚本编辑器里能看到原因
+    except Exception as _exc:  # noqa: BLE001
         import traceback
         traceback.print_exc()
         print("导出失败，请检查是否选中了带 OCD 蒙皮的网格：", _exc)
