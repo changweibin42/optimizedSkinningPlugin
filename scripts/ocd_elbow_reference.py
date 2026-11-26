@@ -346,18 +346,9 @@ def center_response(weights, rotations):
     return np.einsum("nk,kij->nij",weights,rotation_matrix(q))-rotation_matrix(blend)
 
 
-def hinge_displacement(bind, original, weights, bend, twist, direction):
+def hinge_section(station, depth, radius, weights, angle):
     """Construct the two offset limb profiles in the signed bend plane."""
     import numpy as np
-    points = np.asarray(bind, dtype=float)
-    station, y, z = points.T
-    plane = radians(direction + (180 if bend < 0 else 0))
-    angle = radians(abs(bend))
-    # End-bone participation counts the half-angle helper at its bend fraction.
-    phase = radians(twist) * (weights[:,1] + (0.35*weights[:,2] if weights.shape[1]>2 else 0))
-    depth = y*np.cos(phase-plane) - z*np.sin(phase-plane)
-    lateral = y*np.sin(phase-plane) + z*np.cos(phase-plane)
-    radius = np.max(np.hypot(y,z))
     distance = np.abs(station)
     # Inner offset lines intersect on the bisector. Limit their axial travel
     # by the span of the mixed-weight region when the limbs approach parallel.
@@ -396,7 +387,7 @@ def hinge_displacement(bind, original, weights, bend, twist, direction):
     extra = arc_length-tangent_station
     # Gather convex-side material toward the hinge along its existing arc.
     # The remapping is increasing and matches rigid arc travel at support.
-    side = outer_radius/np.maximum(np.hypot(y,z),1e-12)
+    side = (depth<0).astype(float)
     gather = 0.85*sin(half)*side**2
     material = distance*(1-gather*(1-u)**2)
     join = u**3*(4-3*u)
@@ -409,12 +400,30 @@ def hinge_displacement(bind, original, weights, bend, twist, direction):
     height = np.where(depth<0,arc_height,height)
     x = np.where(station<=0,-outward,cos(angle)*outward-sin(angle)*height)
     h = np.where(station<=0,height,sin(angle)*outward+cos(angle)*height)
+    return np.column_stack((x,h))
+
+
+def hinge_displacement(bind, original, weights, bend, twist, direction):
+    """Apply a common signed through-thickness gradient about the neutral layer."""
+    import numpy as np
+    station,y,z = np.asarray(bind,dtype=float).T
+    plane = radians(direction + (180 if bend<0 else 0))
+    phase = radians(twist)*weights[:,1]
+    if weights.shape[1]>2:
+        phase += radians(twist)*0.35*weights[:,2]
+    depth = y*np.cos(phase-plane)-z*np.sin(phase-plane)
+    lateral = y*np.sin(phase-plane)+z*np.cos(phase-plane)
+    radius = np.max(np.hypot(y,z))
+    if radius<=1e-12:
+        return np.zeros_like(original)
+    ext = np.full_like(station,radius)
+    inner = hinge_section(station,ext,radius,weights,radians(abs(bend)))
+    outer = hinge_section(station,-ext,radius,weights,radians(abs(bend)))
+    neutral = (inner+outer)*0.5
+    gradient = (inner-outer)/(2*radius)
+    x,h = (neutral+depth[:,None]*gradient).T
     target = np.column_stack((x,h*cos(plane)-lateral*sin(plane),h*sin(plane)+lateral*cos(plane)))
-    # Near the lateral meridian the two rigid offset profiles carry little
-    # thickness information. Retain the multi-influence rotation there.
-    radial = np.maximum(np.hypot(y,z),1e-12)
-    h = np.clip(np.abs(depth)/radial,0,1)
-    return (target-original)*(0.55+0.45*h*h*(3-2*h))[:,None]
+    return target-original
 
 
 def local_edges(bind, faces):
@@ -542,7 +551,7 @@ def show(three_bone=True, center_limit=16.0):
     from maya.api import OpenMaya as om
     if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "CoRConvexGatherWindow" + ("Three" if three_bone else "Two")
+    win = "CoRBalancedSectionWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
@@ -840,6 +849,22 @@ def show(three_bone=True, center_limit=16.0):
                 gaps = np.linalg.norm(meridian-meridian[HALF_RINGS],axis=1)
                 print("outer distance to crease | -2 %.5f | -1 %.5f | +1 %.5f | +2 %.5f" %
                       tuple(gaps[HALF_RINGS+np.array([-2,-1,1,2])]))
+            if abs(twist)<1e-6:
+                # Use the actual flank vertices as an independent neutral reference.
+                angle = radians(direction)
+                axes = np.array([[1,0,0],[0,cos(angle),sin(angle)]])
+                for row in (-1,1):
+                    ring = grid_points[HALF_RINGS+row]@axes.T
+                    a = ring[outer_center]
+                    b = ring[(outer_center+SIDES//2)%SIDES]
+                    neutral = (ring[(outer_center+SIDES//4)%SIDES]+
+                               ring[(outer_center-SIDES//4)%SIDES])/2
+                    chord = b-a
+                    offset = ring-a
+                    deviations = abs(offset[:,0]*chord[1]-offset[:,1]*chord[0])
+                    print("section %+d | balance %.5f | max deviation %.5f" %
+                          (row,np.linalg.norm(a+b-2*neutral),
+                           deviations.max()/max(np.linalg.norm(chord),1e-12)))
             for row in (-5,-4,-3):
                 ids = (HALF_RINGS+row)*SIDES+np.arange(SIDES)
                 travel = meshes[1][ids,0]-np.asarray(bind)[ids,0]
