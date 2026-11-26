@@ -359,17 +359,21 @@ def hinge_displacement(bind, original, weights, bend, twist, direction):
     rigid_edges = distance[(~mixed) & (distance>reach)]
     support = rigid_edges.min() if rigid_edges.size else reach + radius
     raw = np.maximum(depth,0) * tan(angle/2)
-    shift = raw / np.sqrt(1+(2*raw/support)**2)
+    shift = raw / np.sqrt(1+(raw/(0.95*support))**2)
     # Quadratic relaxation makes the inner longitudinal gap smallest at the
     # crease. The derivative of the station mapping stays positive.
     inner_fade = np.maximum(1-distance/support,0)**2
-    inner_travel = shift * inner_fade
+    # Allocate the remaining axial span after the crease moves, maintaining
+    # positive longitudinal spacing even at a deep bend.
+    u = np.minimum(distance/support,1.)
+    inner_travel = shift*(1-u)
+
     outward = distance + inner_travel
     height = depth.copy()
     # The softened inner miter needs a matching intersection height so both
     # halves meet at station zero. Blend back to the bind offset along the limb.
     if angle > 1e-8:
-        height += (shift/tan(angle/2)-np.maximum(depth,0))*inner_fade
+        height += (shift/tan(angle/2)-np.maximum(depth,0))*(1-u)
     # Exact circular fillet tangent to both rigid offset lines. Traverse it
     # by arc length and let the additional length decay to zero at support.
     # The radius is proportional to meridian depth, so the flank limit is rigid.
@@ -389,7 +393,11 @@ def hinge_displacement(bind, original, weights, bend, twist, direction):
     x = np.where(station<=0,-outward,cos(angle)*outward-sin(angle)*height)
     h = np.where(station<=0,height,sin(angle)*outward+cos(angle)*height)
     target = np.column_stack((x,h*cos(plane)-lateral*sin(plane),h*sin(plane)+lateral*cos(plane)))
-    return target-original
+    # Near the lateral meridian the two rigid offset profiles carry little
+    # thickness information. Retain the multi-influence rotation there.
+    radial = np.maximum(np.hypot(y,z),1e-12)
+    h = np.clip(np.abs(depth)/radial,0,1)
+    return (target-original)*(h*h*(3-2*h))[:,None]
 
 
 def local_edges(bind, faces):
@@ -517,7 +525,7 @@ def show(three_bone=True, center_limit=16.0):
     from maya.api import OpenMaya as om
     if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "CoRLocalBendWindow" + ("Three" if three_bone else "Two")
+    win = "CoRSectorBendWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
