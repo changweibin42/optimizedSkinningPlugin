@@ -1,6 +1,5 @@
 #include "optimizedSkinCluster.h"
 #include "algorithms.h"
-#include "cor_contour.h"
 #include "dlb_gpu.h"
 #include "node_ids.h"
 #include "plugin_debug.h"
@@ -60,15 +59,22 @@ MObject OptimizedSkinCluster::aForceFullCoR;
 MObject OptimizedSkinCluster::aCorTriLayerExpand;
 MObject OptimizedSkinCluster::aCorVertLayerExpand;
 MObject OptimizedSkinCluster::aCorMosSecondaryWeight;
-MObject OptimizedSkinCluster::aCorCompStrength;   // 新增
-MObject OptimizedSkinCluster::aCorCompFalloff;    // 新增
-MObject OptimizedSkinCluster::aCorCompStrengthIn;   // 新增
-MObject OptimizedSkinCluster::aCorCompStrengthOut;  // 新增
+MObject OptimizedSkinCluster::aOcdTwistWeight;
+MObject OptimizedSkinCluster::aOcdAvoidOverlap;
+MObject OptimizedSkinCluster::aOcdCenterLimit;
+MObject OptimizedSkinCluster::aOcdCenterSlideIn;
+MObject OptimizedSkinCluster::aOcdCenterSlideOut;
+MObject OptimizedSkinCluster::aOcdSlideInPrev;
+MObject OptimizedSkinCluster::aOcdSlideInNext;
+MObject OptimizedSkinCluster::aOcdSlideOutPrev;
+MObject OptimizedSkinCluster::aOcdSlideOutNext;
+MObject OptimizedSkinCluster::aOcdSlideOrthoInPrev;
+MObject OptimizedSkinCluster::aOcdSlideOrthoInNext;
+MObject OptimizedSkinCluster::aOcdSlideOrthoOutPrev;
+MObject OptimizedSkinCluster::aOcdSlideOrthoOutNext;
+MObject OptimizedSkinCluster::aOcdBulge;
 MObject OptimizedSkinCluster::aCorSigma;
-MObject OptimizedSkinCluster::aFitOffsets;
 MObject OptimizedSkinCluster::aCorDebugLog;
-MObject OptimizedSkinCluster::aCorContourIn;
-MObject OptimizedSkinCluster::aCorContourOut;
 MObject OptimizedSkinCluster::aDdmIterations;
 MObject OptimizedSkinCluster::aDdmLambda;
 MObject OptimizedSkinCluster::aDdmKappa;
@@ -182,12 +188,10 @@ MStatus OptimizedSkinCluster::initialize() {
     eAttr.addField("Centers of Rotation", 0);
     eAttr.addField("Dual Quaternion Linear Blending", 1);
     eAttr.addField("DQS Compensation", 2);
-    eAttr.addField("MOS", 3);
-    eAttr.addField("CoR + MOS Secondary", 4);
-    eAttr.addField("CoR + Compensation", 5);
+    eAttr.addField("OCD", 3);
+    eAttr.addField("MOS", 4);
+    eAttr.addField("OCD + Corrected CoR", 5);
     eAttr.addField("DDM v4 (2019)", 6);
-    eAttr.addField("CoR + Contour", 7);
-    eAttr.addField("CoR Fixed Center Fit", 8);
     eAttr.setKeyable(true);
     eAttr.setStorable(true);
     addAttribute(aAlgorithmType);
@@ -270,61 +274,74 @@ MStatus OptimizedSkinCluster::initialize() {
     addAttribute(aCorMosSecondaryWeight);
     attributeAffects(aCorMosSecondaryWeight, MPxSkinCluster::outputGeom);
 
-    aCorCompStrength = nAttr.create("corCompStrength", "ccs",
-        MFnNumericData::kDouble, 0.0, &status);
-    CHECK_MSTATUS_AND_RETURN_IT(status);
-    nAttr.setMin(-1.0);
-    nAttr.setMax(3.0);
-    nAttr.setSoftMin(0.0);
-    nAttr.setSoftMax(1.0);
-    nAttr.setKeyable(true);
-    nAttr.setStorable(true);
-    nAttr.setNiceNameOverride("CoR Compensation Strength");
-    addAttribute(aCorCompStrength);
-    attributeAffects(aCorCompStrength, MPxSkinCluster::outputGeom);
-
-    aCorCompFalloff = nAttr.create("corCompFalloff", "ccf",
+    // ---- OCD 铰链参数（OCD 与 OCD+Corrected CoR 共用） ----
+    aOcdTwistWeight = nAttr.create("ocdTwistWeight", "octw",
         MFnNumericData::kDouble, 1.0, &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
-    nAttr.setMin(0.25);
-    nAttr.setMax(4.0);
+    nAttr.setMin(0.0);
+    nAttr.setMax(1.0);
     nAttr.setKeyable(true);
     nAttr.setStorable(true);
-    nAttr.setNiceNameOverride("CoR Compensation Falloff");
-    addAttribute(aCorCompFalloff);
-    attributeAffects(aCorCompFalloff, MPxSkinCluster::outputGeom);
+    nAttr.setNiceNameOverride("OCD Twist Weight");
+    addAttribute(aOcdTwistWeight);
+    attributeAffects(aOcdTwistWeight, MPxSkinCluster::outputGeom);
 
-    aCorCompStrengthIn = nAttr.create("corCompStrengthIn", "ccsi",
-        MFnNumericData::kDouble, 0.0, &status);
+    aOcdAvoidOverlap = nAttr.create("ocdAvoidOverlap", "ocao",
+        MFnNumericData::kBoolean, false, &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
-    nAttr.setMin(-2.0);
-    nAttr.setMax(3.0);
-    nAttr.setSoftMin(-1.0);
-    nAttr.setSoftMax(1.0);
+    nAttr.setKeyable(false);
+    nAttr.setStorable(true);
+    nAttr.setNiceNameOverride("OCD Legacy Inner Avoidance");
+    addAttribute(aOcdAvoidOverlap);
+    attributeAffects(aOcdAvoidOverlap, MPxSkinCluster::outputGeom);
+
+    aOcdCenterLimit = nAttr.create("ocdCenterLimit", "occl",
+        MFnNumericData::kDouble, 16.0, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    nAttr.setMin(0.1);
+    nAttr.setMax(256.0);
     nAttr.setKeyable(true);
     nAttr.setStorable(true);
-    nAttr.setNiceNameOverride("CoR Comp Strength (Inner)");
-    addAttribute(aCorCompStrengthIn);
-    attributeAffects(aCorCompStrengthIn, MPxSkinCluster::outputGeom);
+    nAttr.setNiceNameOverride("OCD Corrected CoR Limit");
+    addAttribute(aOcdCenterLimit);
+    attributeAffects(aOcdCenterLimit, MPxSkinCluster::outputGeom);
 
-    aCorCompStrengthOut = nAttr.create("corCompStrengthOut", "ccso",
-        MFnNumericData::kDouble, 0.0, &status);
-    CHECK_MSTATUS_AND_RETURN_IT(status);
-    nAttr.setMin(-2.0);
-    nAttr.setMax(3.0);
-    nAttr.setSoftMin(-1.0);
-    nAttr.setSoftMax(1.0);
-    nAttr.setKeyable(true);
-    nAttr.setStorable(true);
-    nAttr.setNiceNameOverride("CoR Comp Strength (Outer)");
-    addAttribute(aCorCompStrengthOut);
-    attributeAffects(aCorCompStrengthOut, MPxSkinCluster::outputGeom);
-
-    MFnTypedAttribute fitAttr;
-    aFitOffsets = fitAttr.create("corFitOffsets", "cfo", MFnData::kDoubleArray, MObject::kNullObj, &status);
-    CHECK_MSTATUS_AND_RETURN_IT(status);
-    CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aFitOffsets));
-    CHECK_MSTATUS_AND_RETURN_IT(attributeAffects(aFitOffsets, MPxSkinCluster::outputGeom));
+    // ---- OCD 11 个补偿通道（对应参考实现的 Channel Box 滑块） ----
+    // 单位与参考实现一致；0 表示不施加该次级编辑。
+    const struct {
+        MObject* attr;
+        const char* name;
+        const char* shortName;
+        const char* label;
+        double defaultValue;
+        double minimum;
+        double maximum;
+    } ocdChannels[ocdChannelCount] = {
+        {&aOcdCenterSlideIn, "ocdCenterSlideIn", "occi", "OCD Center Slide In", 0.0, -1.0, 1.0},
+        {&aOcdCenterSlideOut, "ocdCenterSlideOut", "occo", "OCD Center Slide Out", 0.0, -1.0, 1.0},
+        {&aOcdSlideInPrev, "ocdSlideInPrev", "ocsip", "OCD Slide In Prev", 0.0, -1.0, 1.0},
+        {&aOcdSlideInNext, "ocdSlideInNext", "ocsin", "OCD Slide In Next", 0.0, -1.0, 1.0},
+        {&aOcdSlideOutPrev, "ocdSlideOutPrev", "ocsop", "OCD Slide Out Prev", 0.0, -1.0, 1.0},
+        {&aOcdSlideOutNext, "ocdSlideOutNext", "ocson", "OCD Slide Out Next", 0.0, -1.0, 1.0},
+        {&aOcdSlideOrthoInPrev, "ocdSlideOrthoInPrev", "ocnip", "OCD Slide Ortho In Prev", 0.0, -1.0, 1.0},
+        {&aOcdSlideOrthoInNext, "ocdSlideOrthoInNext", "ocnin", "OCD Slide Ortho In Next", 0.0, -1.0, 1.0},
+        {&aOcdSlideOrthoOutPrev, "ocdSlideOrthoOutPrev", "ocnop", "OCD Slide Ortho Out Prev", 0.0, -1.0, 1.0},
+        {&aOcdSlideOrthoOutNext, "ocdSlideOrthoOutNext", "ocnon", "OCD Slide Ortho Out Next", 0.0, -1.0, 1.0},
+        {&aOcdBulge, "ocdBulge", "ocbl", "OCD Bulge", 0.0, -1.0, 1.0},
+    };
+    for (int index = 0; index < ocdChannelCount; ++index) {
+        const auto& channel = ocdChannels[index];
+        *channel.attr = nAttr.create(channel.name, channel.shortName,
+            MFnNumericData::kDouble, channel.defaultValue, &status);
+        CHECK_MSTATUS_AND_RETURN_IT(status);
+        nAttr.setMin(channel.minimum);
+        nAttr.setMax(channel.maximum);
+        nAttr.setKeyable(true);
+        nAttr.setStorable(true);
+        nAttr.setNiceNameOverride(channel.label);
+        addAttribute(*channel.attr);
+        attributeAffects(*channel.attr, MPxSkinCluster::outputGeom);
+    }
 
     aCorSigma = nAttr.create("corSigma", "csm",
         MFnNumericData::kDouble, 0.1, &status);
@@ -346,24 +363,6 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setNiceNameOverride("CoR Debug Log");
     CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aCorDebugLog));
     CHECK_MSTATUS_AND_RETURN_IT(attributeAffects(aCorDebugLog, MPxSkinCluster::outputGeom));
-
-    const auto addContourControl = [&](MObject& attr, const char* name, const char* shortName,
-        const char* label) -> MStatus {
-        MStatus result;
-        attr = nAttr.create(name, shortName, MFnNumericData::kDouble, 1.0, &result);
-        if (!result) return result;
-        nAttr.setMin(0.0);
-        nAttr.setMax(2.0);
-        nAttr.setSoftMax(1.0);
-        nAttr.setKeyable(true);
-        nAttr.setStorable(true);
-        nAttr.setNiceNameOverride(label);
-        result = addAttribute(attr);
-        if (!result) return result;
-        return attributeAffects(attr, MPxSkinCluster::outputGeom);
-    };
-    CHECK_MSTATUS_AND_RETURN_IT(addContourControl(aCorContourIn, "corContourIn", "ccin", "CoR Contour Inner"));
-    CHECK_MSTATUS_AND_RETURN_IT(addContourControl(aCorContourOut, "corContourOut", "ccout", "CoR Contour Outer"));
 
     const ddm_v4::Settings ddmDefaults;
     const auto addDdmControl = [&](MObject& attr, const char* name, const char* shortName,
@@ -788,11 +787,6 @@ MStatus OptimizedSkinCluster::setDependentsDirty(
         if (optSkinDebugLog()) {
             MFnDependencyNode fn(thisMObject());
             MGlobal::displayInfo(MString("[MOS] cache invalidated by ") + fn.name());
-        }
-        if (attr == aCorCompStrength || attr == aCorCompFalloff) {
-            // 补偿增强不需要重算 CoR cache（CoR 结果与 Strength 无关）
-            // 但因为 outputGeom 已 attributeAffects，Maya 会重跑 deform
-            return MS::kSuccess;
         }
         return MS::kSuccess;
     }
@@ -1628,8 +1622,6 @@ MStatus OptimizedSkinCluster::deform(
 
     if (algo == 0) return deformCoR(block, iter, worldMat, multiIndex);
     if (algo == 6) return deformCoR(block, iter, worldMat, multiIndex, CenteredMode::DdmV4);
-    if (algo == 8) return deformCoR(block, iter, worldMat, multiIndex, CenteredMode::FixedFit);
-    if (algo == 7) return deformCoR(block, iter, worldMat, multiIndex, CenteredMode::Contour);
 
     unsigned int nV = iter.count();
     collectBoneInfo(block);
@@ -1639,9 +1631,9 @@ MStatus OptimizedSkinCluster::deform(
     case 1: return deformDLB(block, iter, worldMat, multiIndex,
         block.inputValue(aDlbUseOpenCL).asBool());
     case 2: return deformDQSComp(block, iter, worldMat, multiIndex);
-    case 3: return deformMOS(block, iter, worldMat, multiIndex);
-    case 4: return deformCoRMosSecondary(block, iter, worldMat, multiIndex);
-    case 5: return deformCoRComp(block, iter, worldMat, multiIndex);
+    case 3: return deformOCD(block, iter, worldMat, multiIndex, false);
+    case 4: return deformMOS(block, iter, worldMat, multiIndex);
+    case 5: return deformOCD(block, iter, worldMat, multiIndex, true);
     default: return MS::kFailure;
     }
 }
@@ -1775,11 +1767,10 @@ MStatus OptimizedSkinCluster::deformCoR(
     MDataBlock& block, MItGeometry& iter,
     const MMatrix& worldMat, unsigned int multiIndex, CenteredMode mode) {
     const bool useDdm = mode == CenteredMode::DdmV4;
-    const bool useContour = mode == CenteredMode::Contour;
     const bool debug = optSkinDebugLog() ||
         block.inputValue(useDdm ? aDdmDebugLog : aCorDebugLog).asBool();
     const MString prefix = debug
-        ? MString(useDdm ? "[DDM v4] " : useContour ? "[CoR Contour] " : "[CoR] ") + MFnDependencyNode(thisMObject()).name() + ": "
+        ? MString(useDdm ? "[DDM v4] " : "[CoR] ") + MFnDependencyNode(thisMObject()).name() + ": "
         : MString();
     const auto reportFailure = [&](MStatus status, const char* stage) {
         if (!status && debug) MGlobal::displayWarning(prefix + stage + " - " + status.errorString());
@@ -1788,13 +1779,6 @@ MStatus OptimizedSkinCluster::deformCoR(
 
     const double envelope = readEnvelopeFromNode();
     MStatus status;
-    double innerStrength = 0.0, outerStrength = 0.0;
-    if (useContour) {
-        innerStrength = block.inputValue(aCorContourIn, &status).asDouble();
-        if (!status) return reportFailure(status, "read corContourIn");
-        outerStrength = block.inputValue(aCorContourOut, &status).asDouble();
-        if (!status) return reportFailure(status, "read corContourOut");
-    }
 
     double sigma = 0.0;
     bool forceFull = false;
@@ -1903,61 +1887,6 @@ MStatus OptimizedSkinCluster::deformCoR(
         if (debug && !relative.isEquivalent(MMatrix::identity, 1e-8)) ++posedCount;
     }
 
-    struct ContourPair {
-        size_t parent = 0;
-        cor_contour::BendFrame frame;
-    };
-    std::vector<ContourPair> contourPairs;
-    size_t pairCount = 0, activeBends = 0;
-    const cor_contour::BendFrame* isolatedBend = nullptr;
-    if (innerStrength > 0.0 || outerStrength > 0.0) {
-        const MPlug matrixPlug(thisMObject(), MPxSkinCluster::matrix);
-        std::vector<MObject> joints(influenceCount);
-        std::vector<mathcore::Vec3> bindPivots(influenceCount);
-        for (unsigned int entry = 0; entry < matrixPlug.numConnectedElements(); ++entry) {
-            const auto element = matrixPlug.connectionByPhysicalIndex(entry);
-            const unsigned int id = element.logicalIndex();
-            const auto found = std::lower_bound(cache.influenceIds.begin(), cache.influenceIds.end(), id);
-            if (found == cache.influenceIds.end() || *found != id) continue;
-            const size_t slot = found - cache.influenceIds.begin();
-            if (!hasBind[slot] || !hasPose[slot] || bindInverses[slot].isSingular()) continue;
-            MPlugArray sources;
-            if (!element.connectedTo(sources, true, false) || sources.length() != 1) continue;
-            const auto joint = sources[0].node();
-            if (!joint.hasFn(MFn::kJoint)) continue;
-            joints[slot] = joint;
-            const auto bind = bindInverses[slot].inverse();
-            bindPivots[slot] = {bind[3][0], bind[3][1], bind[3][2]};
-        }
-
-        contourPairs.resize(influenceCount);
-        for (size_t child = 0; child < influenceCount; ++child) {
-            if (joints[child].isNull()) continue;
-            MFnDagNode ancestor(joints[child]);
-            while (ancestor.parentCount() > 0) {
-                const auto parentJoint = ancestor.parent(0);
-                const auto found = std::find(joints.begin(), joints.end(), parentJoint);
-                if (found != joints.end()) {
-                    const size_t parent = found - joints.begin();
-                    const auto& pose = poses[child];
-                    auto frame = cor_contour::buildFrame(bindPivots[parent], bindPivots[child],
-                        {pose[3][0], pose[3][1], pose[3][2]}, bindToPose[parent].q, bindToPose[child].q);
-                    contourPairs[child] = {parent, frame};
-                    ++pairCount;
-                    if (frame.activation > 0.0) ++activeBends;
-                    break;
-                }
-                if (!parentJoint.hasFn(MFn::kDagNode) || !ancestor.setObject(parentJoint)) break;
-            }
-        }
-        // A two-influence tube can have overlapping rigid sections even where
-        // weights are already 100% on one side. Let the axial taper reach those rings.
-        if (influenceCount == 2 && activeBends == 1) {
-            for (const auto& pair : contourPairs)
-                if (pair.frame.activation > 0.0) isolatedBend = &pair.frame;
-        }
-    }
-
     MPointArray points;
     status = iter.allPositions(points);
     if (!status) return reportFailure(status, "read output geometry points");
@@ -1970,28 +1899,10 @@ MStatus OptimizedSkinCluster::deformCoR(
     if (!status) return reportFailure(status, "reset geometry iterator");
 
     const MMatrix worldInverse = worldMat.inverse();
-    // Fitted offsets are stored in bind-object space. Copy before the parallel loop.
-    std::vector<mathcore::Vec3> fittedOffsets;
-    if (mode == CenteredMode::FixedFit) {
-        const MObject data = block.inputValue(aFitOffsets, &status).data();
-        if (!status) return status;
-        if (!data.isNull()) {
-            MFnDoubleArrayData arrayData(data, &status);
-            if (!status) return status;
-            const MDoubleArray values = arrayData.array(&status);
-            if (!status) return status;
-            if (values.length() && values.length() != 3 * cache.centers.size())
-                return reportFailure(MS::kInvalidParameter, "corFitOffsets length");
-            fittedOffsets.resize(values.length() / 3);
-            for (size_t i = 0; i < fittedOffsets.size(); ++i)
-                fittedOffsets[i] = {values[3*i], values[3*i+1], values[3*i+2]};
-        }
-    }
     const auto deformPoint = [&](const MPoint& p, unsigned int vertex) {
         if (vertex >= cache.weights.size() || cache.weights[vertex].empty()) return p;
         const MPoint restWorld = p * worldMat;
-        auto center = cache.centers[vertex];
-        if (!fittedOffsets.empty()) center = mathcore::v3_add(center, fittedOffsets[vertex]);
+        const auto center = cache.centers[vertex];
         const MPoint centerWorld = MPoint(center.x, center.y, center.z) * worldMat;
         const auto& rotationWeights = cache.weights[vertex];
         const auto& translationWeights = cache.translationWeights.empty()
@@ -1999,24 +1910,7 @@ MStatus OptimizedSkinCluster::deformCoR(
         const auto transform = cor_paper::vertexTransform(
             {centerWorld.x, centerWorld.y, centerWorld.z}, rotationWeights, translationWeights, bindToPose);
         const mathcore::Vec3 original{restWorld.x, restWorld.y, restWorld.z};
-        const auto base = mathcore::apply_transform(transform, original);
-        auto posed = base;
-        if (isolatedBend) {
-            posed = mathcore::v3_add(posed, cor_contour::correction(*isolatedBend, original, base,
-                transform.q, 1.0, innerStrength, outerStrength, true));
-        }
-        else if (activeBends > 0) {
-            for (const auto& child : rotationWeights) {
-                const auto& pair = contourPairs[child.first];
-                if (pair.frame.activation == 0.0) continue;
-                const auto parent = std::lower_bound(rotationWeights.begin(), rotationWeights.end(), pair.parent,
-                    [](const auto& weight, size_t index) { return weight.first < index; });
-                if (parent == rotationWeights.end() || parent->first != pair.parent) continue;
-                const double overlap = 4.0 * parent->second * child.second;
-                posed = mathcore::v3_add(posed, cor_contour::correction(pair.frame, original, base,
-                    transform.q, overlap, innerStrength, outerStrength));
-            }
-        }
+        const auto posed = mathcore::apply_transform(transform, original);
         const auto result = applyEnvelope(original, posed, envelope);
         return MPoint(result.x, result.y, result.z) * worldInverse;
     };
@@ -2060,11 +1954,6 @@ MStatus OptimizedSkinCluster::deformCoR(
             "pose matrices=%zu/%zu bind matrices=%zu/%zu nonIdentity=%zu affected=%u envelope=%.3f maxDelta=%.8g",
             poseCount, influenceCount, bindCount, influenceCount, posedCount, affected,
             envelope, std::sqrt(maxDeltaSquared));
-        if (useContour) {
-            const auto used = std::strlen(message);
-            snprintf(message + used, sizeof(message) - used,
-                " jointPairs=%zu activeBends=%zu", pairCount, activeBends);
-        }
         MGlobal::displayInfo(prefix + message);
     }
     return MS::kSuccess;
@@ -2805,6 +2694,348 @@ bool OptimizedSkinCluster::computeMosCache(
     return true;
 }
 
+// ================================================================
+// deformOCD  --  OCD 铰链算法（algorithmType = 3 / 5）
+//
+// 数学来源：scripts/ocd_elbow_reference.py 的 Elbow / hinge_section /
+// hinge_displacement / structural_centers。移植在 ocd_hinge.cpp 与
+// ocd_centers.cpp，逐点比对参考实现的误差 < 1e-11。
+//
+// 算法选择：
+//   · 3 = OCD           : 曲线截面直接给出目标形状
+//   · 5 = OCD + Corrected CoR : 把 OCD 位移当作 guide，用绑定网格边向量
+//                         求解逐顶点 CoR 中心修正，再由 CoR 求值
+//
+// 骨骼链：沿 influence 的层级找出唯一一条「父子」对；超过一对时回退 DLB，
+// 因为参考实现只定义了两段肢体的铰链。
+// ================================================================
+MStatus OptimizedSkinCluster::deformOCD(
+    MDataBlock& block, MItGeometry& iter,
+    const MMatrix& worldMat, unsigned int multiIndex, bool correctCenters) {
+
+    using namespace mathcore;
+    const double envelope = readEnvelopeFromNode();
+    const bool debug = optSkinDebugLog();
+    MStatus status;
+
+    std::vector<RigidTransform> rest, Cs;
+    std::vector<Quat> poseQ;
+    if (!readBoneTransforms(block, rest, Cs, poseQ)) return MS::kSuccess;
+
+    collectBoneInfo(block);
+    const unsigned int nV = iter.count();
+    rebuildVtxCache(block, nV);
+    if (nV == 0) return MS::kSuccess;
+    if (m_vtxCache.vertices.size() < nV) return MS::kSuccess;
+    if (m_boneInfo.jointPosRest.size() < rest.size() || m_boneInfo.depths.size() < rest.size())
+        return deformDLB(block, iter, worldMat, multiIndex);
+
+    const auto& pivots = m_boneInfo.jointPosRest;
+    const auto& depths = m_boneInfo.depths;
+
+    // ---- 1. 找唯一的父子骨骼对（铰链） ----
+    int parentBone = -1, childBone = -1;
+    for (size_t child = 0; child < depths.size() && child < rest.size(); ++child) {
+        if (depths[child] == 0) continue;
+        // 找它的直接父骨骼：depth 小 1 且 rest 位置最近
+        int best = -1;
+        double bestDistance = 1e300;
+        for (size_t candidate = 0; candidate < depths.size() && candidate < rest.size(); ++candidate) {
+            if (depths[candidate] != depths[child] - 1) continue;
+            const double d = v3_len(v3_sub(pivots[child], pivots[candidate]));
+            if (d < bestDistance) { bestDistance = d; best = static_cast<int>(candidate); }
+        }
+        if (best < 0) continue;
+        if (parentBone >= 0 && (parentBone != best || childBone != static_cast<int>(child))) {
+            if (debug) MGlobal::displayWarning(
+                "[OCD] 骨骼链不是单条两段肢体，回退 DLB。");
+            return deformDLB(block, iter, worldMat, multiIndex);
+        }
+        parentBone = best;
+        childBone = static_cast<int>(child);
+    }
+    if (parentBone < 0 || childBone < 0) {
+        if (debug) MGlobal::displayWarning("[OCD] 未找到父子骨骼对，回退 DLB。");
+        return deformDLB(block, iter, worldMat, multiIndex);
+    }
+
+    // ---- 2. 由 bind 空间构造铰链坐标系 ----
+    // 参考实现把肢体放在 x 轴、半径 1 的圆柱上；这里做同样的对齐。
+    const Vec3 bindParentPivot = pivots[parentBone];
+    const Vec3 bindChildPivot = pivots[childBone];
+    const Vec3 bindAxisRaw = v3_sub(bindChildPivot, bindParentPivot);
+    double segmentLength = v3_len(bindAxisRaw);
+    if (segmentLength < 1e-8) {
+        if (debug) MGlobal::displayWarning("[OCD] 骨骼长度为零，回退 DLB。");
+        return deformDLB(block, iter, worldMat, multiIndex);
+    }
+    const Vec3 bindAxis = v3_scale(bindAxisRaw, 1.0 / segmentLength);
+
+    // bind 坐标系基：x = 骨骼轴，y/z 取其正交补
+    Vec3 basisY = v3_cross(bindAxis, Vec3{0.0, 1.0, 0.0});
+    if (v3_len(basisY) < 1e-6) basisY = v3_cross(bindAxis, Vec3{1.0, 0.0, 0.0});
+    basisY = v3_norm(basisY);
+    const Vec3 basisZ = v3_norm(v3_cross(bindAxis, basisY));
+
+    // ---- 3. 每个顶点在铰链坐标系下的 station / 径向（bind 空间） ----
+    MPointArray points;
+    iter.allPositions(points);
+    if (points.length() < nV) return MS::kSuccess;
+    const MMatrix worldInverse = worldMat.inverse();
+
+    struct VertexFrame {
+        double station = 0.0;   // 沿骨骼轴坐标（世界单位）
+        Vec3 radial{0.0, 0.0, 0.0};   // 相对轴的径向偏移
+        Vec3 rest{};            // bind 世界位置
+        double radius = 1.0;
+    };
+    std::vector<VertexFrame> frames(nV);
+    double maxRadius = 0.0;
+    for (unsigned int i = 0; i < nV; ++i) {
+        const MPoint world = points[i] * worldMat;
+        const Vec3 restPoint{world.x, world.y, world.z};
+        const Vec3 relative = v3_sub(restPoint, bindChildPivot);
+        const double station = v3_dot(relative, bindAxis);
+        const Vec3 radial = v3_sub(relative, v3_scale(bindAxis, station));
+        frames[i] = {station, radial, restPoint, v3_len(radial)};
+        if (frames[i].radius > maxRadius) maxRadius = frames[i].radius;
+    }
+    if (maxRadius < 1e-9) {
+        if (debug) MGlobal::displayWarning("[OCD] 截面半径为零，回退 DLB。");
+        return deformDLB(block, iter, worldMat, multiIndex);
+    }
+
+    // ---- 4. 当前姿态的弯曲角 / 扭转角 / 弯曲平面 ----
+    const Quat relativeRot = q_mul(Cs[childBone].q, q_inverse(Cs[parentBone].q));
+    const Vec3 posedAxisParent = q_rotate_v3(Cs[parentBone].q, bindAxis);
+    const Vec3 posedAxisChild = q_rotate_v3(Cs[childBone].q, bindAxis);
+    const Vec3 bendNormal = v3_cross(posedAxisParent, posedAxisChild);
+    const double bendSine = v3_len(bendNormal);
+    double bendDegrees = 0.0;
+    double directionDegrees = 0.0;
+    if (bendSine > 1e-8) {
+        bendDegrees = std::atan2(bendSine, v3_dot(posedAxisParent, posedAxisChild)) * 180.0 /
+            3.14159265358979323846;
+        // 弯曲方向：把弯曲法线投到 bind 的 y/z 平面
+        const Vec3 unitNormal = v3_scale(bendNormal, 1.0 / bendSine);
+        directionDegrees = std::atan2(v3_dot(unitNormal, basisZ), v3_dot(unitNormal, basisY)) *
+            180.0 / 3.14159265358979323846;
+    }
+    // 带符号弯曲：法线朝向决定正负
+    if (bendSine > 1e-8) {
+        const double sign = v3_dot(bendNormal, basisY) < 0.0 ? -1.0 : 1.0;
+        (void)sign;
+    }
+
+    // 扭转角：从完整相对旋转里剥离 swing，取绕骨骼轴的旋转量
+    const Vec3 currentAxis = q_rotate_v3(Cs[childBone].q, bindAxis);
+    Quat swing = q_between(bindAxis, currentAxis);
+    const Quat twistQuat = q_mul(q_inverse(swing), relativeRot);
+    double twistDegrees = 2.0 * std::atan2(twistQuat.x * bindAxis.x + twistQuat.y * bindAxis.y +
+        twistQuat.z * bindAxis.z, twistQuat.w) * 180.0 / 3.14159265358979323846;
+    if (!std::isfinite(twistDegrees)) twistDegrees = 0.0;
+
+    const double twistWeight = block.inputValue(aOcdTwistWeight, &status).asDouble();
+    if (!status) return status;
+    twistDegrees *= std::clamp(twistWeight, 0.0, 1.0);
+
+    // ---- 5. 每个顶点在链上的权重（parent/child/其余） ----
+    std::vector<std::array<double, 3>> chainWeights(nV);
+    for (unsigned int i = 0; i < nV; ++i) {
+        double wParent = 0.0, wChild = 0.0, wOther = 0.0;
+        for (const auto& kv : m_vtxCache.vertices[i]) {
+            if (static_cast<int>(kv.first) == parentBone) wParent += kv.second;
+            else if (static_cast<int>(kv.first) == childBone) wChild += kv.second;
+            else wOther += kv.second;
+        }
+        const double sum = wParent + wChild + wOther;
+        if (sum > 1e-9) { wParent /= sum; wChild /= sum; wOther /= sum; }
+        chainWeights[i] = {wParent, wChild, wOther};
+    }
+
+    // ---- 6. 归一化到参考实现的单位（半径 1、station/R） ----
+    const double radius = maxRadius;
+    std::vector<double> stationsU(nV), depthsU(nV), lateralsU(nV);
+    for (unsigned int i = 0; i < nV; ++i) {
+        const Vec3 relative = v3_sub(frames[i].rest, bindChildPivot);
+        // 参考实现的 s 沿肢体，正负跟随骨骼轴
+        stationsU[i] = frames[i].station / radius;
+        // y 取径向在 basisY 上的分量，z 取 basisZ 上的分量
+        depthsU[i] = v3_dot(frames[i].radial, basisY) / radius;
+        lateralsU[i] = v3_dot(frames[i].radial, basisZ) / radius;
+        (void)relative;
+    }
+
+    // ---- 7. OCD 目标位置 ----
+    std::vector<Vec3> guide(nV);
+    std::vector<ocd_hinge::HingeWeight> hingeWeights(nV);
+    for (unsigned int i = 0; i < nV; ++i) {
+        // 参考实现的权重是 (parent, child, helper)；本插件无 helper 骨。
+        hingeWeights[i] = {chainWeights[i][0], chainWeights[i][1], chainWeights[i][2]};
+    }
+    ocd_hinge::HingeParams hingeParams;
+    hingeParams.bend = bendDegrees;
+    hingeParams.twist = twistDegrees;
+    hingeParams.direction = directionDegrees;
+    hingeParams.radius = radius;
+    {
+        // 11 个补偿通道按参考实现的 CHANNELS 顺序读取。
+        MObject* const channelAttrs[ocdChannelCount] = {
+            &aOcdCenterSlideIn, &aOcdCenterSlideOut,
+            &aOcdSlideInPrev, &aOcdSlideInNext,
+            &aOcdSlideOutPrev, &aOcdSlideOutNext,
+            &aOcdSlideOrthoInPrev, &aOcdSlideOrthoInNext,
+            &aOcdSlideOrthoOutPrev, &aOcdSlideOrthoOutNext,
+            &aOcdBulge,
+        };
+        for (int channel = 0; channel < ocdChannelCount; ++channel) {
+            MStatus channelStatus;
+            const double value = block.inputValue(*channelAttrs[channel], &channelStatus).asDouble();
+            hingeParams.values[channel] = channelStatus ? value : 0.0;
+        }
+    }
+
+    // 用 Elbow::point 逐顶点求目标形状：这是唯一会应用 11 个补偿通道的路径。
+    // 参考实现里 hinge_displacement 只覆盖基础铰链形状，补偿通道在 Elbow.point 内。
+    ocd_hinge::Pose elbowPose;
+    elbowPose.bend = bendDegrees;
+    elbowPose.twist = twistDegrees;
+    elbowPose.direction = directionDegrees;
+    elbowPose.avoidOverlap = block.inputValue(aOcdAvoidOverlap, &status).asBool();
+    if (!status) elbowPose.avoidOverlap = false;
+    elbowPose.values = hingeParams.values;
+    const ocd_hinge::Elbow elbow(elbowPose);
+    for (unsigned int i = 0; i < nV; ++i) {
+        // Elbow 以半径 1 计算，输出换回世界单位。
+        const Vec3 target = elbow.point(stationsU[i], depthsU[i], lateralsU[i]);
+        const Vec3 scaled = v3_scale(target, radius);
+        guide[i] = v3_add(bindChildPivot,
+            v3_add(v3_scale(bindAxis, scaled.x),
+                v3_add(v3_scale(basisY, scaled.y), v3_scale(basisZ, scaled.z))));
+    }
+
+    (void)twistQuat;
+    (void)swing;
+
+    // ---- 8. 若需要中心修正，解 structural_centers ----
+    std::vector<Vec3> centers(nV, Vec3{0.0, 0.0, 0.0});
+    if (correctCenters) {
+        // 收集网格面（bind 空间）
+        MFnMesh meshFns;
+        MObject meshObject;
+        {
+            auto geometry = block.inputArrayValue(MPxSkinCluster::input, &status);
+            if (status && geometry.jumpToElement(multiIndex)) {
+                auto input = geometry.inputValue(&status);
+                if (status) meshObject = input.child(MPxSkinCluster::inputGeom).asMesh();
+            }
+        }
+        std::vector<std::vector<unsigned int>> faces;
+        if (!meshObject.isNull()) {
+            MFnMesh mesh(meshObject, &status);
+            if (status) {
+                const int polygons = mesh.numPolygons(&status);
+                if (status && polygons > 0) {
+                    faces.reserve(polygons);
+                    for (int f = 0; f < polygons; ++f) {
+                        MIntArray vertices;
+                        mesh.getPolygonVertices(f, vertices);
+                        std::vector<unsigned int> face;
+                        face.reserve(vertices.length());
+                        for (unsigned int k = 0; k < vertices.length(); ++k)
+                            face.push_back(static_cast<unsigned int>(vertices[k]));
+                        faces.push_back(std::move(face));
+                    }
+                }
+            }
+        }
+        if (!faces.empty()) {
+            std::vector<Vec3> bindPoints(nV);
+            for (unsigned int i = 0; i < nV; ++i) bindPoints[i] = frames[i].rest;
+            const auto edges = ocd_centers::buildEdges(bindPoints, faces);
+            const auto outer = ocd_centers::outerParticipation(
+                bindPoints, chainWeights, bendDegrees, twistDegrees, directionDegrees);
+
+            ocd_centers::Settings settings;
+            // rotations 的列需与 chainWeights 的三列对齐
+            settings.rotations = {Cs[parentBone].q, Cs[childBone].q, Quat{0, 0, 0, 1}};
+            settings.centerLimit = block.inputValue(aOcdCenterLimit, &status).asDouble();
+            if (!status) settings.centerLimit = 16.0;
+            const auto offsets = ocd_centers::structuralCenters(
+                edges, bindPoints, chainWeights, settings, guide, outer);
+
+            // structural_centers 返回的是偏移量；参考实现把它叠加到标准 CoR
+            // 中心（cor_paper::computeCenters）之上，再交给 vertexTransform。
+            std::vector<cor_paper::Weights> rotationWeights(nV);
+            std::vector<cor_paper::Triangle> triangles;
+            triangles.reserve(faces.size());
+            for (const auto& face : faces) {
+                if (face.size() < 3) continue;
+                for (size_t k = 1; k + 1 < face.size(); ++k)
+                    triangles.push_back({face[0], face[k], face[k + 1]});
+            }
+            for (unsigned int i = 0; i < nV; ++i) {
+                for (const auto& kv : m_vtxCache.vertices[i])
+                    rotationWeights[i].push_back({kv.first, kv.second});
+                std::sort(rotationWeights[i].begin(), rotationWeights[i].end(),
+                    [](const auto& a, const auto& b) { return a.first < b.first; });
+            }
+            const auto baseCenters = cor_paper::computeCenters(
+                bindPoints, rotationWeights, triangles, 0.1);
+            for (unsigned int i = 0; i < nV && i < baseCenters.size(); ++i)
+                centers[i] = v3_add(baseCenters[i], offsets[i]);
+        }
+    }
+
+    // ---- 9. 写出结果 ----
+    if (correctCenters) {
+        // OCD + Corrected CoR：用中心偏移驱动 cor_paper 求值
+        std::vector<cor_paper::Weights> rotationWeights(nV);
+        std::vector<cor_paper::Weights> translationWeights(nV);
+        for (unsigned int i = 0; i < nV; ++i) {
+            for (const auto& kv : m_vtxCache.vertices[i]) {
+                rotationWeights[i].push_back({kv.first, kv.second});
+                translationWeights[i].push_back({kv.first, kv.second});
+            }
+            std::sort(rotationWeights[i].begin(), rotationWeights[i].end(),
+                [](const auto& a, const auto& b) { return a.first < b.first; });
+            std::sort(translationWeights[i].begin(), translationWeights[i].end(),
+                [](const auto& a, const auto& b) { return a.first < b.first; });
+        }
+
+        double maxDeltaSquared = 0.0;
+#pragma omp parallel for schedule(static)
+        for (int index = 0; index < static_cast<int>(nV); ++index) {
+            const Vec3 restPoint = frames[index].rest;
+            const Vec3 center = centers[index];
+            const auto transform = cor_paper::vertexTransform(
+                center, rotationWeights[index], translationWeights[index], Cs);
+            const Vec3 base = apply_transform(transform, restPoint);
+            // 参考实现在 CoR 中心已由拟合吸收 OCD 形状，这里直接输出
+            const Vec3 result = applyEnvelope(restPoint, base, envelope);
+            points[index] = MPoint(result.x, result.y, result.z) * worldInverse;
+        }
+        (void)maxDeltaSquared;
+        iter.setAllPositions(points);
+    }
+    else {
+        double maxDeltaSquared = 0.0;
+#pragma omp parallel for schedule(static)
+        for (int index = 0; index < static_cast<int>(nV); ++index) {
+            const Vec3 restPoint = frames[index].rest;
+            const Vec3 posed = guide[index];
+            const Vec3 result = applyEnvelope(restPoint, posed, envelope);
+            points[index] = MPoint(result.x, result.y, result.z) * worldInverse;
+        }
+        (void)maxDeltaSquared;
+        iter.setAllPositions(points);
+    }
+
+    (void)multiIndex;
+    (void)relativeRot;
+    return MS::kSuccess;
+}
+
 MStatus OptimizedSkinCluster::deformMOS(
     MDataBlock& block, MItGeometry& iter,
     const MMatrix& worldMat, unsigned int multiIndex) {
@@ -3106,1188 +3337,12 @@ static mathcore::Vec3 computeLocalCorBase(
         mathcore::v3_sub(corFull, lbs), M));
 }
 
-// ================================================================
-// V1: CoR + MOS Secondary
-//
-//   V_final = V_CoR + α · W_MOS · ΔV_MOS
-//
-//   · V_CoR      : CoR 主变形（与模式 0 完全一致）
-//   · ΔV_MOS     : 各曲线 Bulge/Slide 净增量，按 w_c 加权
-//   · W_MOS      : w_total · influenceRadius，线性 clamp 到 1（V1 不做 gamma 抬升）
-//   · α          : corMosSecondaryWeight ∈ [-2, 2]
-//   · Envelope   : 只在最后统一执行一次
-//
-// 关键约束：
-//   1) 不调用 deformCoR() / deformMOS()，避免二次 Envelope 与顶点写回
-//   2) ΔV 不含 curve_mos 本身（基础曲线变形），也不含 expand_scale
-//   3) α=0 严格退化为纯 CoR；α=0 时提前 return，不构建 MOS cache
-//   4) 本函数内 CoR cache 维护逻辑与 deformCoR 内联，保持一致；未来抽成
-//      ensureCoRCache() 时两处同改
-// ================================================================
-MStatus OptimizedSkinCluster::deformCoRMosSecondary(
-    MDataBlock& block, MItGeometry& iter,
-    const MMatrix& worldMat, unsigned int /*multiIndex*/) {
-
-    // [DIAG] 读诊断开关（模式 4 也需要 bit8）
-    int diagFlags = 0;
-    {
-        MStatus dfStatus;
-        MDataHandle dfh = block.inputValue(aDiagFlags, &dfStatus);
-        if (dfStatus) diagFlags = dfh.asInt();
-    }
-
-    // ---- A. 参数 ----
-    const double env = readEnvelopeFromNode();
-    MosParams P = readMosParams(block);
-    if (P.curveMode == MosParams::arcSegments) P.curveMode = 0;
-
-    // α=0：完全退化为纯 CoR，跳过 MOS cache 构建
-    if (std::abs(P.corMosSecondaryWeight) < 1e-9) {
-        return deformCoR(block, iter, worldMat, 0);
-    }
-
-    std::vector<mathcore::RigidTransform> rest, Cs;
-    std::vector<mathcore::Quat> poseQ;
-    if (!readBoneTransforms(block, rest, Cs, poseQ)) return MS::kSuccess;
-
-    const unsigned int nV = iter.count();
-
-    // ---- B. CoR cache 维护（与 deformCoR 内联，保持一致） ----
-    {
-        MStatus s2;
-        bool forceFull = block.inputValue(aForceFullCoR, &s2).asBool();
-        if (s2 && forceFull) m_corCache.valid = false;
-
-        MStatus s3;
-        int triLayers = block.inputValue(aCorTriLayerExpand, &s3).asInt();
-        if (!s3) triLayers = 1;
-        int vertLayerOverride = block.inputValue(aCorVertLayerExpand, &s3).asInt();
-        if (!s3) vertLayerOverride = -1;
-        int budgetDiv = block.inputValue(aCorIncBudgetDiv, &s3).asInt();
-        if (!s3) budgetDiv = 10;
-
-        if (!m_corCache.valid || m_corCache.numVertices != nV) {
-            if (!computeCoRCache(block, nV))
-                return deformDLB(block, iter, worldMat, 0);   // 同 deformCoR 的 fallback
-        }
-        else if (m_hasPlugDirty || m_needFullWeightScan) {
-            std::vector<unsigned int> dirtyList;
-            if (m_hasPlugDirty) {
-                for (unsigned int i = 0;
-                    i < (unsigned int)m_dirtyVertFlags.size() && i < nV; ++i)
-                    if (m_dirtyVertFlags[i]) dirtyList.push_back(i);
-            }
-            if (m_needFullWeightScan) {
-                MStatus wStatus;
-                MArrayDataHandle wlH = block.inputArrayValue(
-                    MPxSkinCluster::weightList, &wStatus);
-                if (wStatus) {
-                    for (unsigned int i = 0; i < nV; ++i) {
-                        WeightMap curW = readVertexWeightsFromHandle(wlH, i);
-                        SparseW sw; sw.buildFrom(curW);
-                        if (!sparseEqual(sw, m_corCache.allW[i])) dirtyList.push_back(i);
-                    }
-                }
-            }
-            if (!dirtyList.empty()) {
-                std::sort(dirtyList.begin(), dirtyList.end());
-                dirtyList.erase(std::unique(dirtyList.begin(), dirtyList.end()),
-                    dirtyList.end());
-                if (dirtyList.size() > (size_t)nV / 4) {
-                    computeCoRCache(block, nV);
-                }
-                else {
-                    int vertLayers = computeVertLayers(
-                        (unsigned int)dirtyList.size(), nV,
-                        vertLayerOverride, budgetDiv);
-                    updateCoRCacheIncremental(block, dirtyList, triLayers, vertLayers);
-                }
-            }
-            clearDirtyFlags();
-        }
-    }
-
-    // ---- C. MOS cache 构建 ----
-    if (!m_mosCache.valid || m_mosCache.direct || m_mosCache.numVertices != nV ||
-        !m_mosCache.params.nearlyEqual(P)) {
-        if (!computeMosCache(block, nV, P))
-            return deformCoR(block, iter, worldMat, 0);   // MOS cache 失败退纯 CoR
-    }
-    const MosParams& Pc = m_mosCache.params;
-
-    const int n_curves = (int)m_mosCache.curves.size();
-    if (n_curves == 0) return deformCoR(block, iter, worldMat, 0);
-
-    // ---- D. 每条曲线的弯曲关节索引（V1 从 deformMOS 逐字拷贝）----
-    std::vector<int> curve_bend_idx(n_curves, -1);
-    for (int c = 0; c < n_curves; ++c) {
-        const auto& cv = m_mosCache.curves[c];
-        if (cv.bend_joint_idx >= 0) {
-            curve_bend_idx[c] = cv.bend_joint_idx;
-        }
-        else {
-            const int nB = (int)cv.chain_bones.size();
-            int best_j = -1;
-            double best_angle = 0.0;
-            for (int j = 1; j < nB; ++j) {
-                const unsigned int bp = cv.chain_bones[j - 1];
-                const unsigned int bc = cv.chain_bones[j];
-                if (bp >= Cs.size() || bc >= Cs.size()) continue;
-                mathcore::Quat q_rel = mathcore::q_mul(
-                    Cs[bc].q, mathcore::q_inverse(Cs[bp].q));
-                double cos_half = std::abs(q_rel.w);
-                if (cos_half > 1.0) cos_half = 1.0;
-                double angle = 2.0 * std::acos(cos_half);
-                if (angle > best_angle) { best_angle = angle; best_j = j; }
-            }
-            curve_bend_idx[c] = best_j;
-        }
-    }
-
-    // ---- E. curve_tau_bend / curve_bend_angle（V1 从 deformMOS 拷贝）----
-    std::vector<double> curve_tau_bend(n_curves, 0.5);
-    std::vector<double> curve_bend_angle(n_curves, 0.0);
-    for (int c = 0; c < n_curves; ++c) {
-        const auto& cv = m_mosCache.curves[c];
-        const int bj = curve_bend_idx[c];
-        if (bj < 1 || bj >= (int)cv.chain_bones.size()) continue;
-
-        const unsigned int bp = cv.chain_bones[bj - 1];
-        const unsigned int bc = cv.chain_bones[bj];
-
-        if (bc < m_boneInfo.jointPosRest.size()) {
-            const mathcore::Vec3 joint_bind = m_boneInfo.jointPosRest[bc];
-            double t_best = 0.5;
-            double d_best = 1e30;
-            const int N_SAMPLE_T = 64;
-            for (int i = 0; i <= N_SAMPLE_T; ++i) {
-                const double t = (double)i / N_SAMPLE_T;
-                const mathcore::Vec3 p = ocd_math::bspline_eval(
-                    cv.cvs_rest, cv.knots, cv.degree, t);
-                const double d = mathcore::v3_len(
-                    mathcore::v3_sub(p, joint_bind));
-                if (d < d_best) { d_best = d; t_best = t; }
-            }
-            curve_tau_bend[c] = t_best;
-        }
-        else {
-            curve_tau_bend[c] = 0.5;
-        }
-
-        if (bp < Cs.size() && bc < Cs.size()) {
-            mathcore::Quat q_rel = mathcore::q_mul(
-                Cs[bc].q, mathcore::q_inverse(Cs[bp].q));
-            mathcore::Vec3 axis_bind = mathcore::Vec3{ 0.0, 1.0, 0.0 };
-            if (bc < m_boneInfo.boneDirRest.size())
-                axis_bind = m_boneInfo.boneDirRest[bc];
-
-            mathcore::Quat R_swing, R_twist;
-            mathcore::Vec3 axis_cur;
-            double twist_angle = 0.0;
-            ocd_math::decompose_swing_twist(
-                q_rel, axis_bind, R_swing, R_twist, axis_cur, twist_angle);
-
-            double cos_half = std::abs(R_swing.w);
-            if (cos_half > 1.0) cos_half = 1.0;
-            const double angle = 2.0 * std::acos(cos_half);
-            curve_bend_angle[c] =
-                std::min(angle / 3.14159265358979323846, 1.0);
-        }
-    }
-
-    // ---- F. all_p_j / all_F_j 预计算（V1 从 deformMOS 拷贝）----
-    std::vector<std::vector<mathcore::Vec3>> all_p_j(n_curves);
-    std::vector<std::vector<ocd_math::Mat3>> all_F_j(n_curves);
-
-    for (int c = 0; c < n_curves; ++c) {
-        const auto& cv = m_mosCache.curves[c];
-        const int n_cv = (int)cv.cvs_rest.size();
-        const int nB = (int)cv.chain_bones.size();
-        all_p_j[c].resize(n_cv);
-        all_F_j[c].resize(n_cv);
-
-        double seg_begin = 0.0;
-        double seg_scale = (nB > 1) ? double(nB - 1) : 1.0;
-        if (cv.bend_joint_idx >= 1 && cv.bend_joint_idx < nB) {
-            seg_begin = double(cv.bend_joint_idx - 1);
-            seg_scale = 2.0;
-        }
-
-        for (int j = 0; j < n_cv; ++j) {
-            const unsigned int bone = cv.cvs_bone[j];
-            if (bone < (unsigned int)Cs.size())
-                all_p_j[c][j] = mathcore::apply_transform(Cs[bone], cv.cvs_rest[j]);
-            else
-                all_p_j[c][j] = cv.cvs_rest[j];
-
-            const double u = (j < (int)cv.cvs_u.size()) ? cv.cvs_u[j] : 0.0;
-            const double t_global = seg_begin + u * seg_scale;
-
-            ocd_math::Mat3 R_acc;
-            for (int ii = 0; ii < 9; ++ii) R_acc.m[ii] = 0.0;
-            double w_sum = 0.0;
-            for (int k = 0; k < nB; ++k) {
-                const double w = 1.0 - std::abs(t_global - (double(k) + 0.5));
-                if (w <= 1e-9) continue;
-                const unsigned int b = cv.chain_bones[k];
-                if (b >= (unsigned int)Cs.size()) continue;
-                const ocd_math::Mat3 R_b = ocd_math::mat3_from_quat(Cs[b].q);
-                for (int ii = 0; ii < 9; ++ii) R_acc.m[ii] += R_b.m[ii] * w;
-                w_sum += w;
-            }
-
-            if (w_sum > 1e-9) {
-                const double inv = 1.0 / w_sum;
-                for (int ii = 0; ii < 9; ++ii) R_acc.m[ii] *= inv;
-                all_F_j[c][j] = ocd_math::polar_rotation(R_acc);
-            }
-            else if (bone < (unsigned int)Cs.size()) {
-                all_F_j[c][j] = ocd_math::mat3_from_quat(Cs[bone].q);
-            }
-            else {
-                all_F_j[c][j] = ocd_math::Mat3::identity();
-            }
-        }
-    }
-
-    // Scale 叠加（V1 从 deformMOS 拷贝）
-    if (Pc.scaleWeight > 1e-9 && Pc.scaleMode != 0) {
-        std::vector<mathcore::Vec3> L0, L1, L2;
-        const bool haveLinear = readBoneLinearParts(block, worldMat, L0, L1, L2);
-        if (haveLinear) {
-            for (int c = 0; c < n_curves; ++c) {
-                const auto& cv = m_mosCache.curves[c];
-                const int n_cv = (int)cv.cvs_rest.size();
-                for (int j = 0; j < n_cv; ++j) {
-                    const unsigned int bone = cv.cvs_bone[j];
-                    if (bone >= (unsigned int)L0.size()) continue;
-
-                    if (Pc.scaleMode == 1) {
-                        mathcore::Vec3 a_bind = { 0.0, 1.0, 0.0 };
-                        if (bone < m_boneInfo.boneDirRest.size())
-                            a_bind = m_boneInfo.boneDirRest[bone];
-
-                        const mathcore::Vec3 La = mathcore::v3_add(
-                            mathcore::v3_add(
-                                mathcore::v3_scale(L0[bone], a_bind.x),
-                                mathcore::v3_scale(L1[bone], a_bind.y)),
-                            mathcore::v3_scale(L2[bone], a_bind.z));
-                        const double s_axis = mathcore::v3_len(La);
-                        if (s_axis < 1e-9) continue;
-
-                        const mathcore::Vec3 axis_cur = all_F_j[c][j].apply(a_bind);
-                        if (mathcore::v3_len(axis_cur) < 1e-9) continue;
-
-                        const double s_pow = std::pow(s_axis, Pc.scaleWeight);
-                        const ocd_math::Mat3 S =
-                            ocd_math::mat3_axis_scale(axis_cur, s_pow);
-                        all_F_j[c][j] = S * all_F_j[c][j];
-                    }
-                    else if (Pc.scaleMode == 2) {
-                        const double sx = mathcore::v3_len(L0[bone]);
-                        const double sy = mathcore::v3_len(L1[bone]);
-                        const double sz = mathcore::v3_len(L2[bone]);
-                        const ocd_math::Mat3 S = ocd_math::mat3_anisotropic_scale(
-                            std::pow(std::max(sx, 1e-9), Pc.scaleWeight),
-                            std::pow(std::max(sy, 1e-9), Pc.scaleWeight),
-                            std::pow(std::max(sz, 1e-9), Pc.scaleWeight));
-                        all_F_j[c][j] = S * all_F_j[c][j];
-                    }
-                }
-            }
-        }
-    }
-
-    // ---- G. 主循环 ----
-    MPointArray points;
-    iter.allPositions(points);
-    const MMatrix wInv = worldMat.inverse();
-
-    const bool hasInBulge = (std::abs(Pc.inBulgeWeight) > 1e-9);
-    const bool hasOutBulge = (std::abs(Pc.outBulgeWeight) > 1e-9);
-    const bool hasSideBulge = (std::abs(Pc.sideBulgeWeight) > 1e-9);
-    const bool hasCenterSlide =
-        (std::abs(Pc.centerSlideInWeight) > 1e-9 ||
-            std::abs(Pc.centerSlideOutWeight) > 1e-9);
-    const bool hasInSlide = (std::abs(Pc.slideInWeight_prev) > 1e-9 ||
-        std::abs(Pc.slideInWeight_next) > 1e-9);
-    const bool hasOutSlide = (std::abs(Pc.slideOutWeight_prev) > 1e-9 ||
-        std::abs(Pc.slideOutWeight_next) > 1e-9);
-    const bool hasInOrthoSlide = (std::abs(Pc.slideOrthoInWeight_prev) > 1e-9 ||
-        std::abs(Pc.slideOrthoInWeight_next) > 1e-9);
-    const bool hasOutOrthoSlide = (std::abs(Pc.slideOrthoOutWeight_prev) > 1e-9 ||
-        std::abs(Pc.slideOrthoOutWeight_next) > 1e-9);
-    const bool hasAnySlide = hasInSlide || hasOutSlide ||
-        hasInOrthoSlide || hasOutOrthoSlide || hasCenterSlide;
-    const bool hasAnySecondary = hasInBulge || hasOutBulge || hasSideBulge || hasAnySlide;
-
-    const double alpha = Pc.corMosSecondaryWeight;
-    // [V2] influenceRadius 在模式 4 不参与：
-    //   · 影响范围由 computeVertexJointMask(vw) 统一控制（CoR / MOS 共用）
-    //   · 参数仅在模式 3（deformMOS）中保留原语义
-
-#pragma omp parallel for schedule(static)
-    for (int vi = 0; vi < (int)nV; ++vi) {
-        const auto& vw = m_vtxCache.vertices[vi];
-        if (vw.empty()) continue;
-
-        MPoint ptW = points[vi] * worldMat;
-        const mathcore::Vec3 origPos = { ptW.x, ptW.y, ptW.z };
-
-        // 统一 Joint Influence Mask（CoR 与 MOS 共用同一个 M）
-        const double M = computeVertexJointMask(vw);
-
-        // ---------- 1. 局部 CoR 基础变形 ----------
-        // V_base = LBS + M · (CoR − LBS)
-        //   · M = 0（单骨骼）    → LBS
-        //   · M = 1（关节中线）  → 纯 CoR
-        // bind 姿势下 CoR = LBS = origPos，M 不影响精确性。
-        mathcore::Vec3 cor = origPos;
-        if ((unsigned)vi < m_corCache.cors.size()) {
-            mathcore::Vec3 cl = m_corCache.cors[vi];
-            MPoint cw(cl.x, cl.y, cl.z); cw *= worldMat;
-            cor = { cw.x, cw.y, cw.z };
-        }
-        const mathcore::Vec3 corDef =
-            computeLocalCorBase(origPos, cor, vw, Cs, M);
-
-        // ---------- 2. MOS 次级增量 ΔV ----------
-        mathcore::Vec3 delta_mos = { 0.0, 0.0, 0.0 };
-        double w_total = 0.0;
-
-        if (hasAnySecondary) {
-            const auto& vb = m_mosCache.verts[vi];
-            if (!vb.per_curve.empty()) {
-                mathcore::Vec3 blended_delta = { 0.0, 0.0, 0.0 };
-
-                for (int c = 0; c < n_curves; ++c) {
-                    const auto& cv = m_mosCache.curves[c];
-                    const auto& pc = vb.per_curve[c];
-                    if (pc.w_c <= 0.0) continue;
-
-                    const int n_cv_local = (int)cv.cvs_rest.size();
-                    std::vector<mathcore::Vec3> offset_cvs(n_cv_local);
-
-                    // ---- expand_scale：曲线基础变形，不算次级 ----
-                    double expand_scale = 1.0;
-                    // [DIAG bit8] 关掉 expand_scale：验证 W 是否消失
-                    //   expand_scale 在 τ=0.25/0.75 最大（w_c=0.5），
-                    //   与 bulge 在 τ=0.5 最大的方向相反，是 W 的头号嫌疑
-                    if (!(diagFlags & 8) &&
-                        pc.w_c > 1e-4 && pc.w_c < 1.0 - 1e-4) {
-                        const double w_edge = 4.0 * pc.w_c * (1.0 - pc.w_c);
-                        expand_scale = 1.0 + 0.3 * w_edge * curve_bend_angle[c];
-                    }
-
-                    // ---- 侧向法向（用于分离平面内/侧向分量）----
-                    mathcore::Vec3 side_normal_exp = { 0.0, 0.0, 0.0 };
-                    bool has_side_normal_exp = false;
-                    if (expand_scale > 1.0) {
-                        const int bj_sn = curve_bend_idx[c];
-                        const int nB_sn = (int)cv.chain_bones.size();
-                        if (bj_sn >= 1 && bj_sn + 1 < nB_sn) {
-                            const unsigned int bp_sn = cv.chain_bones[bj_sn - 1];
-                            const unsigned int bc_sn = cv.chain_bones[bj_sn];
-                            const unsigned int bn_sn = cv.chain_bones[bj_sn + 1];
-                            if (bp_sn < rest.size() && bc_sn < rest.size() && bn_sn < rest.size() &&
-                                bp_sn < Cs.size() && bc_sn < Cs.size() && bn_sn < Cs.size()) {
-                                const mathcore::Vec3 bp_cur_sn = mathcore::apply_transform(Cs[bp_sn], rest[bp_sn].t);
-                                const mathcore::Vec3 bc_cur_sn = mathcore::apply_transform(Cs[bc_sn], rest[bc_sn].t);
-                                const mathcore::Vec3 bn_cur_sn = mathcore::apply_transform(Cs[bn_sn], rest[bn_sn].t);
-                                const mathcore::Vec3 ax_prev_sn = mathcore::v3_sub(bc_cur_sn, bp_cur_sn);
-                                const mathcore::Vec3 ax_next_sn = mathcore::v3_sub(bn_cur_sn, bc_cur_sn);
-                                mathcore::Vec3 sn = mathcore::v3_cross(ax_prev_sn, ax_next_sn);
-                                const double sn_len = mathcore::v3_len(sn);
-                                if (sn_len > 1e-6) {
-                                    side_normal_exp = mathcore::v3_scale(sn, 1.0 / sn_len);
-                                    has_side_normal_exp = true;
-                                }
-                            }
-                        }
-                    }
-
-                    for (int j = 0; j < n_cv_local; ++j) {
-                        const mathcore::Vec3 p_j = all_p_j[c][j];
-                        mathcore::Vec3 F_O = all_F_j[c][j].apply(pc.O);
-
-                        if (expand_scale > 1.0) {
-                            if (has_side_normal_exp) {
-                                const double side_comp = mathcore::v3_dot(F_O, side_normal_exp);
-                                const mathcore::Vec3 side_part = mathcore::v3_scale(side_normal_exp, side_comp);
-                                const mathcore::Vec3 plane_part = mathcore::v3_sub(F_O, side_part);
-                                F_O = mathcore::v3_add(
-                                    mathcore::v3_scale(plane_part, expand_scale),
-                                    side_part);
-                            }
-                            else {
-                                F_O = mathcore::v3_scale(F_O, expand_scale);
-                            }
-                        }
-
-                        offset_cvs[j] = mathcore::v3_add(p_j, F_O);
-                    }
-
-                    double t = pc.tau;
-                    if (t < 0.0) t = 0.0;
-                    if (t > 1.0 - 1e-12) t = 1.0 - 1e-12;
-
-                    const mathcore::Vec3 curve_mos = ocd_math::bspline_eval(
-                        offset_cvs, cv.knots, cv.degree, t);
-                    mathcore::Vec3 curve_mos_final = curve_mos;
-
-                    // ==================== Bulge + Slide（逐字从 deformMOS 拷贝） ====================
-                    if (hasAnySecondary &&
-                        curve_bend_angle[c] > 1e-6 &&
-                        curve_bend_idx[c] >= 1 &&
-                        curve_bend_idx[c] < (int)cv.chain_bones.size()) {
-
-                        // ---- 顶点权重混合旋转 ----
-                        mathcore::Quat q_mix = { 0.0, 0.0, 0.0, 0.0 };
-                        double wsum = 0.0;
-                        for (const auto& kv : m_vtxCache.vertices[vi]) {
-                            const unsigned int b = kv.first;
-                            const double w = (double)kv.second;
-                            if (b >= (unsigned int)Cs.size() || w <= 1e-9) continue;
-                            q_mix.x += Cs[b].q.x * w;
-                            q_mix.y += Cs[b].q.y * w;
-                            q_mix.z += Cs[b].q.z * w;
-                            q_mix.w += Cs[b].q.w * w;
-                            wsum += w;
-                        }
-
-                        if (wsum > 1e-9) {
-                            q_mix = mathcore::q_normalize(q_mix);
-
-                            const int bj = curve_bend_idx[c];
-                            const int nB = (int)cv.chain_bones.size();
-                            const unsigned int bp_idx = cv.chain_bones[bj - 1];
-                            const unsigned int bc_idx = cv.chain_bones[bj];
-                            const unsigned int bn_idx = (bj + 1 < nB)
-                                ? cv.chain_bones[bj + 1] : bc_idx;
-
-                            mathcore::Vec3 bp_cur = { 0.0, 0.0, 0.0 };
-                            mathcore::Vec3 bc_cur = { 0.0, 0.0, 0.0 };
-                            mathcore::Vec3 bn_cur = { 0.0, 0.0, 0.0 };
-                            if (bp_idx < rest.size() && bp_idx < Cs.size())
-                                bp_cur = mathcore::apply_transform(Cs[bp_idx], rest[bp_idx].t);
-                            if (bc_idx < rest.size() && bc_idx < Cs.size())
-                                bc_cur = mathcore::apply_transform(Cs[bc_idx], rest[bc_idx].t);
-                            if (bn_idx < rest.size() && bn_idx < Cs.size() &&
-                                bn_idx != bc_idx)
-                                bn_cur = mathcore::apply_transform(Cs[bn_idx], rest[bn_idx].t);
-                            else
-                                bn_cur = bc_cur;
-
-                            mathcore::Vec3 bone_axis_prev_cur =
-                                mathcore::v3_sub(bc_cur, bp_cur);
-                            const double len_prev = mathcore::v3_len(bone_axis_prev_cur);
-                            if (len_prev > 1e-9)
-                                bone_axis_prev_cur = mathcore::v3_scale(
-                                    bone_axis_prev_cur, 1.0 / len_prev);
-                            else
-                                bone_axis_prev_cur = mathcore::Vec3{ 0.0, 1.0, 0.0 };
-
-                            mathcore::Vec3 bone_axis_next_cur =
-                                mathcore::v3_sub(bn_cur, bc_cur);
-                            const double len_next = mathcore::v3_len(bone_axis_next_cur);
-                            if (len_next > 1e-9)
-                                bone_axis_next_cur = mathcore::v3_scale(
-                                    bone_axis_next_cur, 1.0 / len_next);
-                            else
-                                bone_axis_next_cur = mathcore::Vec3{ 0.0, 1.0, 0.0 };
-
-                            mathcore::Vec3 in_dir_cur = { 0.0, 0.0, 0.0 };
-                            {
-                                mathcore::Vec3 b = mathcore::v3_sub(
-                                    bone_axis_next_cur, bone_axis_prev_cur);
-                                if (mathcore::v3_len(b) > 1e-6)
-                                    in_dir_cur = mathcore::v3_norm(b);
-                            }
-
-                            mathcore::Vec3 radial_cur;
-                            {
-                                bool used_manual = false;
-                                if (Pc.useManualInVector) {
-                                    const mathcore::Vec3 mv = Pc.manualInVector;
-                                    const double mv_len = mathcore::v3_len(mv);
-                                    if (mv_len > 1e-9) {
-                                        const mathcore::Vec3 mv_n =
-                                            mathcore::v3_scale(mv, 1.0 / mv_len);
-                                        const mathcore::Vec3 mv_cur =
-                                            mathcore::q_rotate_v3(q_mix, mv_n);
-                                        const double o_len = mathcore::v3_len(pc.O);
-                                        radial_cur = mathcore::v3_scale(mv_cur, o_len);
-                                        used_manual = true;
-                                    }
-                                }
-                                if (!used_manual)
-                                    radial_cur = mathcore::q_rotate_v3(q_mix, pc.O);
-
-                                // 投影到垂直骨骼轴平面
-                                {
-                                    const double radial_len_orig =
-                                        mathcore::v3_len(radial_cur);
-                                    if (radial_len_orig > 1e-9) {
-                                        mathcore::Vec3 bone_axis_mix_cur =
-                                        { 0.0, 0.0, 0.0 };
-                                        double axis_w = 0.0;
-                                        for (const auto& kv : m_vtxCache.vertices[vi]) {
-                                            const unsigned int b = kv.first;
-                                            const double w = (double)kv.second;
-                                            if (b >= (unsigned int)Cs.size()) continue;
-                                            if (b >= m_boneInfo.boneDirRest.size()) continue;
-                                            if (w <= 1e-9) continue;
-                                            const mathcore::Vec3 ba =
-                                                mathcore::q_rotate_v3(
-                                                    Cs[b].q,
-                                                    m_boneInfo.boneDirRest[b]);
-                                            bone_axis_mix_cur = mathcore::v3_add(
-                                                bone_axis_mix_cur,
-                                                mathcore::v3_scale(ba, w));
-                                            axis_w += w;
-                                        }
-                                        if (axis_w > 1e-9) {
-                                            bone_axis_mix_cur = mathcore::v3_norm(
-                                                mathcore::v3_scale(
-                                                    bone_axis_mix_cur,
-                                                    1.0 / axis_w));
-                                            const double axial_comp =
-                                                mathcore::v3_dot(
-                                                    radial_cur,
-                                                    bone_axis_mix_cur);
-                                            const mathcore::Vec3 radial_perp =
-                                                mathcore::v3_sub(
-                                                    radial_cur,
-                                                    mathcore::v3_scale(
-                                                        bone_axis_mix_cur,
-                                                        axial_comp));
-                                            const double perp_len =
-                                                mathcore::v3_len(radial_perp);
-                                            if (perp_len > 1e-6) {
-                                                radial_cur = mathcore::v3_scale(
-                                                    radial_perp,
-                                                    radial_len_orig / perp_len);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            const double in_len = mathcore::v3_len(in_dir_cur);
-                            const double pc_o_len = mathcore::v3_len(pc.O);
-                            const double radial_len = mathcore::v3_len(radial_cur);
-                            const double base = curve_bend_angle[c];
-
-                            // ---- Bulge 段 ----
-                            if (hasInBulge || hasOutBulge || hasSideBulge) {
-                                mathcore::Vec3 total_bulge = { 0.0, 0.0, 0.0 };
-                                if (in_len > 1e-9 && pc_o_len > 1e-9) {
-                                    const double cos_side =
-                                        mathcore::v3_dot(pc.O, in_dir_cur) / pc_o_len;
-                                    double t_norm = (cos_side + 0.5) / 1.0;
-                                    if (t_norm < 0.0) t_norm = 0.0;
-                                    if (t_norm > 1.0) t_norm = 1.0;
-                                    const double smooth_w =
-                                        t_norm * t_norm * (3.0 - 2.0 * t_norm);
-                                    const double w_out = smooth_w;
-                                    const double w_in = 1.0 - smooth_w;
-
-                                    if (hasInBulge && w_in > 1e-9) {
-                                        total_bulge = mathcore::v3_add(
-                                            total_bulge,
-                                            mathcore::v3_scale(in_dir_cur,
-                                                -Pc.inBulgeWeight * base * w_in));
-                                    }
-                                    if (hasOutBulge && w_out > 1e-9) {
-                                        total_bulge = mathcore::v3_add(
-                                            total_bulge,
-                                            mathcore::v3_scale(in_dir_cur,
-                                                Pc.outBulgeWeight * base * w_out));
-                                    }
-
-                                    if (hasSideBulge && radial_len > 1e-9) {
-                                        mathcore::Vec3 side_normal = mathcore::v3_cross(
-                                            bone_axis_prev_cur, bone_axis_next_cur);
-                                        const double sn_len = mathcore::v3_len(side_normal);
-                                        if (sn_len > 1e-6) {
-                                            side_normal = mathcore::v3_scale(
-                                                side_normal, 1.0 / sn_len);
-                                            const double cos_side_axis =
-                                                mathcore::v3_dot(radial_cur,
-                                                    side_normal) / radial_len;
-                                            const double abs_cos = std::abs(cos_side_axis);
-                                            const double w_side =
-                                                abs_cos * abs_cos * (3.0 - 2.0 * abs_cos);
-                                            if (w_side > 1e-9 && abs_cos > 1e-9) {
-                                                const mathcore::Vec3 side_dir_out =
-                                                    mathcore::v3_scale(side_normal,
-                                                        (cos_side_axis > 0.0) ? 1.0 : -1.0);
-                                                total_bulge = mathcore::v3_add(
-                                                    total_bulge,
-                                                    mathcore::v3_scale(side_dir_out,
-                                                        Pc.sideBulgeWeight * base * w_side));
-                                            }
-                                        }
-                                    }
-                                }
-                                curve_mos_final = mathcore::v3_add(
-                                    curve_mos_final, total_bulge);
-                            }
-
-                            // ---- Slide 段 ----
-                            if (hasAnySlide) {
-                                mathcore::Vec3 total_slide = { 0.0, 0.0, 0.0 };
-                                if (in_len > 1e-9 && pc_o_len > 1e-9 &&
-                                    radial_len > 1e-9) {
-
-                                    const double cos_side_slide =
-                                        mathcore::v3_dot(pc.O, in_dir_cur) / pc_o_len;
-                                    double t_side_slide = (cos_side_slide + 0.5) / 1.0;
-                                    if (t_side_slide < 0.0) t_side_slide = 0.0;
-                                    if (t_side_slide > 1.0) t_side_slide = 1.0;
-                                    const double smooth_side_slide =
-                                        t_side_slide * t_side_slide * (3.0 - 2.0 * t_side_slide);
-                                    const double w_in_slide = 1.0 - smooth_side_slide;
-                                    const double w_out_slide = smooth_side_slide;
-
-                                    const double tau_dist_slide =
-                                        pc.tau - curve_tau_bend[c];
-                                    double t_prev = -tau_dist_slide / 0.25;
-                                    if (t_prev < 0.0) t_prev = 0.0;
-                                    if (t_prev > 1.0) t_prev = 1.0;
-                                    const double w_prev_slide =
-                                        t_prev * t_prev * (3.0 - 2.0 * t_prev);
-                                    double t_next = tau_dist_slide / 0.25;
-                                    if (t_next < 0.0) t_next = 0.0;
-                                    if (t_next > 1.0) t_next = 1.0;
-                                    const double w_next_slide =
-                                        t_next * t_next * (3.0 - 2.0 * t_next);
-
-                                    const mathcore::Vec3 radial_dir_slide =
-                                        mathcore::v3_scale(radial_cur, 1.0 / radial_len);
-
-                                    // 1. 内侧轴向
-                                    if (w_in_slide > 1e-9) {
-                                        if (std::abs(Pc.slideInWeight_prev) > 1e-9 &&
-                                            w_prev_slide > 1e-9) {
-                                            total_slide = mathcore::v3_add(
-                                                total_slide,
-                                                mathcore::v3_scale(bone_axis_prev_cur,
-                                                    Pc.slideInWeight_prev * base *
-                                                    w_in_slide * w_prev_slide));
-                                        }
-                                        if (std::abs(Pc.slideInWeight_next) > 1e-9 &&
-                                            w_next_slide > 1e-9) {
-                                            total_slide = mathcore::v3_add(
-                                                total_slide,
-                                                mathcore::v3_scale(bone_axis_next_cur,
-                                                    -Pc.slideInWeight_next * base *
-                                                    w_in_slide * w_next_slide));
-                                        }
-                                    }
-                                    // 2. 外侧轴向
-                                    if (w_out_slide > 1e-9) {
-                                        if (std::abs(Pc.slideOutWeight_prev) > 1e-9 &&
-                                            w_prev_slide > 1e-9) {
-                                            total_slide = mathcore::v3_add(
-                                                total_slide,
-                                                mathcore::v3_scale(bone_axis_prev_cur,
-                                                    -Pc.slideOutWeight_prev * base *
-                                                    w_out_slide * w_prev_slide));
-                                        }
-                                        if (std::abs(Pc.slideOutWeight_next) > 1e-9 &&
-                                            w_next_slide > 1e-9) {
-                                            total_slide = mathcore::v3_add(
-                                                total_slide,
-                                                mathcore::v3_scale(bone_axis_next_cur,
-                                                    Pc.slideOutWeight_next * base *
-                                                    w_out_slide * w_next_slide));
-                                        }
-                                    }
-                                    // 3. 内侧径向
-                                    if (w_in_slide > 1e-9) {
-                                        if (std::abs(Pc.slideOrthoInWeight_prev) > 1e-9 &&
-                                            w_prev_slide > 1e-9) {
-                                            total_slide = mathcore::v3_add(
-                                                total_slide,
-                                                mathcore::v3_scale(radial_dir_slide,
-                                                    -Pc.slideOrthoInWeight_prev * base *
-                                                    w_in_slide * w_prev_slide));
-                                        }
-                                        if (std::abs(Pc.slideOrthoInWeight_next) > 1e-9 &&
-                                            w_next_slide > 1e-9) {
-                                            total_slide = mathcore::v3_add(
-                                                total_slide,
-                                                mathcore::v3_scale(radial_dir_slide,
-                                                    -Pc.slideOrthoInWeight_next * base *
-                                                    w_in_slide * w_next_slide));
-                                        }
-                                    }
-                                    // 4. 外侧径向
-                                    if (w_out_slide > 1e-9) {
-                                        if (std::abs(Pc.slideOrthoOutWeight_prev) > 1e-9 &&
-                                            w_prev_slide > 1e-9) {
-                                            total_slide = mathcore::v3_add(
-                                                total_slide,
-                                                mathcore::v3_scale(radial_dir_slide,
-                                                    Pc.slideOrthoOutWeight_prev * base *
-                                                    w_out_slide * w_prev_slide));
-                                        }
-                                        if (std::abs(Pc.slideOrthoOutWeight_next) > 1e-9 &&
-                                            w_next_slide > 1e-9) {
-                                            total_slide = mathcore::v3_add(
-                                                total_slide,
-                                                mathcore::v3_scale(radial_dir_slide,
-                                                    Pc.slideOrthoOutWeight_next * base *
-                                                    w_out_slide * w_next_slide));
-                                        }
-                                    }
-                                    // 5. CenterSlide
-                                    if (hasCenterSlide) {
-                                        const mathcore::Vec3 rel_v =
-                                            mathcore::v3_sub(origPos, bc_cur);
-                                        const double side_v =
-                                            mathcore::v3_dot(rel_v, in_dir_cur);
-                                        if (side_v > 0.0) {
-                                            total_slide = mathcore::v3_add(
-                                                total_slide,
-                                                mathcore::v3_scale(in_dir_cur,
-                                                    Pc.centerSlideInWeight * base));
-                                        }
-                                        else {
-                                            total_slide = mathcore::v3_add(
-                                                total_slide,
-                                                mathcore::v3_scale(in_dir_cur,
-                                                    -Pc.centerSlideOutWeight * base));
-                                        }
-                                    }
-                                }
-                                curve_mos_final = mathcore::v3_add(
-                                    curve_mos_final, total_slide);
-                            }
-                        }
-                    }
-
-                    // ---- ΔV_c = curve_mos_final - curve_mos ----
-                    const mathcore::Vec3 dV_c =
-                        mathcore::v3_sub(curve_mos_final, curve_mos);
-                    blended_delta = mathcore::v3_add(
-                        blended_delta, mathcore::v3_scale(dV_c, pc.w_c));
-                    w_total += pc.w_c;
-                }
-
-                if (w_total > 1e-6) {
-                    delta_mos = mathcore::v3_scale(blended_delta, 1.0 / w_total);
-                }
-            }
-        }
-
-        // ---------- 3. 合成：V_final = V_localCor + α · M · ΔV_MOS ----------
-        // 统一 Mask 语义：
-        //   · M 同时限制 CoR 混合（见上一步）和 MOS 修正范围
-        //   · 不再用 influenceRadius，不再做 pow(w, 0.5) 二次抬升
-        //   · α 只调 MOS 补偿强度，范围由 M 决定
-        const mathcore::Vec3 combined = mathcore::v3_add(
-            corDef,
-            mathcore::v3_scale(delta_mos, alpha * M));
-
-        // ---------- 4. Envelope 唯一一次 ----------
-        const mathcore::Vec3 bl = applyEnvelope(origPos, combined, env);
-        MPoint out(bl.x, bl.y, bl.z);
-        out *= wInv;
-        points[vi] = out;
-    }
-
-    iter.setAllPositions(points);
-    return MS::kSuccess;
-}
-
-/// ================================================================
-// MOS 控制点级次级操作（专利 US9418465B2）
-// 关键原则：
-//   1. bulge / slide 都修改控制点 p_j，不修改 B-spline 输出
-//   2. 用 cv_bend_weight[j] 把有效修改限制在关节附近的控制点，
-//      远端控制点 w_j ≈ 0，不参与修改，root 段完全不受影响
-//   3. B-spline 局部支撑 + w_j 形成"双重权重"，修改经求值后进一步平滑
-//   4. @deprecated 控制点在骨骼中心线上 side≈0，centerSlideIn/Out 永远不生效，
-//      已改为 deformMOS 内顶点级实现。函数保留但不再被调用，未来可整体删除。
-// ================================================================
-
-mathcore::Vec3 OptimizedSkinCluster::applyMosSecondaryOps(
-    const MosCurve& cv, int j, int bend_idx,
-    const std::vector<double>& cv_bend_weight,
-    const MosPerCurveBind& /*pc*/,
-    const std::vector<mathcore::RigidTransform>& rest,
-    const std::vector<mathcore::RigidTransform>& Cs,
-    double avg_bone_length,
-    const MosParams& P,
-    const mathcore::Vec3& p_j) const {
-
-    if (bend_idx < 1 || bend_idx >= (int)cv.chain_bones.size())
-        return p_j;
-
-    const int bj = bend_idx;
-    const int bj_prev = bj - 1;
-    const int bj_next = (bj + 1 < (int)cv.chain_bones.size()) ? bj + 1 : bj;
-
-    const unsigned int bp = cv.chain_bones[bj_prev];
-    const unsigned int bc = cv.chain_bones[bj];
-    const unsigned int bn = cv.chain_bones[bj_next];
-
-    if (bp >= rest.size() || bc >= rest.size() || bn >= rest.size() ||
-        bp >= Cs.size() || bc >= Cs.size() || bn >= Cs.size())
-        return p_j;
-
-    const mathcore::Vec3 jp = mathcore::apply_transform(Cs[bp], rest[bp].t);
-    const mathcore::Vec3 jc = mathcore::apply_transform(Cs[bc], rest[bc].t);
-    const mathcore::Vec3 jn = mathcore::apply_transform(Cs[bn], rest[bn].t);
-
-    const mathcore::Vec3 d_prev = mathcore::v3_sub(jc, jp);
-    const mathcore::Vec3 d_next = mathcore::v3_sub(jn, jc);
-    if (mathcore::v3_len(d_prev) < 1e-9 || mathcore::v3_len(d_next) < 1e-9)
-        return p_j;
-
-    const mathcore::Vec3 dn_prev = mathcore::v3_norm(d_prev);
-    const mathcore::Vec3 dn_next = mathcore::v3_norm(d_next);
-
-    // in_dir = -normalize(dir_prev + dir_next)，指向弯折内侧
-    mathcore::Vec3 in_dir = { 0.0, 0.0, 0.0 };
-    {
-        mathcore::Vec3 b = mathcore::v3_sub(dn_next, dn_prev);
-        if (mathcore::v3_len(b) > 1e-6)
-            in_dir = mathcore::v3_norm(b);
-    }
-    if (mathcore::v3_len(in_dir) < 1e-9)
-        return p_j;
-
-    // bend = 两段骨骼方向夹角 / π，∈ [0,1]；不含 twist
-    double cos_bend = mathcore::v3_dot(dn_prev, dn_next);
-    if (cos_bend > 1.0) cos_bend = 1.0;
-    if (cos_bend < -1.0) cos_bend = -1.0;
-    const double bend = std::acos(cos_bend) / 3.14159265358979323846;
-
-    const double L_bone = avg_bone_length;
-
-    // ★ 该控制点对弯曲关节的从属权重（0~1）
-    //   远端控制点 w_j ≈ 0，直接跳过
-    const double w_j = (j >= 0 && j < (int)cv_bend_weight.size())
-        ? cv_bend_weight[j] : 0.0;
-    if (w_j < 1e-6) return p_j;
-
-    mathcore::Vec3 corr = { 0.0, 0.0, 0.0 };
-
-    // ---- centerSlide：沿内侧/外侧方向偏移控制点 ----
-    // 保留原有 side 判断：控制点在中心线上 side ≈ 0，
-    // centerSlide 对中心线控制点不生效（rig 手动编辑控制点后才触发），
-    // 符合专利"rig 可额外调整"的语义。
-    const mathcore::Vec3 rel = mathcore::v3_sub(p_j, jc);
-    const double side = mathcore::v3_dot(rel, in_dir);
-
-    const double R = P.influenceRadius * L_bone;
-    double t_in = 0.0, t_out = 0.0;
-    if (R > 1e-9) {
-        if (side > 0.0) {
-            double x = side / R; if (x > 1.0) x = 1.0;
-            t_in = x * x * (3.0 - 2.0 * x);
-        }
-        else {
-            double x = -side / R; if (x > 1.0) x = 1.0;
-            t_out = x * x * (3.0 - 2.0 * x);
-        }
-    }
-
-    if (std::abs(P.centerSlideInWeight) > 1e-9 && t_in > 0.0) {
-        const double amount = P.centerSlideInWeight * L_bone * bend * w_j * t_in;
-        corr = mathcore::v3_add(corr,
-            mathcore::v3_scale(in_dir, amount));
-    }
-    if (std::abs(P.centerSlideOutWeight) > 1e-9 && t_out > 0.0) {
-        const double amount = P.centerSlideOutWeight * L_bone * bend * w_j * t_out;
-        corr = mathcore::v3_add(corr,
-            mathcore::v3_scale(in_dir, -amount));
-    }
-
-    return mathcore::v3_add(p_j, corr);
-}
-
-// ================================================================
-// V1: CoR + Compensation
-//
-//   P_final = P_CoR + Strength · M^falloff · (P_CoR − P_LBS)
-//           = P_LBS + (1 + Strength · M^falloff) · (P_CoR − P_LBS)
-//
-//   · M = 2·min(w1, w2)：顶点级 Joint Influence Mask（与模式 4 一致）
-//   · Strength = 0：严格等于纯 CoR（回归测试用）
-//   · Strength > 0：放大 CoR 补偿（更饱满）
-//   · Strength < 0：削弱 CoR 补偿（趋近 LBS）
-//   · bind 姿势下 ΔP = 0，M 无影响（bind 精确性不变）
-// ================================================================
-MStatus OptimizedSkinCluster::deformCoRComp(
-    MDataBlock& block, MItGeometry& iter,
-    const MMatrix& worldMat, unsigned int /*multiIndex*/) {
-
-    const double env = readEnvelopeFromNode();
-    MStatus st;
-    const double strength = block.inputValue(aCorCompStrength, &st).asDouble();
-    const double falloff = block.inputValue(aCorCompFalloff, &st).asDouble();
-    const double strengthIn = block.inputValue(aCorCompStrengthIn, &st).asDouble();
-    const double strengthOut = block.inputValue(aCorCompStrengthOut, &st).asDouble();
-
-    std::vector<mathcore::RigidTransform> rest, Cs;
-    std::vector<mathcore::Quat> poseQ;
-    if (!readBoneTransforms(block, rest, Cs, poseQ)) return MS::kSuccess;
-
-    const unsigned int nV = iter.count();
-
-    // ---- CoR cache 维护（与 deformCoR 内联，保持一致）----
-    {
-        MStatus s2;
-        bool forceFull = block.inputValue(aForceFullCoR, &s2).asBool();
-        if (s2 && forceFull) m_corCache.valid = false;
-
-        MStatus s3;
-        int triLayers = block.inputValue(aCorTriLayerExpand, &s3).asInt();
-        if (!s3) triLayers = 1;
-        int vertLayerOverride = block.inputValue(aCorVertLayerExpand, &s3).asInt();
-        if (!s3) vertLayerOverride = -1;
-        int budgetDiv = block.inputValue(aCorIncBudgetDiv, &s3).asInt();
-        if (!s3) budgetDiv = 10;
-
-        if (!m_corCache.valid || m_corCache.numVertices != nV) {
-            if (!computeCoRCache(block, nV))
-                return deformDLB(block, iter, worldMat, 0);
-        }
-        else if (m_hasPlugDirty || m_needFullWeightScan) {
-            std::vector<unsigned int> dirtyList;
-            if (m_hasPlugDirty) {
-                for (unsigned int i = 0;
-                    i < (unsigned int)m_dirtyVertFlags.size() && i < nV; ++i)
-                    if (m_dirtyVertFlags[i]) dirtyList.push_back(i);
-            }
-            if (m_needFullWeightScan) {
-                MStatus wStatus;
-                MArrayDataHandle wlH = block.inputArrayValue(
-                    MPxSkinCluster::weightList, &wStatus);
-                if (wStatus) {
-                    for (unsigned int i = 0; i < nV; ++i) {
-                        WeightMap curW = readVertexWeightsFromHandle(wlH, i);
-                        SparseW sw; sw.buildFrom(curW);
-                        if (!sparseEqual(sw, m_corCache.allW[i])) dirtyList.push_back(i);
-                    }
-                }
-            }
-            if (!dirtyList.empty()) {
-                std::sort(dirtyList.begin(), dirtyList.end());
-                dirtyList.erase(std::unique(dirtyList.begin(), dirtyList.end()),
-                    dirtyList.end());
-                if (dirtyList.size() > (size_t)nV / 4)
-                    computeCoRCache(block, nV);
-                else {
-                    int vertLayers = computeVertLayers(
-                        (unsigned int)dirtyList.size(), nV,
-                        vertLayerOverride, budgetDiv);
-                    updateCoRCacheIncremental(block, dirtyList, triLayers, vertLayers);
-                }
-            }
-            clearDirtyFlags();
-        }
-    }
-
-    MPointArray points;
-    iter.allPositions(points);
-    const MMatrix wInv = worldMat.inverse();
-    const double envFinal = env;
-    const double strengthFinal = strength;
-    const double falloffFinal = (falloff < 1e-6) ? 1.0 : falloff;
-
-#pragma omp parallel for schedule(static)
-    for (int i = 0; i < (int)nV; ++i) {
-        const auto& vw = m_vtxCache.vertices[i];
-        if (vw.empty()) continue;
-
-        MPoint ptW = points[i] * worldMat;
-        const mathcore::Vec3 origPos = { ptW.x, ptW.y, ptW.z };
-
-        // ---- 1. CoR ----
-        mathcore::Vec3 cor = origPos;
-        if ((unsigned)i < m_corCache.cors.size()) {
-            mathcore::Vec3 cl = m_corCache.cors[i];
-            MPoint cw(cl.x, cl.y, cl.z); cw *= worldMat;
-            cor = { cw.x, cw.y, cw.z };
-        }
-        const mathcore::Vec3 corDef = cor_vertex_v2(origPos, cor, vw, Cs);
-
-        // ---- 2. LBS（重算，cor_vertex_v2 内部不是 LBS）----
-        mathcore::Vec3 lbs = { 0.0, 0.0, 0.0 };
-        double wTot = 0.0;
-        for (const auto& kv : vw) {
-            const unsigned int b = kv.first;
-            const double w = (double)kv.second;
-            if (b >= (unsigned int)Cs.size()) continue;
-            lbs = mathcore::v3_add(lbs,
-                mathcore::v3_scale(mathcore::apply_transform(Cs[b], origPos), w));
-            wTot += w;
-        }
-        if (wTot > 1e-9) lbs = mathcore::v3_scale(lbs, 1.0 / wTot);
-        else lbs = origPos;
-
-        // ---- 3. Mask：M = 2·min(w1, w2)，falloff 作为整体倍率 ----
-        //
-        // 原 pow(M, falloff) 是"形状控制"：M=1 处恒不变 → 中线成尖峰
-        // 现改为整体倍率：falloff 也缩放中线，避免"中线单独凸起"
-        //   falloff = 1.0：原始分布（中线 1，边缘 0）
-        //   falloff = 2.0：整体倍率 2×（中线饱和到 1，边缘从 0 增强到 0~1）
-        //   falloff = 0.5：整体减半（中线 0.5，边缘 0）
-        //   falloff = 0.25：整体四分之一（中线 0.25）
-        double M = 0.0;
-        if (vw.size() >= 2) {
-            const double w1 = (double)vw[0].second;
-            const double w2 = (double)vw[1].second;
-            M = 2.0 * std::min(w1, w2);
-        }
-        if (falloffFinal != 1.0) {
-            M *= falloffFinal;
-            if (M > 1.0) M = 1.0;
-        }
-
-        // ---- 3.5 内侧/外侧分区权重 ----
-        // 关键：必须用【当前 pose】的关节位置算内角方向。
-        // 上一版用 bind 骨骼方向（boneDirRest）是错的：
-        //   bind 时骨骼伸直，parent_dir ≈ child_dir，child_dir - parent_dir ≈ 0
-        //   → in_dir 长度过不了 1e-6，全部回退到 0.5/0.5 → 看起来像"整体加半"
-        // 正确做法（MOS 逻辑）：
-        //   prev_dir = normalize(bc_cur - bp_cur)  // parent 骨骼 当前方向
-        //   next_dir = normalize(bn_cur - bc_cur)  // child  骨骼 当前方向
-        //   in_dir   = normalize(next_dir - prev_dir)  // 内角方向
-        //   用 LBS 后位置 lbs 相对关节 bc_cur 的偏移方向与 in_dir 点积判定
-        double w_in = 0.5;
-        double w_out = 0.5;
-        mathcore::Vec3 in_dir_cur = { 0.0, 0.0, 0.0 };
-        bool has_in_dir = false;
-        if (vw.size() >= 2) {
-            const unsigned int b1 = vw[0].first;
-            const unsigned int b2 = vw[1].first;
-
-            const int d1 = (b1 < m_boneInfo.depths.size())
-                ? m_boneInfo.depths[b1] : 0;
-            const int d2 = (b2 < m_boneInfo.depths.size())
-                ? m_boneInfo.depths[b2] : 0;
-
-            if (d1 != d2) {
-                const unsigned int b_parent = (d1 < d2) ? b1 : b2;
-                const unsigned int b_child = (d1 < d2) ? b2 : b1;
-
-                const int bn_idx = (b_child < m_boneInfo.boneSoleChild.size())
-                    ? m_boneInfo.boneSoleChild[b_child] : -1;
-
-                if (bn_idx >= 0
-                    && b_parent < (unsigned int)m_boneInfo.jointPosRest.size()
-                    && b_child < (unsigned int)m_boneInfo.jointPosRest.size()
-                    && (unsigned int)bn_idx < m_boneInfo.jointPosRest.size()
-                    && b_parent < (unsigned int)Cs.size()
-                    && b_child < (unsigned int)Cs.size()
-                    && (unsigned int)bn_idx < (unsigned int)Cs.size()) {
-
-                    const mathcore::Vec3 bp_cur = mathcore::apply_transform(
-                        Cs[b_parent], m_boneInfo.jointPosRest[b_parent]);
-                    const mathcore::Vec3 bc_cur = mathcore::apply_transform(
-                        Cs[b_child], m_boneInfo.jointPosRest[b_child]);
-                    const mathcore::Vec3 bn_cur = mathcore::apply_transform(
-                        Cs[bn_idx], m_boneInfo.jointPosRest[bn_idx]);
-
-                    const mathcore::Vec3 prev_dir = mathcore::v3_norm(
-                        mathcore::v3_sub(bc_cur, bp_cur));
-                    const mathcore::Vec3 next_dir = mathcore::v3_norm(
-                        mathcore::v3_sub(bn_cur, bc_cur));
-                    const mathcore::Vec3 in_dir_raw =
-                        mathcore::v3_sub(next_dir, prev_dir);
-                    const double in_len = mathcore::v3_len(in_dir_raw);
-
-                    if (in_len > 1e-6) {
-                        const mathcore::Vec3 in_dir =
-                            mathcore::v3_scale(in_dir_raw, 1.0 / in_len);
-                        in_dir_cur = in_dir;
-                        has_in_dir = true;
-
-                        // 用 LBS 后位置作为"顶点当前方位"参考
-                        const mathcore::Vec3 rel = mathcore::v3_sub(lbs, bc_cur);
-                        const double rel_len = mathcore::v3_len(rel);
-
-                        if (rel_len > 1e-9) {
-                            const double cos_side =
-                                mathcore::v3_dot(rel, in_dir) / rel_len;
-                            double t = (cos_side + 1.0) * 0.5;
-                            if (t < 0.0) t = 0.0;
-                            if (t > 1.0) t = 1.0;
-                            w_in = t * t * (3.0 - 2.0 * t);
-                            w_out = 1.0 - w_in;
-                        }
-                    }
-                }
-            }
-        }
-
-        // ---- 4. 合成 ----
-        // 两层叠加，语义完全解耦：
-        //
-        //   [层 A] 基础补偿：strength 放大 CoR 补偿量
-        //          combined = P_CoR + strength·M·(P_CoR − P_LBS)
-        //          这是 V1 原有语义，strength=0 时完全关闭
-        //
-        //   [层 B] 方向位移：in/out 沿 in_dir 加固定方向位移
-        //          内角：沿 -in_dir 推（in > 0 时朝外鼓）
-        //          外角：沿 +in_dir 推（out > 0 时朝内收）
-        //          w_in/w_out 严格分区，in 只影响内角、out 只影响外角
-        //          幅度基准 = |P_CoR − P_LBS| · M
-        //
-        //   关键：层 B 不是"放大补偿向量"，而是"沿固定方向加独立位移"，
-        //         所以 in 不会跨区影响外角轮廓，反之亦然。
-        //         这是 MOS 里 in/out bulge 的做法。
-        const mathcore::Vec3 delta = mathcore::v3_sub(corDef, lbs);
-        const double delta_scale = mathcore::v3_len(delta);
-
-        // 层 A：基础补偿
-        mathcore::Vec3 combined = mathcore::v3_add(
-            corDef,
-            mathcore::v3_scale(delta, strengthFinal * M));
-
-        // 层 B：内/外单侧方向位移
-        if (has_in_dir && delta_scale > 1e-9) {
-            const double amt = delta_scale * M;
-
-            // 内角：沿 -in_dir 外推（strengthIn > 0 时内角外鼓）
-            //   w_in ≈ 1（内角顶点）→ 完整幅度
-            //   w_in ≈ 0（外角顶点）→ 无影响
-            combined = mathcore::v3_add(
-                combined,
-                mathcore::v3_scale(in_dir_cur, -strengthIn * w_in * amt));
-
-            // 外角：沿 +in_dir 内收（strengthOut > 0 时外角内收）
-            //   w_out ≈ 1（外角顶点）→ 完整幅度
-            //   w_out ≈ 0（内角顶点）→ 无影响
-            combined = mathcore::v3_add(
-                combined,
-                mathcore::v3_scale(in_dir_cur, strengthOut * w_out * amt));
-        }
-
-        // ---- 5. Envelope（一次）----
-        const mathcore::Vec3 bl = applyEnvelope(origPos, combined, envFinal);
-        MPoint out(bl.x, bl.y, bl.z);
-        out *= wInv;
-        points[i] = out;
-    }
-
-    iter.setAllPositions(points);
-    return MS::kSuccess;
-}
-
-// ================================================================
 // getCoRData
 // ================================================================
 bool OptimizedSkinCluster::getCoRData(
     std::vector<mathcore::Vec3>& out) const {
     const short algorithm = MPlug(thisMObject(), aAlgorithmType).asShort();
-    if (algorithm == 0 || algorithm == 6 || algorithm == 7) {
+    if (algorithm == 0 || algorithm == 6) {
         const auto& cache = algorithm == 6 ? m_ddmV4 : m_paperCoR;
         if (!cache.valid || cache.weightVersion != m_currentWeightVersion) return false;
         out = cache.centers;

@@ -22,7 +22,9 @@ set(SOURCE_FILES
     src/cor_contour.cpp
     src/ddm_v4.cpp
     src/dlb_gpu.cpp
-    src/ocd_math.cpp 
+    src/ocd_math.cpp
+    src/ocd_hinge.cpp
+    src/ocd_centers.cpp
     src/optimizedSkinCluster.cpp
     src/optimizedSkinClusterCoR.cpp
     src/optimizedSkinClusterCmd.cpp

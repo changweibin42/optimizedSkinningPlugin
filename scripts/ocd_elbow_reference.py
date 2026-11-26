@@ -313,7 +313,10 @@ def read_rotation(quat, old_bend, old_direction):
 
 
 def fit_preview_centers(mc, om, node, shape, driver, bind, faces):
-    """Calibrate fixed centers once, in the preview's bind-object frame."""
+    """Report how well the compiled OCD+Corrected CoR tracks the reference.
+
+    The center offsets are solved inside the plug-in (structural_centers),
+    so the preview only has to drive the pose and sample the result."""
     import numpy as np
     sel = om.MSelectionList()
     sel.add(shape)
@@ -322,74 +325,18 @@ def fit_preview_centers(mc, om, node, shape, driver, bind, faces):
     sel.add(driver)
     xf = om.MFnTransform(sel.getDagPath(0))
     count = len(bind)
-    rings = 2*HALF_RINGS+1
     def sample():
         return np.array([(p.x,p.y,p.z) for p in mesh.getPoints(om.MSpace.kObject)])
-    node_sel = om.MSelectionList()
-    node_sel.add(node)
-    offset_plug = om.MFnDependencyNode(node_sel.getDependNode(0)).findPlug("corFitOffsets",False)
-    def offsets(data):
-        values = om.MDoubleArray(data.ravel().tolist())
-        offset_plug.setMObject(om.MFnDoubleArrayData().create(values))
-    zeros = np.zeros((count,3))
-    H = np.zeros((count,3,3))
-    rhs = np.zeros((count,3))
-    for angle in (60,90,120,150):
-        xf.setRotation(om.MQuaternion(*joint_quaternion(angle,0,0)),om.MSpace.kTransform)
-        offsets(zeros)
-        base = sample()
-        target = np.asarray(Elbow(angle).mesh(bind))
-        grid = target[:-2].reshape(rings,SIDES,3)
-        axial = np.gradient(grid,axis=0)
-        hoop = np.roll(grid,-1,axis=1)-np.roll(grid,1,axis=1)
-        normal = np.cross(hoop,axial)
-        normal /= np.maximum(np.linalg.norm(normal,axis=2,keepdims=True),1e-12)
-        half = radians(angle/2)
-        normal[HALF_RINGS,0] = (-sin(half),cos(half),0)
-        n = np.vstack((normal.reshape(-1,3),zeros[-2:]))
-        # Probe the compiled runtime: center sensitivity is exactly affine.
-        columns = []
-        for axis in range(3):
-            probe = zeros.copy()
-            probe[:,axis] = 1
-            offsets(probe)
-            columns.append(np.sum((sample()-base)*n,axis=1))
-        J = np.stack(columns,axis=1)
-        H += J[:,:,None]*J[:,None,:]
-        rhs += J*np.sum((target-base)*n,axis=1)[:,None]
-    if H.max()<1e-6:
-        raise RuntimeError("CoR 中心扰动未产生位移，请确认加载了本分支编译的插件。")
-    edges = sorted({tuple(sorted((a,b))) for f in faces for a,b in zip(f,f[1:]+f[:1])})
-    a,b = np.array(edges).T
-    degree = np.bincount(np.r_[a,b],minlength=count)
     active = np.array([0<skin_weight(p[0])<1 for p in bind])
-    smoothing = 0.015
-    matrix = H+(0.01+smoothing*degree)[:,None,None]*np.eye(3)
-    inverse = np.linalg.inv(matrix)
-    solution = zeros.copy()
-    for _ in range(240):
-        neighbor = zeros.copy()
-        np.add.at(neighbor,a,solution[b])
-        np.add.at(neighbor,b,solution[a])
-        updated = np.einsum("nij,nj->ni",inverse,rhs+smoothing*neighbor)
-        updated[~active] = 0
-        change = np.max(abs(updated-solution))
-        solution = updated
-        if change<1e-8:
-            break
-    offsets(solution)
     metrics = []
     for angle,twist in ((75,0),(105,0),(135,0),(-105,0),(105,45)):
         xf.setRotation(om.MQuaternion(*joint_quaternion(angle,twist,0)),om.MSpace.kTransform)
         target = np.asarray(Elbow(angle,twist).mesh(bind))
-        offsets(zeros)
-        original = sample()
-        offsets(solution)
         fitted = sample()
         def rms(q):
             return float(np.sqrt(np.mean(np.sum((q[active]-target[active])**2,axis=1))))
-        metrics.append("%g/%g: %.4f -> %.4f" % (angle,twist,rms(original),rms(fitted)))
-    print("CoR holdout RMS (bend/twist, original -> fitted): "+" | ".join(metrics))
+        metrics.append("%g/%g: %.4f" % (angle,twist,rms(fitted)))
+    print("OCD+CoR holdout RMS (bend/twist): "+" | ".join(metrics))
     xf.setRotation(om.MQuaternion(),om.MSpace.kTransform)
 
 
@@ -477,9 +424,9 @@ def show():
                 for vertex,(station,_,_) in enumerate(bind):
                     w = skin_weight(station)
                     mc.setAttr("%s.weightList[%d].weights[0:1]" % (skin,vertex),1-w,w,size=2)
-                if label=="CoR_FixedFit" and not mc.attributeQuery("corFitOffsets",node=skin,exists=True):
+                if label=="CoR_FixedFit" and not mc.attributeQuery("ocdCenterLimit",node=skin,exists=True):
                     raise RuntimeError("请加载本测试分支新编译的插件。")
-                mc.setAttr(skin+".algorithmType",{"CoR":0,"DQS_Com":2,"CoR_FixedFit":8}[label])
+                mc.setAttr(skin+".algorithmType",{"CoR":0,"DQS_Com":2,"CoR_FixedFit":5}[label])
                 if label=="DQS_Com":
                     mc.setAttr(skin+".dqsCompStrength",1.0)
                 result = mc.listRelatives(geo,shapes=True,noIntermediate=True,fullPath=True)[0]

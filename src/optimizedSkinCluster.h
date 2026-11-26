@@ -24,6 +24,8 @@
 #include "ocd_math.h"
 #include "mos_math.h"
 #include "ocd_arc.h"
+#include "ocd_hinge.h"
+#include "ocd_centers.h"
 #include "optimizedSkinClusterCoR.h"
 
 class DlbGpu;
@@ -60,18 +62,28 @@ public:
     static MObject aCorVertLayerExpand;
     static MObject aCorIncBudgetDiv;
     static MObject aCorMosSecondaryWeight;
-    // ---- CoR 补偿增强（algorithmType = 5） ----
-    // Strength = 0：严格 CoR；1：CoR 补偿量翻倍；-1：取消 CoR（退化为 LBS）
-    static MObject aCorCompStrength;
-    // Mask 的幂次：M^falloff。falloff=1 原始，>1 收窄，<1 放宽
-    static MObject aCorCompFalloff;
-    // 内侧/外侧额外补偿倍率（基于 bind 时顶点相对关节的方向判断）
-    static MObject aCorCompStrengthIn;
-    static MObject aCorCompStrengthOut;
+    // ---- OCD 铰链参数（algorithmType = 3 / 5） ----
+    // 顶点 twist 跟随骨骼扭转的比例：1 = 完整跟随，0 = 完全剥离 twist。
+    static MObject aOcdTwistWeight;
+    // 旧版内侧避让：开启后内侧肩部按参考实现的 avoid_overlap 曲线放宽。
+    static MObject aOcdAvoidOverlap;
+    // OCD+Corrected CoR 的中心修正上限（世界单位）。
+    static MObject aOcdCenterLimit;
+    // OCD 的 11 个补偿通道，顺序与参考实现的 CHANNELS 一致。
+    static constexpr int ocdChannelCount = 11;
+    static MObject aOcdCenterSlideIn;
+    static MObject aOcdCenterSlideOut;
+    static MObject aOcdSlideInPrev;
+    static MObject aOcdSlideInNext;
+    static MObject aOcdSlideOutPrev;
+    static MObject aOcdSlideOutNext;
+    static MObject aOcdSlideOrthoInPrev;
+    static MObject aOcdSlideOrthoInNext;
+    static MObject aOcdSlideOrthoOutPrev;
+    static MObject aOcdSlideOrthoOutNext;
+    static MObject aOcdBulge;
     static MObject aCorSigma;
-    static MObject aFitOffsets;
     static MObject aCorDebugLog;
-    static MObject aCorContourIn, aCorContourOut;
     static MObject aDdmIterations, aDdmLambda, aDdmKappa, aDdmAlpha, aDdmDebugLog;
     static MObject aDisplayCoR;
 
@@ -164,9 +176,11 @@ public:
 
 private:
     // ================================================================
-    // 四种算法的 deform 实现
+    // 各算法 deform 实现
+    //   0 = CoR，1 = DLB，2 = DQS Compensation，3 = OCD，
+    //   4 = MOS，5 = OCD + Corrected CoR，6 = DDM v4
     // ================================================================
-    enum class CenteredMode { CoR, DdmV4, Contour, FixedFit };
+    enum class CenteredMode { CoR, DdmV4 };
     MStatus deformCoR(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int,
         CenteredMode mode = CenteredMode::CoR);
     MStatus deformDLB(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int,
@@ -174,8 +188,8 @@ private:
     std::unique_ptr<DlbGpu> m_dlbGpu;
     MStatus deformDQSComp(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int);
     MStatus deformMOS(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int);
-    MStatus deformCoRMosSecondary(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int);
-    MStatus deformCoRComp(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int);
+    MStatus deformOCD(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int,
+        bool correctCenters);
 
     bool readBoneTransforms(MDataBlock&,
         std::vector<mathcore::RigidTransform>& out_rest,
