@@ -319,6 +319,13 @@ def rig_weights(w, three_bone):
     return (1-w-helper/2, w-helper/2, helper)
 
 
+def preview_influences(station, three_bone):
+    # Reserve weak secondary influence beyond the original transition for the
+    # experimental mesh. The five comparison rigs keep their authored weights.
+    w = 0.75*skin_weight(station)+0.25*smooth(0.5+station/9.0)
+    return rig_weights(w,three_bone)
+
+
 def rotation_matrix(q):
     import numpy as np
     x, y, z, w = np.moveaxis(np.asarray(q), -1, 0)
@@ -358,8 +365,9 @@ def hinge_displacement(bind, original, weights, bend, twist, direction):
     reach = max(radius, distance[mixed].max()) if mixed.any() else radius
     rigid_edges = distance[(~mixed) & (distance>reach)]
     support = rigid_edges.min() if rigid_edges.size else reach + radius
+    support = min(support, 2.6*radius) + 1.6*radius*sin(angle/2)**2
     raw = np.maximum(depth,0) * tan(angle/2)
-    shift = raw / np.sqrt(1+(raw/(0.95*support))**2)
+    shift = raw / np.sqrt(1+(raw/(0.95*min(support,2.6*radius)))**2)
     # Quadratic relaxation makes the inner longitudinal gap smallest at the
     # crease. The derivative of the station mapping stays positive.
     inner_fade = np.maximum(1-distance/support,0)**2
@@ -397,7 +405,7 @@ def hinge_displacement(bind, original, weights, bend, twist, direction):
     # thickness information. Retain the multi-influence rotation there.
     radial = np.maximum(np.hypot(y,z),1e-12)
     h = np.clip(np.abs(depth)/radial,0,1)
-    return (target-original)*(h*h*(3-2*h))[:,None]
+    return (target-original)*(0.55+0.45*h*h*(3-2*h))[:,None]
 
 
 def local_edges(bind, faces):
@@ -525,7 +533,7 @@ def show(three_bone=True, center_limit=16.0):
     from maya.api import OpenMaya as om
     if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "CoRSectorBendWindow" + ("Three" if three_bone else "Two")
+    win = "CoRReachBendWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
@@ -558,6 +566,7 @@ def show(three_bone=True, center_limit=16.0):
         import numpy as np
         joints, rigs, helpers = [], [], []
         weights = np.array([rig_weights(skin_weight(p[0]), three_bone) for p in bind])
+        effective = np.array([preview_influences(p[0],three_bone) for p in bind])
         layout = (("Classic_LBS",-7,16),("DQ_Skin",7,16),
                   ("CoR",-7,0),("DQS_Com",7,0),("CoR_CurveGuided",7,-16),("OCD",-7,-16))
         grid = {}
@@ -617,7 +626,7 @@ def show(three_bone=True, center_limit=16.0):
                 for vertex,(station,_,_) in enumerate(bind):
                     w = skin_weight(station)
                     mc.setAttr("%s.weightList[%d].weights[0:%d]" % (skin,vertex,len(bones)-1),
-                               *weights[vertex],size=len(bones))
+                               *(effective if label=="CoR_CurveGuided" else weights)[vertex],size=len(bones))
                 if label=="CoR_CurveGuided" and not mc.attributeQuery("corFitOffsets",node=skin,exists=True):
                     raise RuntimeError("请加载本测试分支新编译的插件。")
                 mc.setAttr(skin+".algorithmType",{"CoR":0,"DQS_Com":2,"CoR_CurveGuided":8}[label])
@@ -708,10 +717,11 @@ def show(three_bone=True, center_limit=16.0):
                     for helper in helpers:
                         helper.setRotation(om.MQuaternion(*half),om.MSpace.kTransform)
                     rotations.append(half)
-                original = np.asarray([(p.x,p.y,p.z) for p in reference.getPoints(om.MSpace.kObject)])
-                guide = hinge_displacement(bind,original,weights,bend,twist,direction)
-                outer = outer_participation(bind,weights,bend,twist,direction)
-                delta = structural_centers(edges,original,weights,rotations,guide,outer,center_limit)
+                plug.setMObject(om.MFnDoubleArrayData().create(om.MDoubleArray()))
+                original = np.asarray([(p.x,p.y,p.z) for p in guided_mesh.getPoints(om.MSpace.kObject)])
+                guide = hinge_displacement(bind,original,effective,bend,twist,direction)
+                outer = outer_participation(bind,effective,bend,twist,direction)
+                delta = structural_centers(edges,original,effective,rotations,guide,outer,center_limit)
                 plug.setMObject(om.MFnDoubleArrayData().create(om.MDoubleArray(delta.ravel().tolist())))
             mesh.setPoints([om.MPoint(*p) for p in pose.mesh(bind)],om.MSpace.kObject)
 
@@ -809,14 +819,19 @@ def show(three_bone=True, center_limit=16.0):
             print("pose | bend %.2f | twist %.2f | direction %.2f" % (bend,twist,direction))
             print("CoR -> geometric CoR | active RMS %.5f -> %.5f" %
                   (np.sqrt(np.mean(before[active]**2)),np.sqrt(np.mean(after[active]**2))))
-            print("All vertices RMS %.5f -> %.5f | single-influence max error %.5f" %
+            print("All vertices RMS %.5f -> %.5f | original single-influence region max error %.5f" %
                   (np.sqrt(np.mean(before**2)),np.sqrt(np.mean(after**2)),after[~active].max()))
             # Find the actual inner/outer meridians in the signed bend plane.
             azimuth = radians(direction + (180 if bend<0 else 0))
             rings = [v[:-2].reshape(-1,SIDES,3) for v in (*meshes,target)]
-            roll = weights[:,1].copy()
+            for row in (-5,-4,-3):
+                ids = (HALF_RINGS+row)*SIDES+np.arange(SIDES)
+                travel = meshes[1][ids,0]-np.asarray(bind)[ids,0]
+                print("horizontal ring %+d | axial min/max %.5f / %.5f" %
+                      (row,travel.min(),travel.max()))
+            roll = effective[:,1].copy()
             if weights.shape[1] == 3:
-                roll += 0.35*weights[:,2]
+                roll += 0.35*effective[:,2]
             inner_phase = azimuth-radians(twist)*roll[0:-2:SIDES]
             for step in (-1,1):
                 rows = HALF_RINGS+step*np.arange(5)
