@@ -69,6 +69,13 @@ public:
     static MObject aOcdAvoidOverlap;
     // OCD+Corrected CoR 的中心修正上限（世界单位）。
     static MObject aOcdCenterLimit;
+    // 显式指定主铰链的父/子骨骼名称（空 = 自动）。
+    // 真实角色上如果自动选择有歧义，用它显式锁定。
+    static MObject aOcdHingeParent;
+    static MObject aOcdHingeChild;
+    // 诊断：把实际选中的 parent/child/helper 名字写成字符串，
+    // 供测试与真实角色校对。不影响 outputGeom。
+    static MObject aOcdHingeReport;
     // 可选的中心偏移注入（对象空间向量）。
     // 非空时直接矩阵这些偏移，跳过求解，用于与参考实现逐级对拍。
     static MObject aOcdCenterOffsets;
@@ -288,8 +295,12 @@ private:
         // 每个 joint 的"唯一" grandchild joint（用于当前 pose 判断内角方向）
         // -1 = leaf 或无唯一 child（多 child 或 0 child），此时 in/out 分区回退到 0.5/0.5
         std::vector<int> boneSoleChild;
-        // 每个 influence 的真实 DAG 父骨（logical index）；不在 influence 集合里时为 -1。
+        // 每个 influence 的最近「已蒙皮」祖先（logical index）；没有时为 -1。
         std::vector<int> boneParent;
+        // 到那个祖先之间隔了几层关节（1 = 直接父骨，>1 表示跨过了未蒙皮关节）。
+        std::vector<int> boneParentSteps;
+        // 该骨骼是否还有子骨骼（用于判断它是否延续链条）。
+        std::vector<char> boneHasJointChild;
         unsigned long long topologySignature = 0;
     };
     BoneInfo m_boneInfo;

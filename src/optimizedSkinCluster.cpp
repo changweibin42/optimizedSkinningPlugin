@@ -63,6 +63,9 @@ MObject OptimizedSkinCluster::aOcdTwistWeight;
 MObject OptimizedSkinCluster::aOcdAvoidOverlap;
 MObject OptimizedSkinCluster::aOcdCenterLimit;
 MObject OptimizedSkinCluster::aOcdCenterOffsets;
+MObject OptimizedSkinCluster::aOcdHingeParent;
+MObject OptimizedSkinCluster::aOcdHingeChild;
+MObject OptimizedSkinCluster::aOcdHingeReport;
 MObject OptimizedSkinCluster::aOcdCenterSlideIn;
 MObject OptimizedSkinCluster::aOcdCenterSlideOut;
 MObject OptimizedSkinCluster::aOcdSlideInPrev;
@@ -316,6 +319,35 @@ MStatus OptimizedSkinCluster::initialize() {
     offsetAttr.setNiceNameOverride("OCD Corrected CoR Offsets (debug)");
     CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aOcdCenterOffsets));
     CHECK_MSTATUS_AND_RETURN_IT(attributeAffects(aOcdCenterOffsets, MPxSkinCluster::outputGeom));
+
+    MObject* const hingeAttrs[2] = {&aOcdHingeParent, &aOcdHingeChild};
+    const char* const hingeNames[2] = {"ocdHingeParent", "ocdHingeChild"};
+    const char* const hingeShorts[2] = {"ochp", "ochc"};
+    const char* const hingeLabels[2] = {"OCD Hinge Parent (override)",
+                                        "OCD Hinge Child (override)"};
+    for (int hinge = 0; hinge < 2; ++hinge) {
+        MFnTypedAttribute hingeAttr;
+        *hingeAttrs[hinge] = hingeAttr.create(hingeNames[hinge], hingeShorts[hinge],
+            MFnData::kString, MObject::kNullObj, &status);
+        CHECK_MSTATUS_AND_RETURN_IT(status);
+        hingeAttr.setStorable(true);
+        hingeAttr.setNiceNameOverride(hingeLabels[hinge]);
+        CHECK_MSTATUS_AND_RETURN_IT(addAttribute(*hingeAttrs[hinge]));
+        CHECK_MSTATUS_AND_RETURN_IT(attributeAffects(*hingeAttrs[hinge],
+            MPxSkinCluster::outputGeom));
+    }
+
+    {
+        MFnTypedAttribute reportAttr;
+        aOcdHingeReport = reportAttr.create("ocdHingeReport", "ochr",
+            MFnData::kString, MObject::kNullObj, &status);
+        CHECK_MSTATUS_AND_RETURN_IT(status);
+        reportAttr.setStorable(false);
+        reportAttr.setKeyable(false);
+        reportAttr.setWritable(false);
+        reportAttr.setNiceNameOverride("OCD Hinge Report (debug)");
+        CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aOcdHingeReport));
+    }
 
     // ---- OCD 11 个补偿通道（对应参考实现的 Channel Box 滑块） ----
     // 单位与参考实现一致；0 表示不施加该次级编辑。
@@ -1212,27 +1244,50 @@ void OptimizedSkinCluster::collectBoneInfo(MDataBlock& block) {
     }
 
     m_boneInfo.boneParent.assign(maxIdx + 1, -1);
+    m_boneInfo.boneParentSteps.assign(maxIdx + 1, 1);
     for (unsigned int i = 0; i < nB; ++i) {
-        unsigned int d = 0;
+        // 沿真实 DAG 一直向上走：中间可能夹着没有蒙皮的关节。
+        // 之前遇到未蒙皮父骨就 break，使该子骨被记为 depth=0，
+        // 导致「上臂 → 未蒙皮中间关节 → 前臂」里前臂直接失去候选资格。
+        int skinnedAncestors = 0;
+        int nearestSkinned = -1;
+        int stepsToNearest = 0;
+        int steps = 0;
         MObject curJnt = joints[i];
-        int directParent = -1;
-        while (d < 512) {
+        while (steps < 512) {
             MFnDagNode dag(curJnt);
             MObject parent = dag.parent(0);
             if (parent.isNull() || !parent.hasFn(MFn::kJoint)) break;
+            ++steps;
             int foundIndex = -1;
             for (unsigned int j = 0; j < nB; ++j) {
                 if (joints[j] == parent) { foundIndex = static_cast<int>(logicalIdx[j]); break; }
             }
-            if (foundIndex < 0) break;
-            if (d == 0) directParent = foundIndex;
+            if (foundIndex >= 0) {
+                ++skinnedAncestors;
+                if (nearestSkinned < 0) {
+                    nearestSkinned = foundIndex;
+                    stepsToNearest = steps;
+                }
+            }
             curJnt = parent;
-            ++d;
         }
-        m_boneInfo.depths[logicalIdx[i]] = (int)d;
-        // 真实 DAG 父骨：不靠「depth 小一层 + 距离最近」猜，
-        // 分支、共点关节或权重较大的辅助骨都不会被误选。
-        m_boneInfo.boneParent[logicalIdx[i]] = directParent;
+        m_boneInfo.depths[logicalIdx[i]] = skinnedAncestors;
+        m_boneInfo.boneParent[logicalIdx[i]] = nearestSkinned;
+        m_boneInfo.boneParentSteps[logicalIdx[i]] = stepsToNearest;
+    }
+
+    // 该骨骼是否还有子骨骼：用来区分「延续链条的子骨」与
+    // 「共点的 helper」。同位置的 helper 没有子骨，不应被选为主铰链的 child。
+    m_boneInfo.boneHasJointChild.assign(maxIdx + 1, 0);
+    for (unsigned int i = 0; i < nB; ++i) {
+        MFnDagNode dag(joints[i]);
+        const unsigned int childCount = dag.childCount();
+        for (unsigned int child = 0; child < childCount; ++child) {
+            if (!dag.child(child).hasFn(MFn::kJoint)) continue;
+            m_boneInfo.boneHasJointChild[logicalIdx[i]] = 1;
+            break;
+        }
     }
 
     // [新增] 缓存每个 joint 的"唯一" child（用于 deform 时算当前 pose 的内角方向）
@@ -2734,6 +2789,9 @@ MStatus OptimizedSkinCluster::deformOCD(
     using namespace mathcore;
     const double envelope = readEnvelopeFromNode();
     const bool debug = optSkinDebugLog();
+    MStatus debugStatus;
+    const bool reportHinge = debug
+        || block.inputValue(aCorDebugLog, &debugStatus).asBool();
     MStatus status;
 
     std::vector<RigidTransform> rest, Cs;
@@ -2763,7 +2821,7 @@ MStatus OptimizedSkinCluster::deformOCD(
 
     const auto& dagParents = m_boneInfo.boneParent;
     int parentBone = -1, childBone = -1;
-    double bestPairWeight = -1.0;
+    double bestPairScore = -1.0;
     for (size_t child = 0; child < depths.size() && child < rest.size(); ++child) {
         if (depths[child] == 0) continue;
         int best = -1;
@@ -2779,10 +2837,15 @@ MStatus OptimizedSkinCluster::deformOCD(
             }
         }
         if (best < 0) continue;
-        const double pairWeight =
-            std::min(boneWeight[best], boneWeight[child]);
-        if (pairWeight > bestPairWeight) {
-            bestPairWeight = pairWeight;
+        // 「延续链条的子骨」优先于「共点的 helper」。
+        // 否则只要 helper 累计权重更大，就会把它选成主铰链，
+        // 而求解器仍会输出平滑网格，只是跟错了弯曲角。
+        const bool continuesChain = child < m_boneInfo.boneHasJointChild.size()
+            && m_boneInfo.boneHasJointChild[child] != 0;
+        const double pairScore = (continuesChain ? 1.0e6 : 0.0)
+            + std::min(boneWeight[best], boneWeight[child]);
+        if (pairScore > bestPairScore) {
+            bestPairScore = pairScore;
             parentBone = best;
             childBone = static_cast<int>(child);
         }
@@ -2790,6 +2853,40 @@ MStatus OptimizedSkinCluster::deformOCD(
     if (parentBone < 0 || childBone < 0) {
         if (debug) MGlobal::displayWarning("[OCD] 未找到父子骨骼对，回退 DLB。");
         return deformDLB(block, iter, worldMat, multiIndex);
+    }
+
+    // 显式指定主铰链（空字符串 = 自动）。真实角色上如果自动选择有歧义，
+    // 用 ocdHingeParent / ocdHingeChild 直接锁定，不靠启发式。
+    {
+        const auto resolveBoneByName = [&](const MString& name) -> int {
+            if (name.length() == 0) return -1;
+            const MPlug matrixPlug(thisMObject(), MPxSkinCluster::matrix);
+            for (unsigned int entry = 0; entry < matrixPlug.numConnectedElements(); ++entry) {
+                const auto element = matrixPlug.connectionByPhysicalIndex(entry);
+                MPlugArray sources;
+                if (!element.connectedTo(sources, true, false) || sources.length() != 1) continue;
+                MFnDagNode node(sources[0].node());
+                if (node.name() == name) return static_cast<int>(element.logicalIndex());
+            }
+            return -1;
+        };
+        MStatus nameStatus;
+        const MString parentName = block.inputValue(aOcdHingeParent, &nameStatus).asString();
+        const MString childName = nameStatus
+            ? block.inputValue(aOcdHingeChild, &nameStatus).asString() : MString();
+        if (nameStatus && parentName.length() && childName.length()) {
+            const int overrideParent = resolveBoneByName(parentName);
+            const int overrideChild = resolveBoneByName(childName);
+            if (overrideParent >= 0 && overrideChild >= 0 && overrideParent != overrideChild) {
+                parentBone = overrideParent;
+                childBone = overrideChild;
+                if (debug) MGlobal::displayInfo(MString("[OCD] hinge overridden by attributes: ")
+                    + parentName + " -> " + childName);
+            }
+            else if (debug && optSkinDebugLog()) {
+                MGlobal::displayWarning("[OCD] ocdHingeParent/ocdHingeChild 无法解析，回退自动选择。");
+            }
+        }
     }
 
     // 辅助骨：除主铰链两端外仍有显著权重的骨骼。
@@ -2806,7 +2903,7 @@ MStatus OptimizedSkinCluster::deformOCD(
     }
     const int helperBone = helperBones.empty() ? -1 : helperBones.front();
 
-    if (debug) {
+    if (reportHinge) {
         // 真实角色上一定要能看到它选了哪三根骨骼。
         const MPlug matrixPlug(thisMObject(), MPxSkinCluster::matrix);
         const auto jointName = [&](int bone) -> MString {
@@ -2820,8 +2917,23 @@ MStatus OptimizedSkinCluster::deformOCD(
             }
             return MString("<unresolved>");
         };
-        MGlobal::displayInfo(MString("[OCD] hinge parent=") + jointName(parentBone) +
+        MString info = MString("[OCD] hinge parent=") + jointName(parentBone) +
+            " child=" + jointName(childBone) + " helper=" + jointName(helperBone);
+        if (static_cast<size_t>(childBone) < m_boneInfo.boneParentSteps.size()) {
+            const int steps = m_boneInfo.boneParentSteps[childBone];
+            if (steps > 1) {
+                char suffix[64];
+                snprintf(suffix, sizeof(suffix), " (%d unskinned joints crossed)", steps - 1);
+                info += suffix;
+            }
+        }
+        MGlobal::displayInfo(info);
+        // 同时写成属性，供测试/脚本直接读，不靠日志抓取。
+        MStatus reportStatus;
+        MPlug reportPlug(thisMObject(), aOcdHingeReport);
+        reportPlug.setString(MString("parent=") + jointName(parentBone) +
             " child=" + jointName(childBone) + " helper=" + jointName(helperBone));
+        (void)reportStatus;
     }
 
     // ---- 2. 由 bind 空间构造铰链坐标系 ----
@@ -3109,6 +3221,10 @@ MStatus OptimizedSkinCluster::deformOCD(
                 if (meshStatus) meshObject = input.child(MPxSkinCluster::inputGeom).asMesh();
             }
         }
+        // 基础 CoR 的积分三角形必须与算法 0 一致：都用 Maya 的
+        // getTriangles()。之前算法 5 从 face[0] 扇形三角化，在四边面上它恰好
+        // 选同一条对角线，但在 n-gon 上不保证，会让两个算法的中心不同。
+        std::vector<cor_paper::Triangle> corTriangles;
         if (!meshObject.isNull()) {
             MFnMesh mesh(meshObject, &status);
             if (status) {
@@ -3123,6 +3239,18 @@ MStatus OptimizedSkinCluster::deformOCD(
                         for (unsigned int k = 0; k < vertices.length(); ++k)
                             face.push_back(static_cast<unsigned int>(vertices[k]));
                         faces.push_back(std::move(face));
+                    }
+                }
+                MIntArray triCounts, triVerts;
+                mesh.getTriangles(triCounts, triVerts);
+                {
+                    const unsigned int triangleCount = triVerts.length() / 3;
+                    corTriangles.reserve(triangleCount);
+                    for (unsigned int triangle = 0; triangle < triangleCount; ++triangle) {
+                        corTriangles.push_back({
+                            static_cast<unsigned int>(triVerts[triangle * 3 + 0]),
+                            static_cast<unsigned int>(triVerts[triangle * 3 + 1]),
+                            static_cast<unsigned int>(triVerts[triangle * 3 + 2])});
                     }
                 }
             }
@@ -3143,11 +3271,13 @@ MStatus OptimizedSkinCluster::deformOCD(
             std::sort(rotationWeights[i].begin(), rotationWeights[i].end(),
                 [](const auto& a, const auto& b) { return a.first < b.first; });
         }
-        std::vector<cor_paper::Triangle> triangles;
-        triangles.reserve(faces.size() * 2);
-        for (const auto& face : faces) {
-            for (size_t k = 1; k + 1 < face.size(); ++k)
-                triangles.push_back({face[0], face[k], face[k + 1]});
+        // buildEdges 用原始多边形边（保留局部结构，不引入对角线）；
+        // computeCenters 用与算法 0 相同的 getTriangles() 结果。
+        const std::vector<cor_paper::Triangle>& triangles = corTriangles;
+        if (triangles.empty()) {
+            if (debug) MGlobal::displayWarning(
+                "[OCD] getTriangles() 没有返回三角形，回退到 CoR。");
+            return deformCoR(block, iter, worldMat, multiIndex);
         }
 
         double sigma = 0.1;
