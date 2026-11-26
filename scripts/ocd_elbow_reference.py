@@ -389,7 +389,10 @@ def hinge_section(station, depth, radius, weights, angle):
     # The remapping is increasing and matches rigid arc travel at support.
     side = (depth<0).astype(float)
     gather = 0.85*sin(half)*side**2
-    material = distance*(1-gather*(1-u)**2)
+    # Open the convex shoulders on the existing arc. The extra travel peaks
+    # at one sixth of the support span and vanishes at the tip and rigid end.
+    opening = 0.32*distance*sin(half)*side**2*(1-u)**5
+    material = distance*(1-gather*(1-u)**2)+opening
     join = u**3*(4-3*u)
     progress = material+extra*join
     remaining = np.maximum(arc_length-progress,0)
@@ -551,7 +554,7 @@ def show(three_bone=True, center_limit=16.0):
     from maya.api import OpenMaya as om
     if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "CoRBalancedSectionWindow" + ("Three" if three_bone else "Two")
+    win = "CoRShoulderSpacingWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
