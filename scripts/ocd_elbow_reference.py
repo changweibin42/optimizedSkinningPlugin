@@ -422,6 +422,13 @@ def anchor_profile(bind, weights, bend, twist, direction):
         width = 0.25
         u = np.minimum(distance/width,1.0)
         eased = np.where(distance<width,width*u*u*(2-u),distance)
+        # In bottom projection the hoop width follows sin(theta). Pair it
+        # with a cosine height on the convex half to fill both shoulders.
+        outer = fraction>0.5 if bend>0 else fraction<0.5
+        blend = np.clip((0.5-distance)/0.12,0.,1.)
+        blend = blend*blend*(3-2*blend)
+        ellipse = np.sin(0.5*pi*distance)**2
+        eased += np.where(outer,blend*(ellipse-eased),0.)
         fraction = np.where(fraction<=0.5,eased,1-eased)
         even = ends[0]+fraction[:,None]*(ends[1]-ends[0])
         shift = gain[row]*(even-projected)
@@ -507,7 +514,7 @@ def show(three_bone=True, center_limit=16.0):
     from maya.api import OpenMaya as om
     if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "CoRBothRoundedHoopWindow" + ("Three" if three_bone else "Two")
+    win = "CoRBottomArcWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
