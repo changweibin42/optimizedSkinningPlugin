@@ -33,10 +33,13 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 sys.path.insert(0, HERE)
 
 import ocd_elbow_reference as ref
+import ocd_elbow_reference_latest as ref_latest
 
 TOLERANCE_IDENTITY = 5.0e-3     # 零偏移算法 5 == CoR
 TOLERANCE_RIGID = 5.0e-3        # 刚性变换后的不变性
 BENDS = (118.0, 150.0)
+# --three-bone：用参考的三骨有效权重与 helper 骨。
+THREE_BONE = "--three-bone" in sys.argv
 
 
 # ----------------------------------------------------------------------
@@ -66,21 +69,34 @@ def build_rig(mc, om, bind, faces, label, parent_transform=None):
     for joint, dx in ((prev, -ref.HALF), (elbow, ref.HALF), (tip, ref.HALF)):
         mc.setAttr(joint + ".translateX", dx)
         mc.setAttr(joint + ".radius", 0.09)
-    return {"holder": holder, "geo": geo, "shape": shape,
-            "prev": prev, "elbow": elbow}
+    rig = {"holder": holder, "geo": geo, "shape": shape,
+           "prev": prev, "elbow": elbow, "helper": None}
+    if THREE_BONE:
+        helper = mc.createNode("joint", name="chk_%s_helper#" % label, parent=prev)
+        mc.setAttr(helper + ".translateX", ref.HALF)
+        mc.setAttr(helper + ".radius", 0.09)
+        rig["helper"] = helper
+    return rig
 
 
 def attach_skin(mc, rig, algorithm, bind):
     skin = mc.deformer(rig["shape"], type="optimizedSkinCluster",
                        name="chk_skin#")[0]
-    for k, joint in enumerate((rig["prev"], rig["elbow"])):
+    joints = [rig["prev"], rig["elbow"]]
+    if rig["helper"] is not None:
+        joints.append(rig["helper"])
+    for k, joint in enumerate(joints):
         mc.connectAttr(joint + ".worldMatrix[0]", "%s.matrix[%d]" % (skin, k))
         inverse = mc.getAttr(joint + ".worldInverseMatrix[0]")
         mc.setAttr("%s.bindPreMatrix[%d]" % (skin, k), *inverse, type="matrix")
     for vertex, (station, _, _) in enumerate(bind):
-        w = ref.skin_weight(station)
-        mc.setAttr("%s.weightList[%d].weights[0:1]" % (skin, vertex),
-                   1.0 - w, w, size=2)
+        if rig["helper"] is not None:
+            row = ref_latest.preview_influences(station, True)
+        else:
+            w = ref.skin_weight(station)
+            row = (1.0 - w, w)
+        mc.setAttr("%s.weightList[%d].weights[0:%d]" % (skin, vertex, len(row) - 1),
+                   *row, size=len(row))
     mc.setAttr(skin + ".algorithmType", algorithm)
     result = mc.listRelatives(rig["geo"], shapes=True,
                               noIntermediate=True, fullPath=True)[0]
@@ -99,6 +115,12 @@ def pose_elbow(mc, om, rig, bend):
     selection.add(rig["elbow"])
     om.MFnTransform(selection.getDagPath(0)).setRotation(
         om.MQuaternion(*ref.joint_quaternion(bend, 0, 0)), om.MSpace.kTransform)
+    if rig["helper"] is not None:
+        helper_sel = om.MSelectionList()
+        helper_sel.add(rig["helper"])
+        om.MFnTransform(helper_sel.getDagPath(0)).setRotation(
+            om.MQuaternion(*ref.joint_quaternion(bend * 0.5, 0, 0)),
+            om.MSpace.kTransform)
     mc.refresh(force=True)
 
 
@@ -140,6 +162,8 @@ def main():
         mc.loadPlugin("optimizedSkinningPlugin.mll", quiet=True)
         bind, faces = ref.cylinder()
         vertex_count = len(bind)
+        print("bone set: %s" % ("three-bone (preview_influences)"
+                                         if THREE_BONE else "two-bone (skin_weight)"))
 
         # ---------------- A + B ----------------
         print("=== A. 零偏移的算法 5 必须等于 CoR（验证 original 语义）===")

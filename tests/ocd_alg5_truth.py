@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """逐级对拍的另一端：用 1285f9a 参考实现算出 guide 与 centerOffset。
 
-Maya 自带的 Python 没有 numpy，所以这一步必须在外部 numpy 环境里跑。
-输入是 `tests/maya_ocd_alg5_dump.py --dump` 导出的 JSON，输出供
-`--inject` 使用。
+权重不再自行推导，而是直接消费 `maya_ocd_alg5_dump.py --dump` 导出的
+实际写入节点的权重矩阵（以及 boneCount、helper 旋转），保证两端用的是
+同一套数据。
 
 用法：
     python tests/ocd_alg5_truth.py tests/_alg5_original.json tests/_alg5_truth.json
@@ -33,24 +33,33 @@ def main():
 
     bind = payload["bind"]
     faces = payload["faces"]
-    three_bone = bool(payload.get("threeBone"))
-    edges = ref.local_edges(bind, faces)
-    if three_bone:
-        # 参考实现的有效权重：边界外保留少量次级影响。
-        weights = np.array([ref.preview_influences(p[0], True) for p in bind])
-    else:
-        weights = np.array([[1.0 - ref.skin_weight(p[0]), ref.skin_weight(p[0])]
-                            for p in bind])
+    weights = np.asarray(payload["weights"], dtype=float)
+    bone_count = int(payload["boneCount"])
+    if weights.shape[0] != len(bind):
+        print("FAIL: 权重行数与顶点数不一致")
+        return 1
+    if weights.shape[1] != bone_count:
+        print("FAIL: 权重列数与 boneCount 不一致")
+        return 1
 
-    out = {"cases": {}}
+    edges = ref.local_edges(bind, faces)
+    out = {"boneCount": bone_count,
+           "weights": payload["weights"],
+           "cases": {}}
+
     for key, case in payload["cases"].items():
         bend = case["bend"]
         original = np.asarray(case["original"])
-        rotations = [ref.joint_quaternion(0, 0, 0), ref.joint_quaternion(bend, 0, 0)]
-        if three_bone:
-            rotations.append(ref.joint_quaternion(bend * 0.5, 0, 0))
 
-        # 与参考预览完全相同的顺序：guide 是相对位移，outer 决定凸侧参与度。
+        rotations = [ref.joint_quaternion(0, 0, 0), ref.joint_quaternion(bend, 0, 0)]
+        if bone_count >= 3:
+            helper_rotation = case.get("helperRotation")
+            if helper_rotation is None:
+                print("FAIL: 三骨场景缺少 helperRotation")
+                return 1
+            rotations.append(tuple(helper_rotation))
+
+        # 与参考预览相同的顺序：guide 是相对位移，outer 决定凸侧参与度。
         outer = ref.outer_participation(bind, weights, bend, 0, 0)
         guide = ref.hinge_displacement(bind, original, weights, bend, 0, 0)
         delta = ref.structural_centers(edges, original, weights, rotations,
@@ -58,11 +67,13 @@ def main():
 
         out["cases"][key] = {
             "bend": bend,
+            "helperRotation": case.get("helperRotation"),
             "guide": guide.tolist(),
             "delta": delta.tolist(),
         }
-        print("bend=%5.1f  |guide|max=%8.4f  |delta|mean=%7.4f  |delta|max=%8.4f"
-              % (bend,
+        print("bend=%5.1f  boneCount=%d  |guide|max=%8.4f  "
+              "|delta|mean=%7.4f  |delta|max=%8.4f"
+              % (bend, bone_count,
                  float(np.max(np.linalg.norm(guide, axis=1))),
                  float(np.mean(np.linalg.norm(delta, axis=1))),
                  float(np.max(np.linalg.norm(delta, axis=1)))))

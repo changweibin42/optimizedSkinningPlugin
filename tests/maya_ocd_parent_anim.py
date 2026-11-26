@@ -25,8 +25,12 @@ import ocd_elbow_reference as ref
 
 TOLERANCE = 2.0e-3
 BEND = 118.0
-# 父骨（肩）在绑定之后的旋转，度。
-PARENT_ROTATIONS = ((0.0, 0.0, 30.0), (25.0, -40.0, 15.0))
+# 父骨（肩）在绑定之后的位姿：(translate, rotate度)。
+PARENT_POSES = (
+    ((0.0, 0.0, 0.0), (0.0, 0.0, 30.0)),
+    ((0.0, 0.0, 0.0), (25.0, -40.0, 15.0)),
+    ((4.0, -3.0, 6.0), (25.0, -40.0, 15.0)),
+)
 
 
 def build_rig(mc, om, bind, faces):
@@ -104,9 +108,15 @@ def main():
             # worldMatrix 返回 16 个浮点，行主序；平移在 12..14。
             flat = mc.getAttr(shoulder + ".worldMatrix[0]")
             pivot = om.MPoint(flat[12], flat[13], flat[14])
+            # 骨骼自己的 translateX 已经是 -HALF，不能直接覆盖。
+            bind_translate = mc.getAttr(shoulder + ".translate")[0]
 
-            for rotation in PARENT_ROTATIONS:
-                # 父骨在绑定之后才转：bindPreMatrix 保持绑定时的值不变。
+            for translate, rotation in PARENT_POSES:
+                # 父骨在绑定之后才动：bindPreMatrix 保持绑定时的值不变。
+                mc.setAttr(shoulder + ".translate",
+                           bind_translate[0] + translate[0],
+                           bind_translate[1] + translate[1],
+                           bind_translate[2] + translate[2])
                 mc.setAttr(shoulder + ".rotate",
                            rotation[0], rotation[1], rotation[2])
                 mc.refresh(force=True)
@@ -124,6 +134,8 @@ def main():
                                               rotated.y + pivot.y,
                                               rotated.z + pivot.z))
 
+                expected = [om.MPoint(p.x + translate[0], p.y + translate[1],
+                                      p.z + translate[2]) for p in expected]
                 worst = 0.0
                 for got, want in zip(moved, expected):
                     delta = got - want
@@ -131,11 +143,13 @@ def main():
                                                  delta.y * delta.y +
                                                  delta.z * delta.z))
                 ok = worst <= TOLERANCE
-                print("%-12s parent.rotate=%s  刚体跟随偏差 %.6f  %s"
-                      % (label, rotation, worst, "OK" if ok else "MISMATCH"))
+                print("%-12s parent t=%s r=%s  刚体跟随偏差 %.6f  %s"
+                      % (label, translate, rotation, worst,
+                         "OK" if ok else "MISMATCH"))
                 if not ok:
-                    failures.append("%s parent=%s 偏差 %.3e"
-                                    % (label, rotation, worst))
+                    failures.append("%s t=%s r=%s 偏差 %.3e"
+                                    % (label, translate, rotation, worst))
+                mc.setAttr(shoulder + ".translate", *bind_translate)
                 mc.setAttr(shoulder + ".rotate", 0, 0, 0)
                 mc.refresh(force=True)
 

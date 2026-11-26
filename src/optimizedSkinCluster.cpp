@@ -1211,21 +1211,28 @@ void OptimizedSkinCluster::collectBoneInfo(MDataBlock& block) {
         m_boneInfo.jointPosRest = std::move(jp);
     }
 
+    m_boneInfo.boneParent.assign(maxIdx + 1, -1);
     for (unsigned int i = 0; i < nB; ++i) {
         unsigned int d = 0;
         MObject curJnt = joints[i];
+        int directParent = -1;
         while (d < 512) {
             MFnDagNode dag(curJnt);
             MObject parent = dag.parent(0);
             if (parent.isNull() || !parent.hasFn(MFn::kJoint)) break;
-            bool found = false;
+            int foundIndex = -1;
             for (unsigned int j = 0; j < nB; ++j) {
-                if (joints[j] == parent) { curJnt = parent; found = true; break; }
+                if (joints[j] == parent) { foundIndex = static_cast<int>(logicalIdx[j]); break; }
             }
-            if (!found) break;
+            if (foundIndex < 0) break;
+            if (d == 0) directParent = foundIndex;
+            curJnt = parent;
             ++d;
         }
         m_boneInfo.depths[logicalIdx[i]] = (int)d;
+        // 真实 DAG 父骨：不靠「depth 小一层 + 距离最近」猜，
+        // 分支、共点关节或权重较大的辅助骨都不会被误选。
+        m_boneInfo.boneParent[logicalIdx[i]] = directParent;
     }
 
     // [新增] 缓存每个 joint 的"唯一" child（用于 deform 时算当前 pose 的内角方向）
@@ -2754,17 +2761,22 @@ MStatus OptimizedSkinCluster::deformOCD(
         for (const auto& kv : vertex)
             if (kv.first < boneWeight.size()) boneWeight[kv.first] += kv.second;
 
+    const auto& dagParents = m_boneInfo.boneParent;
     int parentBone = -1, childBone = -1;
     double bestPairWeight = -1.0;
     for (size_t child = 0; child < depths.size() && child < rest.size(); ++child) {
         if (depths[child] == 0) continue;
-        // 直接父骨骼：depth 小 1 且 bind 位置最近。
         int best = -1;
-        double bestDistance = 1e300;
-        for (size_t candidate = 0; candidate < depths.size() && candidate < rest.size(); ++candidate) {
-            if (depths[candidate] != depths[child] - 1) continue;
-            const double d = v3_len(v3_sub(pivots[child], pivots[candidate]));
-            if (d < bestDistance) { bestDistance = d; best = static_cast<int>(candidate); }
+        // 优先用真实 DAG 父骨；只有查不到时才退回「层数+距离」猜测。
+        if (child < dagParents.size()) best = dagParents[child];
+        if (best < 0 || static_cast<size_t>(best) >= rest.size()) {
+            best = -1;
+            double bestDistance = 1e300;
+            for (size_t candidate = 0; candidate < depths.size() && candidate < rest.size(); ++candidate) {
+                if (depths[candidate] != depths[child] - 1) continue;
+                const double d = v3_len(v3_sub(pivots[child], pivots[candidate]));
+                if (d < bestDistance) { bestDistance = d; best = static_cast<int>(candidate); }
+            }
         }
         if (best < 0) continue;
         const double pairWeight =
@@ -2793,6 +2805,24 @@ MStatus OptimizedSkinCluster::deformOCD(
         return deformDLB(block, iter, worldMat, multiIndex);
     }
     const int helperBone = helperBones.empty() ? -1 : helperBones.front();
+
+    if (debug) {
+        // 真实角色上一定要能看到它选了哪三根骨骼。
+        const MPlug matrixPlug(thisMObject(), MPxSkinCluster::matrix);
+        const auto jointName = [&](int bone) -> MString {
+            if (bone < 0) return MString("<none>");
+            for (unsigned int entry = 0; entry < matrixPlug.numConnectedElements(); ++entry) {
+                const auto element = matrixPlug.connectionByPhysicalIndex(entry);
+                if (static_cast<int>(element.logicalIndex()) != bone) continue;
+                MPlugArray sources;
+                if (element.connectedTo(sources, true, false) && sources.length() == 1)
+                    return MFnDagNode(sources[0].node()).name();
+            }
+            return MString("<unresolved>");
+        };
+        MGlobal::displayInfo(MString("[OCD] hinge parent=") + jointName(parentBone) +
+            " child=" + jointName(childBone) + " helper=" + jointName(helperBone));
+    }
 
     // ---- 2. 由 bind 空间构造铰链坐标系 ----
     // 参考实现把肢体放在 x 轴、半径 1 的圆柱上；这里做同样的对齐。

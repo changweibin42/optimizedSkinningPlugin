@@ -288,6 +288,8 @@ private:
         // 每个 joint 的"唯一" grandchild joint（用于当前 pose 判断内角方向）
         // -1 = leaf 或无唯一 child（多 child 或 0 child），此时 in/out 分区回退到 0.5/0.5
         std::vector<int> boneSoleChild;
+        // 每个 influence 的真实 DAG 父骨（logical index）；不在 influence 集合里时为 -1。
+        std::vector<int> boneParent;
         unsigned long long topologySignature = 0;
     };
     BoneInfo m_boneInfo;
