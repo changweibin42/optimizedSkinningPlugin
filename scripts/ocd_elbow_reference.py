@@ -423,12 +423,11 @@ def anchor_profile(bind, weights, bend, twist, direction):
         u = np.minimum(distance/width,1.0)
         eased = np.where(distance<width,width*u*u*(2-u),distance)
         # In bottom projection the hoop width follows sin(theta). Pair it
-        # with a cosine height on the convex half to fill both shoulders.
-        outer = fraction>0.5 if bend>0 else fraction<0.5
+        # with a cosine height on both halves to fill both shoulders.
         blend = np.clip((0.5-distance)/0.12,0.,1.)
         blend = blend*blend*(3-2*blend)
         ellipse = np.sin(0.5*pi*distance)**2
-        eased += np.where(outer,blend*(ellipse-eased),0.)
+        eased += blend*(ellipse-eased)
         fraction = np.where(fraction<=0.5,eased,1-eased)
         even = ends[0]+fraction[:,None]*(ends[1]-ends[0])
         shift = gain[row]*(even-projected)
@@ -492,6 +491,19 @@ def geometry_residual(bind, original, weights, bend, twist, direction):
             inner = np.clip(np.sign(bend)*np.cos(azimuth[row])*2,0.,1.)
             inner = inner*inner*(3-2*inner)
             target[row] += ((wall-target[row]@up)*inner)[:,None]*up
+            # Keep the inner and outer poles from the longitudinal solve.
+            # Across the hoop, interpolate the in-plane section on their chord;
+            # cosine spacing and the retained lateral depth give a rounded cap.
+            phi = azimuth[row]%(2*pi)
+            order = np.argsort(phi)
+            ring = target[row]
+            projected = np.column_stack((ring[:,0],ring@normal))
+            ends = np.array([np.interp([0.,pi],phi[order],v[order],period=2*pi)
+                             for v in projected.T]).T
+            chord = ends[0]+(0.5-0.5*np.cos(phi))[:,None]*(ends[1]-ends[0])
+            shift = chord-projected
+            ring[:,0] += shift[:,0]
+            ring += shift[:,1,None]*normal
     return profile-original
 
 
@@ -514,7 +526,7 @@ def show(three_bone=True, center_limit=16.0):
     from maya.api import OpenMaya as om
     if center_limit is not None and (not isfinite(center_limit) or center_limit <= 0):
         raise ValueError("center_limit must be finite and positive")
-    win = "CoRBottomArcWindow" + ("Three" if three_bone else "Two")
+    win = "CoRStraightSectionWindow" + ("Three" if three_bone else "Two")
     if mc.window(win, exists=True):
         mc.showWindow(win)
         return win
@@ -994,5 +1006,6 @@ if __name__ == "__main__":
         self_test()
     else:
         show()
+
 
 
