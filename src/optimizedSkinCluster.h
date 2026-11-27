@@ -75,6 +75,7 @@ public:
     static MObject aOcdEnableCenterLimit;
     static MObject aOcdOuterGather;
     static MObject aOcdBendFlip;
+    static MObject aOcdElbowGuide;
     // 显式指定主铰链的父/子骨骼名称（空 = 自动）。
     // 真实角色上如果自动选择有歧义，用它显式锁定。
     static MObject aOcdHingeParent;

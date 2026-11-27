@@ -66,6 +66,7 @@ MObject OptimizedSkinCluster::aOcdCenterLimit;
 MObject OptimizedSkinCluster::aOcdEnableCenterLimit;
 MObject OptimizedSkinCluster::aOcdOuterGather;
 MObject OptimizedSkinCluster::aOcdBendFlip;
+MObject OptimizedSkinCluster::aOcdElbowGuide;
 MObject OptimizedSkinCluster::aOcdCenterOffsets;
 MObject OptimizedSkinCluster::aOcdHingeParent;
 MObject OptimizedSkinCluster::aOcdHingeChild;
@@ -371,6 +372,17 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setNiceNameOverride("OCD Flip Plane On Negative Bend");
     addAttribute(aOcdBendFlip);
     attributeAffects(aOcdBendFlip, MPxSkinCluster::outputGeom);
+
+    // 算法 5 的 guide 来源：true 用 Elbow::point（与算法 3 同一套解析截面），
+    // false 用 hingeDisplacement（内外轮廓 + 厚度梯度）。默认 true。
+    aOcdElbowGuide = nAttr.create("ocdElbowGuide", "ocdeg",
+        MFnNumericData::kBoolean, true, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    nAttr.setKeyable(true);
+    nAttr.setStorable(true);
+    nAttr.setNiceNameOverride("OCD Guide From Elbow Model");
+    addAttribute(aOcdElbowGuide);
+    attributeAffects(aOcdElbowGuide, MPxSkinCluster::outputGeom);
 
     MFnTypedAttribute offsetAttr;
     aOcdCenterOffsets = offsetAttr.create("ocdCenterOffsets", "ocdcf",
@@ -3461,8 +3473,36 @@ MStatus OptimizedSkinCluster::deformOCD(
             // 参考实现的权重就是 (parent, child, helper)。
             hingeWeights[i] = {chainWeights[i][0], chainWeights[i][1], chainWeights[i][2]};
         }
-        guide = ocd_hinge::hingeDisplacement(stationsLocal, depthsLocal, lateralsLocal,
-            originalLocal, hingeWeights, hingeParams);
+        // guide 来源有两种：
+        //   · hingeDisplacement：内外两条轮廓 + 厚度梯度插值
+        //   · Elbow::point：与算法 3 相同的解析截面构造
+        // 两者在高弯曲下的外轮廓差别很大：前者会把外侧压瘪（负弯时
+        // bind.y<0 的一侧被 plane 翻转成「内侧」，厚度只由 inner 决定），
+        // 后者保留铰链解析模型本来就有的凸出量。参考预览里被认可的形状
+        // 来自 Elbow，所以默认走 Elbow。
+        MStatus guideSourceStatus;
+        const bool useElbowGuide =
+            block.inputValue(aOcdElbowGuide, &guideSourceStatus).asBool();
+        if (!guideSourceStatus || useElbowGuide) {
+            ocd_hinge::Pose elbowPose;
+            elbowPose.bend = bendDegrees;
+            elbowPose.twist = twistDegrees;
+            elbowPose.direction = directionDegrees;
+            elbowPose.avoidOverlap = avoidOverlap;
+            elbowPose.values = hingeParams.values;
+            const ocd_hinge::Elbow elbow(elbowPose);
+            for (unsigned int i = 0; i < nV; ++i) {
+                // Elbow 给出的是"当前姿态下的绝对位置（局部帧）"，
+                // 减掉零偏移的 CoR 输出才是相对位移。
+                const Vec3 target = elbow.point(bindLocal[i].x,
+                    bindLocal[i].y, bindLocal[i].z);
+                guide[i] = v3_sub(target, originalLocal[i]);
+            }
+        }
+        else {
+            guide = ocd_hinge::hingeDisplacement(stationsLocal, depthsLocal, lateralsLocal,
+                originalLocal, hingeWeights, hingeParams);
+        }
 
         ocd_centers::Settings settings;
         // 用「相对父骨」的旋转。绝对旋转会让中心修正随父骨方向变化，
