@@ -415,3 +415,6 @@ tests/_a8_delta.json
 # commit message scratch
 _commitmsg.txt
 
+
+tests/_density.json
+
