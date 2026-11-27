@@ -373,10 +373,13 @@ MStatus OptimizedSkinCluster::initialize() {
     addAttribute(aOcdBendFlip);
     attributeAffects(aOcdBendFlip, MPxSkinCluster::outputGeom);
 
-    // 算法 5 的 guide 来源：true 用 Elbow::point（与算法 3 同一套解析截面），
-    // false 用 hingeDisplacement（内外轮廓 + 厚度梯度）。默认 true。
+    // 算法 5 的 guide 来源：true 用 Elbow::point，false 用 hingeDisplacement。
+    // 默认 false：Elbow::point 的目标在「未旋转的肢体局部系」，而 originalLocal
+    // 已经是随子骨旋转后的 CoR 输出，两者不在同一坐标系，直接相减会得到
+    // 量级 3~4 的 guide（实测正侧 guide.y 达 3.88），求解后顶点被推离目标。
+    // 保留开关方便继续对齐，但默认走已验证一致的 hingeDisplacement。
     aOcdElbowGuide = nAttr.create("ocdElbowGuide", "ocdeg",
-        MFnNumericData::kBoolean, true, &status);
+        MFnNumericData::kBoolean, false, &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
     nAttr.setKeyable(true);
     nAttr.setStorable(true);
