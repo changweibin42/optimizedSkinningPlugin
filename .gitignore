@@ -411,3 +411,7 @@ tests/_a8_step*.py
 .pylibs/
 
 tests/_a8_delta.json
+
+# commit message scratch
+_commitmsg.txt
+

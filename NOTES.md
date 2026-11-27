@@ -1,12 +1,17 @@
 # OCD + Corrected CoR 移植笔记
 
 > 这份文件是给"新对话里的自己"看的。当前仓库状态、已确认的结论、
-> 被推翻的判断、以及卡住的确切位置都写在这里，不要重新走一遍已知的弯路。
+> 被推翻的判断、以及下一步该做什么都写在这里，不要重新走一遍已知的弯路。
 
 - 仓库：`https://github.com/changweibin42/optimizedSkinningPlugin`
 - 分支：`codex/ocd-hinge-core`
 - 本文件所在提交：见 `git log -1`
 - 平台：Windows，Maya 2024，DevKit `C:\Users\changweibin\devkitBase`
+
+**一句话状态（2026-11-27）**：目标已经达到。真实 `test04.ma` 上插件的
+alg 5 与参考预览 `CoR_CurveGuided` 逐环一致到 `0.0005`，alg 3 与预览的
+OCD 格一致到 `0.0002`。上一版笔记里"插件只有 1.03R"的判断**已被推翻**，
+原因见 §5。剩下的工作是确认用户场景里 deformer 接在哪、以及视口表现（§11）。
 
 ---
 
@@ -147,39 +152,110 @@ p(base) = Σ w_k·T_k(base) + R_blend·(rest − base)
 
 **所以"test04 上做不出参考造型"这个判断是错的。** 造型能出来。
 
+**⚠ 这个脚本有一个容易误读的地方**：它是在**新建的空场景**里用夹具重建了一套
+`prev → elbow → helper` 的 rig，把网格按 `1/R` 缩放到单位半径，**不是**在
+`test04.ma` 上跑。所以它证明的是「参考数学在这份网格上给出 1.25R」，
+不是「插件在真实场景里给出 1.25R」。后者由 §5 的
+`tests/real_target_curveguided.py` 证明。
+
 ---
 
-## 5. 卡住的确切位置
+## 5. 卡住的位置
 
-**同样的输入，C++ alg 5 在外扩量上只有 1.03R，而参考预览是 1.25R。**
+**上一版这里写的是：同样的输入，C++ alg 5 在外扩量上只有 1.03R，而参考预览是 1.25R。**
 
-已逐项排除：
+**这个判断已经被推翻（见 §5.3）。** 在真实 `test04.ma` 上把插件建在 rest 网格
+上游、摆成 −147.2124°，alg 5 与预览 `CoR_CurveGuided` 逐环一致到 **0.0005**，
+alg 3（OCD）与预览的 OCD 格一致到 0.0002。**求解链没有任何残留偏差。**
 
-| 验证项 | 结果 | 说明 |
+复现命令（退出码 0 = 通过）：
+
+```
+set "MAYA_PLUG_IN_PATH=D:\...\optimizedSkinningPlugin\build\Release"
+set "PYTHONPATH=D:\...\optimizedSkinningPlugin\.pylibs"
+mayapy tests\real_target_curveguided.py
+```
+
+实测（真实场景，不是重建夹具；数据来自上面那条命令的输出）：
+
+```
+      x/R      cor/R    fig/cor     预览fig |        差    ocd/cor      预览OCD
+   -1.219     1.0000     1.2508     1.2508    +0.0000     1.1602      1.1602
+   -0.975     1.0000     1.2550     1.2550    +0.0000     1.1906      1.1906
+   -0.731     1.0000     1.2508     1.2508    +0.0000     1.2138      1.2137
+    0.000     1.0000     1.1991     1.1991    +0.0000     1.2195      1.2195
+  24 个环的最大差 0.0005
+```
+
+### 5.1 「1.03R」最可能的来源是**接法**
+
+`mc.deformer()` 会插在网格已有 deformer 的**下游**。test04 里
+`pCylinderShape2` 上挂着原生 `skinCluster1`，所以
+
+```python
+mc.deformer("pCylinderShape2", type="optimizedSkinCluster")   # ← 错
+```
+
+拿到的 `inputGeom` 是 `skinCluster1.outputGeometry[0]`，也就是**已经摆好姿势
+的网格**，而不是 rest 网格。插件于是把「姿势后的形状」当成 bind 网格去求
+中心，输出又被再变形一次。实测同一姿态下：
+
+| 接法 | deformer 输入 | x=−1.219 的 fig/cor |
 |---|---|---|
-| 纯父骨顶点 `guide` 符合公式 | `0.00000` | 73 个 `w1=0` 顶点精确相等 |
-| C++ delta 经 alg 8 求值 vs alg 5 | `1e-6` | 求值路径一致 |
-| `A·delta` 复现 C++ 顶点位移 | `0.00000` | 按 `w1` 分段全部精确 |
-| `structuralCenters` 移植 | 与 Python 一致 | HALF=6 圆柱上 `2.46e-07` |
+| 上游（正确） | `pCylinderTargetShapeOrig.worldMesh` | **1.2508** |
+| 下游（默认插入位置） | `skinCluster1.outputGeometry[0]` | 1.0952 |
 
-**所以求解器、`A_i`、`delta`、求值路径都没有错。**
+下游接法在整条肢体上给出 0.83–1.13 的比值，量级正好落在「1.03R」附近。
 
-**剩下的差异只能在 `original`（`originalLocal` vs 预览的 `original`），
-或者 `chainWeights` / `settings.rotations` 的构造。**
+**判据（一行）**：看 deformer 的输入是不是 rest 网格。
 
-### 未完成的下一步
-
-**导出 C++ 的 `originalLocal`，与预览的 `original` 逐点对比。**
-
-`ocdGuideDump` 给出 `guide`，所以可以反推：
-
-```
-originalLocal = Elbow.point(bindLocal) − guide      （当 ocdElbowGuide=true 时）
+```python
+mc.listConnections(skin + ".input[0].inputGeometry", s=True, d=False, plugs=True)
 ```
 
-或者更直接：在 `deformOCD` 里临时把 `originalLocal` 写进一个新 dump 属性。
+**正确的接法**：先断开网格的 `inMesh`，把 rest 形状的 `worldMesh` 直接接上去，
+再 `mc.deformer()`；顺序反了就会插到原生蒙皮后面。
 
-**这是唯一还没排除的环节。**
+### 5.2 「1.03R」也可能是**度量口径**
+
+畸变只集中在 `|x/R| < 3` 的混合区；`|x| > 6` 时 `Elbow`/`hinge_section` 的
+rail 表取到 `OUTER[9] = 0`，是纯刚体，比值恰好 1.0。整条肢体平均会把 1.25
+稀释成 1.03。夹具实测（`final/cor` 的逐环比值，按顶点数加权）：
+
+```
+全部 201 环    16080 点  平均 1.0447   ← 和一个"1.03R"的量级吻合
+|x/R| <= 6      7920 点  平均 1.0908
+|x/R| <= 3.2    4240 点  平均 1.1698
+|x/R| <= 2.0    2640 点  平均 1.2294
+```
+
+**所以量外扩必须按环报，不要报整条肢体的一个均值**（§6.5 的同类坑）。
+
+### 5.3 被推翻的判断
+
+上一版 §5 的整张「已逐项排除」表方向是对的，但结论错了：它把
+`originalLocal` / `chainWeights` / `settings.rotations` 当成仅剩嫌疑，
+实际上这三者都在预期内，差异根本不在求解链上。**§11 的三步优先级因此作废。**
+
+### 5.4 仍然值得记的一处口径差
+
+`ocdCenterLimit` 属性按**世界单位**暴露，求解时除以 `radius` 变成
+「肢体半径的倍数」；预览的 `center_limit=16` 本来就是半径倍数。所以
+
+```
+属性值 16.0            → 归一化 16.2485   （R = 0.984706）
+预览等价                → 属性值 15.7553
+```
+
+实测两者对结果的最大影响只有 0.0005（`limit=4R` 时才把 x=−1.219 从 1.2508
+拉到 1.2438，仍然远高于 1.03）。**但半径差别大的模型上这个语义差会放大**，
+换模型时先算一遍 `limit / R`。
+
+### 5.5 没验证的部分
+
+我对**用户具体场景里 deformer 到底接在哪**没有直接观测。上面 A/B 两种接法
+是我在真实 `test04.ma` 里自己搭的。要确认实际用法，跑 §5.1 那一行
+`listConnections` 即可。
 
 ---
 
@@ -253,10 +329,37 @@ const double depth = depths[i] * cosPhase - laterals[i] * sinPhase;
 `deform()` 里用 `MPlug.setMObject` 写入的属性，若 `setStorable(false)`，
 Maya 不保留，`getAttr` 永远是空数组。**必须 `setStorable(true)`。**（已在 `05e24c7` 修）
 
-### 6.7 不要往 `D:\` 写文件
+### 6.7 沙箱
 
-沙箱只允许写工作区 `C:\Users\changweibin\Documents\deepseek-harness\default-workspace`。
-往 `D:\` 复制会 `PermissionDenied`。要给用户文件，走 git 推送。
+旧版这里写"不要往 `D:\` 写文件，沙箱只允许写工作区"。**这条已作废**：
+本会话的文件策略是 `danger-full-access`，工作区外也能读写，`D:\maya2024\scenes\ndj\test04.ma`
+可以直接 `file -open`。
+
+**但 `D:\optimizedSkinningPlugin\*` 是用户自己的拉取目录**，仍然不要在那里改仓库
+（§12）。在 `D:\maya2024\scenes\ndj\` 下**只读不写**即可。
+
+### 6.9 打开 test04.ma 之前要先 `loadPlugin`
+
+```python
+mc.loadPlugin("optimizedSkinningPlugin.mll", quiet=True)
+mc.file(SCENE, open=True, force=True)
+```
+
+顺序反了会得到 `警告: 未知节点类型: optimizedSkinCluster`，场景里的节点变成
+unknown，`mc.ls(type="optimizedSkinCluster")` 返回空。
+
+### 6.10 场景打开时是零姿势
+
+`test04.ma` 里的 `joint1 / L_Ankle_jnt / joint3` 打开后 `rotate` 全是
+`(0,0,0)`，没有动画曲线驱动。夹具 `ocd_case3.json` 那一帧的
+`−147.2124°` 是导出时手摆的。**测之前必须自己摆姿势**：
+
+```python
+mc.setAttr("L_Ankle_jnt.rotateZ", -147.2124)
+```
+
+不摆的话 alg 0 / alg 3 / alg 5 三者输出完全相同（都是 rest），
+会误判成"插件没生效"。
 
 ### 6.8 `cmake` 不在 PATH
 
@@ -312,6 +415,7 @@ alg8 全零偏移 vs alg0: 0.000e+00
 | `support=2.6` 能修折痕 | 把折痕从 `x=0` 搬到 `x=±0.667`，且破坏 118°/120° 已认可形态 |
 | test04 上做不出参考造型 | **能做出**，`show_test04_preview.py` 已复现 1.25R |
 | C++ 用 `Elbow` 驱动 guide 会更好 | 跨帧相减，`guide` 达 3.88，结果崩溃 |
+| 插件单独跑同样输入只有 1.03R，差异在 `originalLocal` / `chainWeights` | **错**。真实 `test04.ma` 上插件 alg 5 = 预览到 `0.0005`（§5）。1.03R 来自**接法**（deformer 插在原生蒙皮下游）或**把整条肢体平均**（§5.1/§5.2） |
 
 ---
 
@@ -355,41 +459,54 @@ bend    中线k    最大k     圆度
 
 | 脚本 | 用途 |
 |---|---|
-| `tests/show_test04_preview.py` | **把参考预览搬到 test04**（七格数值对比） |
+| `tests/real_target_curveguided.py` | **★ 关键验收**：真实 `test04.ma` 上插件 vs 参考预览，含上游/下游两种接法 |
+| `tests/show_test04_preview.py` | 把参考预览搬到 test04（七格数值对比，从夹具重建） |
 | `tests/ocd_elbow_reference_latest.py` | 与 `cor-local-structure-d78d264` 版本 SHA256 相同 |
 | `tests/ocd_center_limit_toggle.py` | `ocdEnableCenterLimit` 验收 |
 | `tests/ocd_alg8_fixedfit.py` | alg 8 语义验收 |
 | `tests/verify_A_matrix.py` | `A·delta` 与顶点位移一致性 |
 | `tests/guide_vs_elbow.py` | `guide` 与 `Elbow` 期望对比 |
 | `tests/elbow_guide_compare.py` | 两种 guide 来源对比 |
-| `tests/cpp_py_rig_fixed.py` | 正确 rig 层级下的 alg5 半径 |
+| `tests/cpp_py_rig_fixed.py` | 正确 rig 层级下的 alg5 半径（458 点） |
+| `tests/preview_vs_cpp_radius.py` | 458 点圆柱上 preview / CoR / alg5 逐环对比 |
 | `tests/ring_roundness.py` | 坐标系无关的逐环圆度 |
 | `tests/support_sweep.py` | `support` 扫描 |
 | `tests/verify_hinge_continuity.py` | `hinge_section` 连续性与导数 |
+| `tests/replay_exported_case.py` | 从 `D:\tmp\ocd_case3.json` 重建场景并重放（复现到 `1e-22`） |
+
+跑测试的通用环境：
+
+```powershell
+$env:MAYA_PLUG_IN_PATH = "<repo>\build\Release"
+$env:PYTHONPATH = "<repo>\.pylibs"
+```
+
+**注意**：本机 `PYTHONPATH` 全局指向一个 Python 3.11 共享目录，会污染 mayapy
+的 3.10 解释器（`SRE module mismatch`）。跑 mayapy 前必须把它覆盖成 `.pylibs`。
 
 ---
 
 ## 11. 下一步建议
 
-**优先级 1：查 `originalLocal` 与预览 `original` 的数值差异。**
+§11 原来那三步（查 `originalLocal` / 查 `chainWeights` 第三列 / 参数化
+`Elbow` 的 `HALF`）**已作废**：§5 已证明求解链在真实场景上与预览一致到
+0.0005，那三步是在追一个不存在的偏差。
 
-方法：在 `deformOCD` 里加一个 dump 属性写 `originalLocal`（或者临时用
-`Elbow.point(bindLocal) − guide` 反推，前提是 `ocdElbowGuide=true`），
-与 `tests/show_test04_preview.py` 里的 `original`（alg 8 零偏移输出）逐点比较。
+**现在的优先级：**
 
-若两者一致 → 差异在 `chainWeights` 或 `settings.rotations`。
-若不一致 → 就是它。
+1. **确认用户场景里 deformer 接在哪**（§5.1 那一行 `listConnections`）。
+   如果接在原生蒙皮下游，就是全部解释；如果不是，再说。
 
-**优先级 2：确认 `chainWeights` 的第三列（helper）。**
+2. **把「已复现」这件事在视觉上确认一次**。数值上 alg 5 = 预览到 0.0005，
+   但我没有亲眼看过视口。用户看的是视口，若视口仍不对，问题在 GPU/VP2 路径
+   或另一个网格（test04 里 `pCylinderTarget` 和 `pCylinderShape2` 是两份
+   16808/16080 点的网格，容易看错对象）。alg 3/5 都走 CPU（
+   `optimizedSkinClusterGPUDeformer.cpp:344` 对 alg 3 显式返回失败），
+   所以 GPU 路径理论上不参与，但没有验证过 alg 5 的视口结果。
 
-test04 里 `helperBone = -1`（无 helper），但 `chainWeights[i][2]` 是否恒为 0？
-若不为 0 而 `settings.rotations[2]` 是单位四元数，`A_i` 就会偏。
-
-**优先级 3：如果前两项都排除，考虑让 `Elbow` 的 `HALF` 参数化。**
-
-`Elbow` 的偏移表按 `HALF=6` 拟合。test04 的半长是 12，超出 2 倍。
-若要让 `Elbow` 覆盖全肢体，需要把 `RING_STEP` 按实际 `|station|max` 缩放。
-**但这会改变已认可的 458 点圆柱造型，需谨慎。**
+3. **`Elbow` 的 `HALF=6` 限制**仍然是真的（§6.2 那条成立）：`|station| > 6`
+   取到 `OUTER[9]=0` 是纯刚体。test04 混合区在 `|x| ≤ 2.5`，够用；
+   换到更长的肢体才需要参数化。**这条不是当前卡点。**
 
 ---
 
