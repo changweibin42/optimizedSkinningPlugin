@@ -67,6 +67,7 @@ MObject OptimizedSkinCluster::aOcdEnableCenterLimit;
 MObject OptimizedSkinCluster::aOcdOuterGather;
 MObject OptimizedSkinCluster::aOcdBendFlip;
 MObject OptimizedSkinCluster::aOcdElbowGuide;
+MObject OptimizedSkinCluster::aOcdCreaseFillet;
 MObject OptimizedSkinCluster::aOcdCenterOffsets;
 MObject OptimizedSkinCluster::aOcdHingeParent;
 MObject OptimizedSkinCluster::aOcdHingeChild;
@@ -386,6 +387,23 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setNiceNameOverride("OCD Guide From Elbow Model");
     addAttribute(aOcdElbowGuide);
     attributeAffects(aOcdElbowGuide, MPxSkinCluster::outputGeom);
+
+    // station=0 折角的圆角窗口（肢体半径倍数）。默认 0 = 关闭，保持参考实现
+    // 的硬旋转切换。参考实现在这里有一个 15.5° 的折角：458 点低密度网格的
+    // 环距 0.667 跨过了折角，看起来圆滑；16080 点环距 0.060 会如实采出来。
+    // 试出来的平衡点是 0.15：高密度网格内轨三点转角 164.9° -> 49.5°，
+    // 而 458 点造型只动 0.0389（不到半径的 4%）。
+    aOcdCreaseFillet = nAttr.create("ocdCreaseFillet", "occf",
+        MFnNumericData::kDouble, 0.0, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    nAttr.setMin(0.0);
+    nAttr.setMax(3.0);
+    nAttr.setSoftMax(0.3);
+    nAttr.setKeyable(true);
+    nAttr.setStorable(true);
+    nAttr.setNiceNameOverride("OCD Crease Fillet (body radii)");
+    addAttribute(aOcdCreaseFillet);
+    attributeAffects(aOcdCreaseFillet, MPxSkinCluster::outputGeom);
 
     MFnTypedAttribute offsetAttr;
     aOcdCenterOffsets = offsetAttr.create("ocdCenterOffsets", "ocdcf",
@@ -3312,6 +3330,12 @@ MStatus OptimizedSkinCluster::deformOCD(
         bindLocal[i] = toLocalPoint(frames[i].rest);
     }
 
+    // station=0 折角的圆角窗口（肢体半径倍数，0 = 关闭）。
+    MStatus filletStatus;
+    const double creaseFillet =
+        block.inputValue(aOcdCreaseFillet, &filletStatus).asDouble();
+    const double filletWindow = filletStatus ? std::max(0.0, creaseFillet) : 0.0;
+
     // ---- 7. 补偿通道与目标形状 ----
     ocd_hinge::HingeParams hingeParams;
     hingeParams.bend = bendDegrees;
@@ -3326,6 +3350,7 @@ MStatus OptimizedSkinCluster::deformOCD(
         const bool flip = block.inputValue(aOcdBendFlip, &flipStatus).asBool();
         if (flipStatus) hingeParams.bendFlip = flip;
     }
+    hingeParams.creaseFillet = filletWindow;
     {
         // 11 个补偿通道按参考实现的 CHANNELS 顺序读取。
         MObject* const channelAttrs[ocdChannelCount] = {
@@ -3359,6 +3384,7 @@ MStatus OptimizedSkinCluster::deformOCD(
         elbowPose.direction = directionDegrees;
         elbowPose.avoidOverlap = avoidOverlap;
         elbowPose.values = hingeParams.values;
+        elbowPose.creaseFillet = filletWindow;
         const ocd_hinge::Elbow elbow(elbowPose);
         for (unsigned int i = 0; i < nV; ++i) {
             // 形状在局部帧里建好，再经父骨当前位姿放回世界；
@@ -3493,6 +3519,7 @@ MStatus OptimizedSkinCluster::deformOCD(
             elbowPose.direction = directionDegrees;
             elbowPose.avoidOverlap = avoidOverlap;
             elbowPose.values = hingeParams.values;
+            elbowPose.creaseFillet = filletWindow;
             const ocd_hinge::Elbow elbow(elbowPose);
             for (unsigned int i = 0; i < nV; ++i) {
                 // Elbow 给出的是"当前姿态下的绝对位置（局部帧）"，
@@ -3528,6 +3555,8 @@ MStatus OptimizedSkinCluster::deformOCD(
             ? 0.0
             : centerLimit / radius;
 
+        ocd_centers::Diagnostics solveDiagnostics;
+        settings.diagnostics = &solveDiagnostics;
         std::vector<Vec3> offsetsLocal = ocd_centers::structuralCenters(
             edges, originalLocal, chainWeights, settings, guide, outer);
 
@@ -3546,6 +3575,9 @@ MStatus OptimizedSkinCluster::deformOCD(
                 deltaOut[3 * i + 2] = offsetsLocal[i].z;
             }
             limitOut.append(settings.centerLimit);
+            limitOut.append(static_cast<double>(solveDiagnostics.iterations));
+            limitOut.append(solveDiagnostics.converged ? 1.0 : 0.0);
+            limitOut.append(solveDiagnostics.residualRatio);
             MPlug guidePlug(thisMObject(), aOcdGuideDump);
             guidePlug.setMObject(MFnDoubleArrayData().create(guideOut));
             MPlug deltaPlug(thisMObject(), aOcdDeltaDump);

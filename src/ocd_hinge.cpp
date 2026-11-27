@@ -90,6 +90,7 @@ Elbow::Elbow(const Pose& pose) {
     innerClearance_ = 1.0 / (1.0 + 3.0 * (excess + 0.60 * std::exp(-excess / 0.60) - 0.60));
     if (!avoidOverlap_) innerClearance_ = 1.0;
     twistRadians_ = pose.twist * degToRad;
+    creaseFillet_ = std::max(0.0, pose.creaseFillet);
 
     // 11 个补偿通道：按参考实现的 VIDEO 表归一化，全零则不做次级编辑。
     static const double video[11] = {0.33, 0.29, 0.19, 0.19, 0.21, 0.21,
@@ -106,7 +107,7 @@ double Elbow::twistSkin(double station) const {
     return twistRadians_ * skinWeight(station);
 }
 
-Rail Elbow::rail(double station, const double offsets[halfRings + 1], int pole) const {
+Rail Elbow::rawRail(double station, const double offsets[halfRings + 1], int pole) const {
     const double u = std::abs(station);
     const int row = std::min(static_cast<int>(u / ringStep), halfRings - 1);
     const double t = std::min(1.0, u / ringStep - row);
@@ -139,6 +140,63 @@ Rail Elbow::rail(double station, const double offsets[halfRings + 1], int pole) 
 
     if (station > 0.0) return {-cb_ * x - sb_ * y, -sb_ * x + cb_ * y};
     return {x, y};
+}
+
+// station=0 处的圆角。
+//
+// 参考实现的 _rail() 在 station=0 左右用两支：station>0 时把 (x, y) 绕原点
+// 转 beta，station<=0 时原样。两支在 station=0 处位置连续，但左右切向夹角
+// 只有 164.5°（偏折 15.5°），是一个硬折角。
+//
+// 低密度网格（如 458 点的 24x19 圆柱，环距 0.667）相邻两环跨过折角很远，
+// 折线把尖角切掉，看上去是圆滑的；16080 点（环距 0.060）就如实采出这个
+// 折角，视觉上是刀口。
+//
+// 这里在 |station| < creaseFillet_ 的窗口内用三次 Hermite 把折角接起来：
+// 两端点取原曲线的位置，切向取原曲线的单侧切向，因此 C1 连续、曲率有界。
+// 窗口外完全沿用原实现。窗口 = 0 时退回原行为（逐位相同）。
+Rail Elbow::rail(double station, const double offsets[halfRings + 1], int pole) const {
+    const double window = creaseFillet_;
+    if (window <= 0.0 || std::abs(station) >= window || bend_ <= 1e-9) {
+        return rawRail(station, offsets, pole);
+    }
+
+    const Rail left = rawRail(-window, offsets, pole);
+    const Rail right = rawRail(window, offsets, pole);
+
+    // 单侧切向：窗口端点处用中心差分，步长远小于窗口。
+    const double h = std::min(1e-4, window * 1e-3);
+    const Rail l0 = rawRail(-window - h, offsets, pole);
+    const Rail l1 = rawRail(-window + h, offsets, pole);
+    const Rail r0 = rawRail(window - h, offsets, pole);
+    const Rail r1 = rawRail(window + h, offsets, pole);
+
+    double t0x = l1.x - l0.x;
+    double t0y = l1.y - l0.y;
+    double t1x = r1.x - r0.x, t1y = r1.y - r0.y;
+    const double n0 = std::hypot(t0x, t0y);
+    const double n1 = std::hypot(t1x, t1y);
+    if (n0 < 1e-12 || n1 < 1e-12) return rawRail(station, offsets, pole);
+    t0x /= n0; t0y /= n0;
+    t1x /= n1; t1y /= n1;
+
+    const double chordX = right.x - left.x;
+    const double chordY = right.y - left.y;
+    const double chord = std::hypot(chordX, chordY);
+    if (chord < 1e-12) return rawRail(station, offsets, pole);
+
+    const double u = std::clamp((station + window) / (2.0 * window), 0.0, 1.0);
+    const double u2 = u * u;
+    const double u3 = u2 * u;
+    const double h00 = 2.0 * u3 - 3.0 * u2 + 1.0;
+    const double h10 = u3 - 2.0 * u2 + u;
+    const double h01 = -2.0 * u3 + 3.0 * u2;
+    const double h11 = u3 - u2;
+    const double px = h00 * left.x + h10 * (chord * t0x) +
+        h01 * right.x + h11 * (chord * t1x);
+    const double py = h00 * left.y + h10 * (chord * t0y) +
+        h01 * right.y + h11 * (chord * t1y);
+    return {px, py};
 }
 
 Section Elbow::section(double station) const {
@@ -247,10 +305,47 @@ double Elbow::shoulder(double distance, double peak, double end) const {
 // ================================================================
 HingePoint hingeSection(double station, double depth, double radius,
     double weightParent, double weightChild, double weightHelper,
-    double angle, double support, double gatherScale) {
+    double angle, double support, double gatherScale, double creaseFillet) {
     (void)weightHelper;
     const double distance = std::abs(station);
     if (radius <= 1e-12) return {station, depth};
+
+    // station=0 处的圆角：参考实现用 `if (station <= 0) return {-outward, height};
+    // return {cosA*outward - sinA*height, sinA*outward + cosA*height};`
+    // 这支在 0 处位置连续，但左右切向夹角约 168°（偏折约 12°）。
+    // 低密度网格跨过去看不出来，高密度会如实采出来成刀口。
+    // 窗口内改用与 Elbow::rail 相同的 Hermite 连接，窗口外完全沿用原实现。
+    if (creaseFillet > 0.0 && std::abs(station) < creaseFillet && angle > 1e-8) {
+        const auto rawAt = [&](double s) -> HingePoint {
+            return hingeSection(s, depth, radius, weightParent, weightChild,
+                weightHelper, angle, support, gatherScale, 0.0);
+        };
+        const double w = creaseFillet;
+        const HingePoint left = rawAt(-w);
+        const HingePoint right = rawAt(w);
+        const double h = std::min(1e-4, w * 1e-3);
+        const HingePoint l0 = rawAt(-w - h), l1 = rawAt(-w + h);
+        const HingePoint r0 = rawAt(w - h), r1 = rawAt(w + h);
+
+        double t0x = l1.x - l0.x, t0y = l1.h - l0.h;
+        double t1x = r1.x - r0.x, t1y = r1.h - r0.h;
+        const double n0 = std::hypot(t0x, t0y);
+        const double n1 = std::hypot(t1x, t1y);
+        const double chord = std::hypot(right.x - left.x, right.h - left.h);
+        if (n0 > 1e-12 && n1 > 1e-12 && chord > 1e-12) {
+            t0x /= n0; t0y /= n0;
+            t1x /= n1; t1y /= n1;
+            const double u = std::clamp((station + w) / (2.0 * w), 0.0, 1.0);
+            const double u2 = u * u, u3 = u2 * u;
+            const double h00 = 2.0 * u3 - 3.0 * u2 + 1.0;
+            const double h10 = u3 - 2.0 * u2 + u;
+            const double h01 = -2.0 * u3 + 3.0 * u2;
+            const double h11 = u3 - u2;
+            return {
+                h00 * left.x + h10 * (chord * t0x) + h01 * right.x + h11 * (chord * t1x),
+                h00 * left.h + h10 * (chord * t0y) + h01 * right.h + h11 * (chord * t1y)};
+        }
+    }
 
     const double half = angle * 0.5;
     const double sineHalf = std::sin(half);
@@ -387,10 +482,14 @@ std::vector<Vec3> hingeDisplacement(
         const double lateral = depths[i] * sinPhase + laterals[i] * cosPhase;
 
         const double ext = params.radius;
+        // 圆角窗口参数在归一化空间（肢体半径倍数）。hingeSection 收的 station
+        // 已经是「除以半径」的量，所以直接用。
         const HingePoint inner = hingeSection(stations[i], ext, params.radius,
-            w.parent, w.child, w.helper, angle, support, params.gatherScale);
+            w.parent, w.child, w.helper, angle, support, params.gatherScale,
+            params.creaseFillet);
         const HingePoint outer = hingeSection(stations[i], -ext, params.radius,
-            w.parent, w.child, w.helper, angle, support, params.gatherScale);
+            w.parent, w.child, w.helper, angle, support, params.gatherScale,
+            params.creaseFillet);
         const double neutralX = (inner.x + outer.x) * 0.5;
         const double neutralH = (inner.h + outer.h) * 0.5;
         const double gradientX = (inner.x - outer.x) / (2.0 * params.radius);

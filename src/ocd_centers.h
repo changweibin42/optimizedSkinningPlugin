@@ -45,10 +45,18 @@ std::vector<double> outerParticipation(const std::vector<Vec3>& rest,
     const std::vector<std::array<double, 3>>& weights,
     double bendDegrees, double twistDegrees, double directionDegrees);
 
+/// PCG 求解的诊断输出（可选）。
+struct Diagnostics {
+    int iterations = 0;          // 实际迭代次数
+    bool converged = false;      // 是否达到残差容差
+    double residualRatio = 0.0;  // 结束时 rz / rz0
+};
+
 struct Settings {
     std::vector<Quat> rotations;   // 每骨骼相对 bind 的旋转（索引与 weights 列对应）
     double centerLimit = 16.0;     // 中心偏移上限（世界单位），<=0 表示不限
     int maxIterations = 100;
+    Diagnostics* diagnostics = nullptr;  // 非空时回填求解状态
 };
 
 /// 求解逐顶点中心偏移量。

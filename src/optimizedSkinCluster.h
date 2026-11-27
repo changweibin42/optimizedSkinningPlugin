@@ -76,6 +76,10 @@ public:
     static MObject aOcdOuterGather;
     static MObject aOcdBendFlip;
     static MObject aOcdElbowGuide;
+    // station=0 处折角的圆角窗口，单位是肢体半径的倍数。
+    // 0 = 关闭（参考实现的硬旋转切换）。参考实现在这里有一个 15.5° 的折角：
+    // 458 点的低密度网格跨过去了看不出来，16080 点就如实采出来成刀口。
+    static MObject aOcdCreaseFillet;
     // 显式指定主铰链的父/子骨骼名称（空 = 自动）。
     // 真实角色上如果自动选择有歧义，用它显式锁定。
     static MObject aOcdHingeParent;

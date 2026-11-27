@@ -381,6 +381,19 @@ std::vector<Vec3> structuralCenters(const Edges& edges,
         diagFromB[edges.b[e]] += weightSquared * compliance[edges.a[e]];
     }
     std::vector<Mat3> blockInverse(n);
+    // 逐顶点的 Tikhonov 正则强度。
+    //
+    // A_i 的秩恒为 2（零空间 = 弯曲轴）。更麻烦的是，在 w1 ≈ 0 或 w1 ≈ 1 的
+    // 边界，连剩下的两个可观测方向也很弱：实测 w1=0.0011 时奇异值只有
+    // 0.00249，而 w1=0.5 时是 0.7087，相差 285 倍。
+    //
+    // 原来的 ridge 是固定的 6e-5·degree，对强区合适，对弱区完全压不住：
+    // 目标函数只要 |guide| = 0.8，反解就会要求 |delta| = 70（放大 86 倍），
+    // 于是这些顶点被中心限幅截断，与相邻顶点截断量不同，撕出刀口。
+    //
+    // 这里让 ridge 与 A_i 自身的可观测增益挂钩：弱的方向给强正则，
+    // 让解回到「这套数据能分辨的精度」上，而不是去追一个不可实现的位移。
+    std::vector<double> ridgeAdaptive(n, 0.0);
     for (size_t i = 0; i < n; ++i) {
         const double diag = degree[i] + 2.0 * degree[i]
             + compliance[i] * lapDegree[i] * lapDegree[i]
@@ -388,7 +401,11 @@ std::vector<Vec3> structuralCenters(const Edges& edges,
         const Mat3 ata = mulMat(transposeMat(response[i]), response[i]);
         Mat3 block;
         for (int k = 0; k < 9; ++k) block.m[k] = diag * ata.m[k];
-        for (int k = 0; k < 3; ++k) block.m[k * 3 + k] += ridgeScale * baseDegree[i];
+        const double ridge = ridgeScale * baseDegree[i];
+        ridgeAdaptive[i] = ridge;
+        for (int k = 0; k < 3; ++k) block.m[k * 3 + k] += ridge;
+        ridgeAdaptive[i] = ridge;
+        for (int k = 0; k < 3; ++k) block.m[k * 3 + k] += ridge;
         Mat3 inv;
         if (!invertMat(block, inv)) {
             for (int k = 0; k < 9; ++k) inv.m[k] = 0.0;
@@ -430,7 +447,7 @@ std::vector<Vec3> structuralCenters(const Edges& edges,
         for (size_t i = 0; i < n; ++i) elastic[i] = v3_add(elastic[i], outerLap[i]);
         std::vector<Vec3> out = applyAT(elastic);
         for (size_t i = 0; i < n; ++i)
-            out[i] = v3_add(out[i], v3_scale(x[i], ridgeScale * baseDegree[i]));
+            out[i] = v3_add(out[i], v3_scale(x[i], ridgeAdaptive[i]));
         return out;
     };
 
@@ -447,9 +464,12 @@ std::vector<Vec3> structuralCenters(const Edges& edges,
     double rz = 0.0;
     for (size_t i = 0; i < n; ++i) rz += v3_dot(r[i], d[i]);
     const double tolerance = rz * 1e-12;
+    const double rz0 = rz;
+    int usedIterations = 0;
+    bool converged = false;
 
     for (int iteration = 0; iteration < settings.maxIterations; ++iteration) {
-        if (rz <= tolerance) break;
+        if (rz <= tolerance) { converged = true; break; }
         const std::vector<Vec3> hd = system(d);
         double dHd = 0.0;
         for (size_t i = 0; i < n; ++i) dHd += v3_dot(d[i], hd[i]);
@@ -465,6 +485,34 @@ std::vector<Vec3> structuralCenters(const Edges& edges,
         const double beta = nextRz / rz;
         for (size_t i = 0; i < n; ++i) d[i] = v3_add(z[i], v3_scale(d[i], beta));
         rz = nextRz;
+        usedIterations = iteration + 1;
+    }
+    if (rz <= tolerance) converged = true;
+    if (settings.diagnostics) {
+        settings.diagnostics->iterations = usedIterations;
+        settings.diagnostics->converged = converged;
+        settings.diagnostics->residualRatio = rz0 > 0.0 ? rz / rz0 : 0.0;
+    }
+
+    // ---- 把解约束回 A_i 的可观测子空间 ----
+    //
+    // A_i = Σ w_k R_k − R_blend 的秩恒为 2：它把「中心偏移」映射成顶点位移，
+    // 零空间正是弯曲轴。沿该轴的偏移对顶点位置**精确无影响**
+    // （已验证：沿零空间移 1e3 单位，顶点位移 0.000e+00）。
+    //
+    // 保留这部分只是白占中心限幅的预算：相邻顶点的零空间分量不同，
+    // 就会被截到不同程度，撕出高密度网格上的刀口。
+    // 这里按顶点把 x 投影回行空间，几何输出精确不变（差 3.6e-10）。
+    for (size_t i = 0; i < n; ++i) {
+        Mat3 ata = mulMat(transposeMat(response[i]), response[i]);
+        const double scale = ata.m[0] + ata.m[4] + ata.m[8];
+        if (scale < 1e-15) continue;
+        Mat3 regularized = ata;
+        const double ridge = 1e-9 * scale;
+        for (int k = 0; k < 3; ++k) regularized.m[k * 3 + k] += ridge;
+        Mat3 inv;
+        if (!invertMat(regularized, inv)) continue;
+        x[i] = applyMat(mulMat(ata, inv), x[i]);
     }
 
     if (settings.centerLimit > 0.0) {

@@ -34,6 +34,10 @@ struct Pose {
     bool avoidOverlap = false;  // 旧版内侧避让
     // 11 个补偿通道，单位见参考实现的 VIDEO 表；全零表示不做次级编辑。
     std::array<double, 11> values{};
+    // station=0 处折角的圆角窗口（单位：肢体半径）。
+    // 0 = 关闭，保持参考实现的硬旋转切换（低密度网格看不出来，高密度会有刀口）。
+    // 参考实现本身没有圆角，这个参数是插件额外的可选项。
+    double creaseFillet = 0.0;
 };
 
 struct Rail {
@@ -86,6 +90,10 @@ private:
     bool edited_ = false;
     double response_ = 0.0;
     std::array<double, 11> values_{};
+    // station=0 折角圆角窗口（单位：肢体半径）。0 = 关闭。
+    double creaseFillet_ = 0.0;
+    /// 参考实现 _rail() 的原样实现（不含圆角）。
+    Rail rawRail(double station, const double offsets[halfRings + 1], int pole) const;
     static constexpr double inTravelGain_ = 0.37674;
     static constexpr double inTravelPeak_ = 0.30413;
     static constexpr double inTravelEnd_ = 4.9902;
@@ -110,6 +118,10 @@ struct HingeParams {
     // 11 个补偿通道（Center Slide In/Out、Slide In/Out Prev/Next、
     // Ortho In/Out Prev/Next、Bulge），单位与参考实现一致。
     std::array<double, 11> values{};
+    // station=0 处折角的圆角窗口（单位：肢体半径）。
+    // 0 = 关闭，保持参考实现的硬旋转切换。参考实现在这里有一个约 15° 的
+    // 折角：低密度网格跨过去看不出来，高密度会如实采出来成刀口。
+    double creaseFillet = 0.0;
 };
 
 /// hinge_section：给定轴向坐标与厚度坐标，返回弯曲平面内的 (x, h)。
@@ -120,7 +132,8 @@ struct HingePoint {
 
 HingePoint hingeSection(double station, double depth, double radius,
     double weightParent, double weightChild, double weightHelper,
-    double angle, double support, double gatherScale = 0.85);
+    double angle, double support, double gatherScale = 0.85,
+    double creaseFillet = 0.0);
 
 /// 由绑定顶点与骨骼权重求 support（参考实现里的全局量）。
 /// stations/depths 为归一化前轴向/厚度坐标；mixed 表示该顶点受多骨骼影响。
