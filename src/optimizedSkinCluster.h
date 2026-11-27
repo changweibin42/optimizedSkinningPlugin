@@ -80,6 +80,14 @@ public:
     // 0 = 关闭（参考实现的硬旋转切换）。参考实现在这里有一个 15.5° 的折角：
     // 458 点的低密度网格跨过去了看不出来，16080 点就如实采出来成刀口。
     static MObject aOcdCreaseFillet;
+    /// CoR 曲线引导开关（0=关闭，走原分组路径；1=开启，逐顶点积分）。
+    static MObject aCorCurveGate;
+    /// 曲线关联度的高斯尺度，单位是参与积分的绑定半径。
+    static MObject aCorCurveSigma;
+    /// 只衰减跨曲线贡献（B 组），同曲线因子恒为 1。
+    static MObject aCorCurveCrossOnly;
+    /// 手工曲线归属（每顶点一个 curveId）；空表示按骨骼链自动推导。
+    static MObject aCorCurveAssign;
     // 显式指定主铰链的父/子骨骼名称（空 = 自动）。
     // 真实角色上如果自动选择有歧义，用它显式锁定。
     static MObject aOcdHingeParent;
@@ -267,6 +275,11 @@ private:
         std::vector<cor_paper::Weights> weights;
         std::vector<cor_paper::Weights> translationWeights;
         std::vector<mathcore::Vec3> centers;
+        /// 生成这批中心时使用的曲线引导配置；任一变化都会使缓存失效。
+        double curveGate = 0.0;
+        double curveSigma = 0.0;
+        /// 是否是「只衰减跨曲线」模式；变化时也要重算中心。
+        double curveCrossOnly = -1.0;
     };
     CenteredSkinningCache m_paperCoR, m_ddmV4;
 

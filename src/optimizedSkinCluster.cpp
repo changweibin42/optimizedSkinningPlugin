@@ -1,5 +1,6 @@
 #include "optimizedSkinCluster.h"
 #include "algorithms.h"
+#include "cor_curve.h"
 #include "dlb_gpu.h"
 #include "node_ids.h"
 #include "plugin_debug.h"
@@ -14,6 +15,8 @@
 #include <maya/MFnDagNode.h>
 #include <maya/MDagPath.h>
 #include <maya/MFnTypedAttribute.h>
+#include <maya/MFnSkinCluster.h>
+#include <maya/MDagPathArray.h>
 #include <maya/MFnDoubleArrayData.h>
 #include <maya/MDoubleArray.h>
 #include <maya/MGlobal.h>
@@ -68,6 +71,10 @@ MObject OptimizedSkinCluster::aOcdOuterGather;
 MObject OptimizedSkinCluster::aOcdBendFlip;
 MObject OptimizedSkinCluster::aOcdElbowGuide;
 MObject OptimizedSkinCluster::aOcdCreaseFillet;
+MObject OptimizedSkinCluster::aCorCurveGate;
+MObject OptimizedSkinCluster::aCorCurveSigma;
+MObject OptimizedSkinCluster::aCorCurveCrossOnly;
+MObject OptimizedSkinCluster::aCorCurveAssign;
 MObject OptimizedSkinCluster::aOcdCenterOffsets;
 MObject OptimizedSkinCluster::aOcdHingeParent;
 MObject OptimizedSkinCluster::aOcdHingeChild;
@@ -404,6 +411,60 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setNiceNameOverride("OCD Crease Fillet (body radii)");
     addAttribute(aOcdCreaseFillet);
     attributeAffects(aOcdCreaseFillet, MPxSkinCluster::outputGeom);
+
+    // ---- CoR 曲线引导（方向 A）----
+    // 只改 CoR 基础中心积分时的邻域权重：
+    //     s*_ij = s^W_ij . g_curve(i, sample)
+    //     g = exp( -(d / radius)^2 / (2 sigma^2) ),  d = 采样点沿曲线的弧长 - 查询顶点
+    // 关闭（默认 0）时 computeCenters 走原来的分组路径，逐位不变。
+    // 首版用「骨骼轴上的归一化位置」当曲线参数：与绑定 axis 对齐，无需额外
+    // 曲线数据即可先验证 A/B；后续接入真实 Influence Curve 时替换取参函数。
+    aCorCurveGate = nAttr.create("corCurveGate", "ccg",
+        MFnNumericData::kDouble, 0.0, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    nAttr.setMin(0.0);
+    nAttr.setMax(1.0);
+    nAttr.setSoftMax(1.0);
+    nAttr.setKeyable(true);
+    nAttr.setStorable(true);
+    nAttr.setNiceNameOverride("CoR Curve Gate (0=off, 1=on)");
+    addAttribute(aCorCurveGate);
+    attributeAffects(aCorCurveGate, MPxSkinCluster::outputGeom);
+
+    aCorCurveSigma = nAttr.create("corCurveSigma", "ccs",
+        MFnNumericData::kDouble, 0.1, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    nAttr.setMin(1e-4);
+    nAttr.setMax(1.0e3);
+    nAttr.setSoftMax(2.0);
+    nAttr.setKeyable(true);
+    nAttr.setStorable(true);
+    nAttr.setNiceNameOverride("CoR Curve Gate Sigma (body radii)");
+    addAttribute(aCorCurveSigma);
+    attributeAffects(aCorCurveSigma, MPxSkinCluster::outputGeom);
+
+    // B 组对照：同曲线因子恒为 1，只衰减跨曲线贡献。
+    // 0 = C 组（归属 + 同曲线弧长高斯），1 = B 组（只保留归属）。
+    aCorCurveCrossOnly = nAttr.create("corCurveCrossOnly", "ccco",
+        MFnNumericData::kBoolean, false, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    nAttr.setKeyable(true);
+    nAttr.setStorable(true);
+    nAttr.setNiceNameOverride("CoR Curve Gate: cross-curve only");
+    addAttribute(aCorCurveCrossOnly);
+    attributeAffects(aCorCurveCrossOnly, MPxSkinCluster::outputGeom);
+
+    // 手工曲线归属：长度必须为 0（自动）或 3 以外的顶点数，值为 curveId。
+    // 用于「权重配方相同、归属不同」的场景 —— 骨骼权重无法区分两块表面时，
+    // 只能靠这个显式指定。空数组 = 按骨骼链自动推导。
+    MFnTypedAttribute assignAttr;
+    aCorCurveAssign = assignAttr.create("corCurveAssign", "ccas",
+        MFnData::kDoubleArray, MObject::kNullObj, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    assignAttr.setStorable(true);
+    assignAttr.setNiceNameOverride("CoR Curve Assign (curveId per vertex)");
+    addAttribute(aCorCurveAssign);
+    attributeAffects(aCorCurveAssign, MPxSkinCluster::outputGeom);
 
     MFnTypedAttribute offsetAttr;
     aOcdCenterOffsets = offsetAttr.create("ocdCenterOffsets", "ocdcf",
@@ -1937,6 +1998,28 @@ MStatus OptimizedSkinCluster::rebuildCenteredSkinning(
         }
     }
 
+    // 方向 A 用：按紧凑 influence 顺序取出绑定关节的位置，作为曲线折线。
+    // 第一版把整条关节序列当成一条链（curveId = 0）。绑定期执行，
+    // 因此关节的世界位置就是绑定位置。
+    std::vector<mathcore::Vec3> jointPositions;
+    std::vector<unsigned int> jointChain;
+    if (next.influenceIds.size() >= 2) {
+        MDagPathArray influencePaths;
+        MFnSkinCluster skinFn(thisMObject(), &status);
+        if (status && skinFn.influenceObjects(influencePaths, &status) && status) {
+            jointPositions.reserve(influencePaths.length());
+            for (unsigned int k = 0; k < influencePaths.length(); ++k) {
+                const MMatrix world = influencePaths[k].inclusiveMatrix();
+                jointPositions.push_back({world[3][0], world[3][1], world[3][2]});
+                jointChain.push_back(k);
+            }
+        } else {
+            status = MS::kSuccess;
+            jointPositions.clear();
+            jointChain.clear();
+        }
+    }
+
     if (settings) {
         stage = "rest mesh edges";
         const int edgeCount = mesh.numEdges(&status);
@@ -1974,7 +2057,177 @@ MStatus OptimizedSkinCluster::rebuildCenteredSkinning(
                 triangle[2] >= restPoints.size()) return MS::kFailure;
             triangles.push_back(triangle);
         }
-        next.centers = cor_paper::computeCenters(restPoints, next.weights, triangles, sigma);
+
+        // ---- 方向 A：曲线引导的邻域权重 ----
+        // 开关关闭时不构造 gate，computeCenters 走原分组路径，逐位不变。
+        const double curveGateOn = block.inputValue(aCorCurveGate, &status).asDouble();
+        if (!status) return status;
+        const double curveSigma = block.inputValue(aCorCurveSigma, &status).asDouble();
+        if (!status) return status;
+        const bool curveCrossOnly = block.inputValue(aCorCurveCrossOnly, &status).asBool();
+        if (!status) return status;
+
+        cor_paper::CurveGate gate;
+        std::vector<cor_paper::CurveVertex> curveVertices;
+        if (curveGateOn >= 0.5 && curveSigma > 0.0) {
+            // 曲线归属的两种来源：
+            //   1) 手工指定 corCurveAssign（长度=顶点数，值为 curveId）
+            //      —— 用于「权重配方相同、归属不同」的场景，骨骼权重无法区分
+            //         两块表面时必须靠这个。
+            //   2) 自动：按骨骼链推导（整条关节序列视为一条曲线）。
+            std::vector<int> manualAssign;
+            {
+                const MObject assignData = block.inputValue(aCorCurveAssign, &status).data();
+                if (!status) return status;
+                if (!assignData.isNull()) {
+                    MFnDoubleArrayData arrayData(assignData, &status);
+                    if (status) {
+                        const MDoubleArray values = arrayData.array(&status);
+                        if (status && values.length() == restPoints.size()) {
+                            manualAssign.resize(values.length());
+                            for (unsigned int i = 0; i < values.length(); ++i)
+                                manualAssign[i] = static_cast<int>(values[i]);
+                        }
+                    }
+                    status = MS::kSuccess;
+                }
+            }
+
+            std::vector<cor_curve::Chain> chains;
+            std::vector<int> chainSourceId;   // 每条链对应的原始 curveId
+            if (!manualAssign.empty()) {
+                int maxId = 0;
+                for (int id : manualAssign) maxId = std::max(maxId, id);
+                for (int id = 0; id <= maxId; ++id) {
+                    std::vector<mathcore::Vec3> pts;
+                    for (size_t v = 0; v < restPoints.size(); ++v) {
+                        if (manualAssign[v] == id) pts.push_back(restPoints[v]);
+                    }
+                    if (pts.size() < 2) continue;
+                    mathcore::Vec3 lo = pts.front(), hi = pts.front();
+                    for (const auto& p : pts) {
+                        lo.x = std::min(lo.x, p.x); hi.x = std::max(hi.x, p.x);
+                        lo.y = std::min(lo.y, p.y); hi.y = std::max(hi.y, p.y);
+                        lo.z = std::min(lo.z, p.z); hi.z = std::max(hi.z, p.z);
+                    }
+                    // 主方向取跨度最大的轴；折线两端点沿该轴。
+                    const double dx = hi.x - lo.x, dy = hi.y - lo.y, dz = hi.z - lo.z;
+                    mathcore::Vec3 a = lo, b = hi;
+                    if (dx >= dy && dx >= dz) {
+                        a.y = (lo.y + hi.y) * 0.5; a.z = (lo.z + hi.z) * 0.5;
+                        b.y = a.y; b.z = a.z;
+                    } else if (dy >= dz) {
+                        a.x = (lo.x + hi.x) * 0.5; a.z = (lo.z + hi.z) * 0.5;
+                        b.x = a.x; b.z = a.z;
+                    } else {
+                        a.x = (lo.x + hi.x) * 0.5; a.y = (lo.y + hi.y) * 0.5;
+                        b.x = a.x; b.y = a.y;
+                    }
+                    cor_curve::Chain chain;
+                    chain.points = {a, b};
+                    cor_curve::buildChainGeometry(chain);
+                    chains.push_back(std::move(chain));
+                    chainSourceId.push_back(id);
+                }
+            } else {
+                // 自动模式：整条关节序列一条曲线。
+                cor_curve::Chain chain;
+                chain.bones = jointChain;
+                chain.points = jointPositions;
+                if (chain.points.size() >= 2) {
+                    cor_curve::buildChainGeometry(chain);
+                    chains.push_back(std::move(chain));
+                    chainSourceId.push_back(-1);
+                }
+            }
+
+            if (!chains.empty()) {
+                const auto bindCurves = cor_curve::bindVertices(chains, restPoints,
+                    next.weights);
+                const double scale = std::max(bindCurves.meanChainLength, 1e-12);
+                const double invTwoSigma = 1.0 / (2.0 * curveSigma * curveSigma);
+                const bool crossOnly = curveCrossOnly;
+
+                struct QueryInfo {
+                    std::vector<double> membership;
+                    std::vector<double> arc;
+                };
+                std::vector<QueryInfo> queryInfo(restPoints.size());
+                curveVertices.resize(restPoints.size());
+                for (size_t i = 0; i < restPoints.size(); ++i) {
+                    if (!manualAssign.empty()) {
+                        // 手工模式：one-hot 归属，弧长用该顶点在自己链上的投影。
+                        std::vector<double> mem(chains.size(), 0.0);
+                        std::vector<double> arc(chains.size(), 0.0);
+                        for (size_t c = 0; c < chains.size(); ++c) {
+                            if (chainSourceId[c] != manualAssign[i]) continue;
+                            mem[c] = 1.0;
+                            arc[c] = cor_curve::detail::projectArc(
+                                chains[c], restPoints[i]);
+                        }
+                        queryInfo[i].membership = mem;
+                        queryInfo[i].arc = arc;
+                        curveVertices[i].membership = mem;
+                        curveVertices[i].arc = arc;
+                    } else {
+                        queryInfo[i].membership = bindCurves.vertices[i].membership;
+                        queryInfo[i].arc = bindCurves.vertices[i].arcLength;
+                        curveVertices[i].membership = bindCurves.vertices[i].membership;
+                        curveVertices[i].arc = bindCurves.vertices[i].arcLength;
+                    }
+                }
+
+                gate = [queryInfo, scale, invTwoSigma, crossOnly](
+                           unsigned int query, const cor_paper::CurveSample& sample) -> double {
+                    if (query >= queryInfo.size()) return 1.0;
+                    if (!sample.membership || !sample.arc) return 1.0;
+                    const auto& qm = queryInfo[query].membership;
+                    const auto& qa = queryInfo[query].arc;
+                    const auto& sm = *sample.membership;
+                    const auto& sa = *sample.arc;
+                    const size_t n = std::min(qm.size(), sm.size());
+                    if (n == 0) return 1.0;
+                    // 跨曲线归属：用两侧归属权重的重叠量作为同属程度。
+                    double overlap = 0.0;
+                    double total = 0.0;
+                    for (size_t k = 0; k < n; ++k) {
+                        overlap += std::min(qm[k], sm[k]);
+                        total += qm[k];
+                    }
+                    // 归一化到 [0,1]：完全同属 -> 1。
+                    const double sameCurve = total > 1e-12
+                        ? std::max(0.0, std::min(1.0, overlap / total)) : 1.0;
+                    double g = 1.0;
+                    if (crossOnly) {
+                        // B 组：同曲线 g=1，只衰减跨曲线贡献。
+                        g = sameCurve;
+                    } else {
+                        // C 组：在 B 之上再叠加同曲线弧长高斯。
+                        double arc = 0.0;
+                        double weightSum = 0.0;
+                        for (size_t k = 0; k < n; ++k) {
+                            if (qm[k] <= 0.0) continue;
+                            arc += qm[k] * (sa[k] - qa[k]);
+                            weightSum += qm[k];
+                        }
+                        const double d = weightSum > 1e-12
+                            ? std::fabs(arc / weightSum) / scale : 0.0;
+                        g = sameCurve * std::exp(-(d * d) * invTwoSigma);
+                    }
+                    return g;
+                };
+
+                if (crossOnly) {
+                    // B 组只看归属，不需要弧长参与，但仍要把归属传进去。
+                }
+            }
+        }
+
+        next.centers = cor_paper::computeCenters(restPoints, next.weights, triangles,
+            sigma, gate, gate ? &curveVertices : nullptr);
+        next.curveGate = curveGateOn >= 0.5 ? 1.0 : 0.0;
+        next.curveSigma = curveSigma;
+        next.curveCrossOnly = curveCrossOnly ? 1.0 : 0.0;
     }
     next.geometryIndex = geometryIndex;
     next.weightVersion = m_currentWeightVersion;
@@ -2022,9 +2275,25 @@ MStatus OptimizedSkinCluster::deformCoR(
     }
 
     auto& cache = useDdm ? m_ddmV4 : m_paperCoR;
+    // 曲线引导开关/尺度变化也必须使基础中心失效，否则 A/B 会读到上一组缓存。
+    double curveGateNow = 0.0;
+    double curveSigmaNow = 0.0;
+    if (!useDdm) {
+        curveGateNow = block.inputValue(aCorCurveGate, &status).asDouble();
+        if (!status) return reportFailure(status, "read corCurveGate");
+        curveSigmaNow = block.inputValue(aCorCurveSigma, &status).asDouble();
+        if (!status) return reportFailure(status, "read corCurveSigma");
+    }
     if (forceFull || !cache.valid || cache.geometryIndex != multiIndex ||
         cache.weightVersion != m_currentWeightVersion ||
-        (useDdm ? !(cache.ddmSettings == ddmSettings) : cache.sigma != sigma)) {
+        (useDdm ? !(cache.ddmSettings == ddmSettings)
+                : (cache.sigma != sigma ||
+                   cache.curveGate != curveGateNow ||
+                   cache.curveSigma != curveSigmaNow ||
+                   cache.curveCrossOnly !=
+                       (block.inputValue(aCorCurveCrossOnly, &status).asBool()
+                            ? 1.0 : 0.0)))) {
+        if (!status) return reportFailure(status, "read corCurveCrossOnly");
         cache.valid = false;
         const char* stage = "bind cache";
         const auto start = std::chrono::steady_clock::now();
