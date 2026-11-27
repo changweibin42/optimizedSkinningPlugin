@@ -56,6 +56,7 @@ MObject OptimizedSkinCluster::aAlgorithmType;
 MObject OptimizedSkinCluster::aDlbUseOpenCL;
 MObject OptimizedSkinCluster::aDQSCompStrength;
 MObject OptimizedSkinCluster::aForceFullCoR;
+MObject OptimizedSkinCluster::aFitOffsets;
 MObject OptimizedSkinCluster::aCorTriLayerExpand;
 MObject OptimizedSkinCluster::aCorVertLayerExpand;
 MObject OptimizedSkinCluster::aCorMosSecondaryWeight;
@@ -63,6 +64,8 @@ MObject OptimizedSkinCluster::aOcdTwistWeight;
 MObject OptimizedSkinCluster::aOcdAvoidOverlap;
 MObject OptimizedSkinCluster::aOcdCenterLimit;
 MObject OptimizedSkinCluster::aOcdEnableCenterLimit;
+MObject OptimizedSkinCluster::aOcdOuterGather;
+MObject OptimizedSkinCluster::aOcdBendFlip;
 MObject OptimizedSkinCluster::aOcdCenterOffsets;
 MObject OptimizedSkinCluster::aOcdHingeParent;
 MObject OptimizedSkinCluster::aOcdHingeChild;
@@ -202,6 +205,7 @@ MStatus OptimizedSkinCluster::initialize() {
     eAttr.addField("MOS", 4);
     eAttr.addField("OCD + Corrected CoR", 5);
     eAttr.addField("DDM v4 (2019)", 6);
+    eAttr.addField("CoR Fixed Center Fit", 8);
     eAttr.setKeyable(true);
     eAttr.setStorable(true);
     addAttribute(aAlgorithmType);
@@ -235,6 +239,21 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setChannelBox(false);
     addAttribute(aForceFullCoR);
     attributeAffects(aForceFullCoR, MPxSkinCluster::outputGeom);
+
+    // CoR Fixed Center Fit（alg 8）：偏移按绑定对象空间向量保存，
+    // 由外部（例如参考实现的 NumPy 求解）写入。插件只做
+    // center + offset 之后的一次 vertexTransform。
+    {
+        MFnTypedAttribute fitAttr;
+        aFitOffsets = fitAttr.create("corFitOffsets", "cfo",
+            MFnData::kDoubleArray, MObject::kNullObj, &status);
+        CHECK_MSTATUS_AND_RETURN_IT(status);
+        fitAttr.setStorable(true);
+        fitAttr.setKeyable(false);
+        fitAttr.setNiceNameOverride("CoR Fixed Center Fit Offsets (bind object space)");
+        CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aFitOffsets));
+        CHECK_MSTATUS_AND_RETURN_IT(attributeAffects(aFitOffsets, MPxSkinCluster::outputGeom));
+    }
 
     aCorTriLayerExpand = nAttr.create("corTriLayerExpand", "ctle",
         MFnNumericData::kInt, 1, &status);
@@ -329,6 +348,30 @@ MStatus OptimizedSkinCluster::initialize() {
     addAttribute(aOcdEnableCenterLimit);
     attributeAffects(aOcdEnableCenterLimit, MPxSkinCluster::outputGeom);
 
+    // 凸侧 gather 系数：参考实现的 0.85 在深弯时会把外轮廓拉瘪。
+    // 0 表示外侧按刚体搬运，保留绑定网格原本饱满的外侧。
+    aOcdOuterGather = nAttr.create("ocdOuterGather", "ocdog",
+        MFnNumericData::kDouble, 0.85, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    nAttr.setMin(0.0);
+    nAttr.setMax(2.0);
+    nAttr.setKeyable(true);
+    nAttr.setStorable(true);
+    nAttr.setNiceNameOverride("OCD Outer Gather");
+    addAttribute(aOcdOuterGather);
+    attributeAffects(aOcdOuterGather, MPxSkinCluster::outputGeom);
+
+    // 负弯时是否翻转弯面 180 度。参考实现翻转；关闭后 bind.y<0 的一侧
+    // 在负弯时仍按外侧处理，用于对比外轮廓是否因此更饱满。
+    aOcdBendFlip = nAttr.create("ocdBendFlip", "ocdbfl",
+        MFnNumericData::kBoolean, true, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    nAttr.setKeyable(true);
+    nAttr.setStorable(true);
+    nAttr.setNiceNameOverride("OCD Flip Plane On Negative Bend");
+    addAttribute(aOcdBendFlip);
+    attributeAffects(aOcdBendFlip, MPxSkinCluster::outputGeom);
+
     MFnTypedAttribute offsetAttr;
     aOcdCenterOffsets = offsetAttr.create("ocdCenterOffsets", "ocdcf",
         MFnData::kDoubleArray, MObject::kNullObj, &status);
@@ -407,10 +450,16 @@ MStatus OptimizedSkinCluster::initialize() {
             *dumps[dump] = dumpAttr.create(names[dump], shorts[dump],
                 MFnData::kDoubleArray, MObject::kNullObj, &status);
             CHECK_MSTATUS_AND_RETURN_IT(status);
-            dumpAttr.setStorable(false);
+            // storable 必须为 true：false 时 Maya 不保留我们在 deform() 里
+            // 用 setMObject 写进去的值，getAttr 会一直读到空数组。
+            dumpAttr.setStorable(true);
+            dumpAttr.setReadable(true);
+            dumpAttr.setWritable(true);
             dumpAttr.setKeyable(false);
             dumpAttr.setNiceNameOverride(labels[dump]);
             CHECK_MSTATUS_AND_RETURN_IT(addAttribute(*dumps[dump]));
+            CHECK_MSTATUS_AND_RETURN_IT(attributeAffects(*dumps[dump],
+                MPxSkinCluster::outputGeom));
         }
     }
 
@@ -1760,6 +1809,7 @@ MStatus OptimizedSkinCluster::deform(
 
     if (algo == 0) return deformCoR(block, iter, worldMat, multiIndex);
     if (algo == 6) return deformCoR(block, iter, worldMat, multiIndex, CenteredMode::DdmV4);
+    if (algo == 8) return deformCoR(block, iter, worldMat, multiIndex, CenteredMode::FixedFit);
 
     unsigned int nV = iter.count();
     collectBoneInfo(block);
@@ -2037,10 +2087,33 @@ MStatus OptimizedSkinCluster::deformCoR(
     if (!status) return reportFailure(status, "reset geometry iterator");
 
     const MMatrix worldInverse = worldMat.inverse();
+    // 固定中心拟合的偏移按绑定对象空间保存，中心也在同一空间，直接相加。
+    // 长度必须为 0（不启用）或 3*顶点数，否则报错而不是静默忽略，
+    // 以免外部求解器写入的数组长度不对时得到看似正常的错误结果。
+    std::vector<mathcore::Vec3> fittedOffsets;
+    if (mode == CenteredMode::FixedFit) {
+        const MObject data = block.inputValue(aFitOffsets, &status).data();
+        if (!status) return reportFailure(status, "read corFitOffsets");
+        if (!data.isNull()) {
+            MFnDoubleArrayData arrayData(data, &status);
+            if (!status) return reportFailure(status, "corFitOffsets data");
+            const MDoubleArray values = arrayData.array(&status);
+            if (!status) return reportFailure(status, "corFitOffsets array");
+            if (values.length() != 0 &&
+                values.length() != 3 * cache.centers.size()) {
+                return reportFailure(MS::kInvalidParameter, "corFitOffsets length");
+            }
+            fittedOffsets.resize(values.length() / 3);
+            for (size_t i = 0; i < fittedOffsets.size(); ++i)
+                fittedOffsets[i] = {values[3 * i], values[3 * i + 1], values[3 * i + 2]};
+        }
+    }
     const auto deformPoint = [&](const MPoint& p, unsigned int vertex) {
         if (vertex >= cache.weights.size() || cache.weights[vertex].empty()) return p;
         const MPoint restWorld = p * worldMat;
-        const auto center = cache.centers[vertex];
+        auto center = cache.centers[vertex];
+        if (vertex < fittedOffsets.size())
+            center = mathcore::v3_add(center, fittedOffsets[vertex]);
         const MPoint centerWorld = MPoint(center.x, center.y, center.z) * worldMat;
         const auto& rotationWeights = cache.weights[vertex];
         const auto& translationWeights = cache.translationWeights.empty()
@@ -3230,6 +3303,14 @@ MStatus OptimizedSkinCluster::deformOCD(
     hingeParams.twist = twistDegrees;
     hingeParams.direction = directionDegrees;
     hingeParams.radius = 1.0;      // 局部坐标已按半径归一，这里必须是 1
+    {
+        MStatus gatherStatus;
+        const double gather = block.inputValue(aOcdOuterGather, &gatherStatus).asDouble();
+        if (gatherStatus) hingeParams.gatherScale = std::clamp(gather, 0.0, 2.0);
+        MStatus flipStatus;
+        const bool flip = block.inputValue(aOcdBendFlip, &flipStatus).asBool();
+        if (flipStatus) hingeParams.bendFlip = flip;
+    }
     {
         // 11 个补偿通道按参考实现的 CHANNELS 顺序读取。
         MObject* const channelAttrs[ocdChannelCount] = {

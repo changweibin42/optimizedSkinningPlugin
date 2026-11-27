@@ -57,7 +57,10 @@ public:
     static MObject aDlbUseOpenCL;
     static MObject aDQSCompStrength;
     static MObject aForceFullCoR;
-
+    // CoR Fixed Center Fit（对应参考实现 alg 8）：把外部求得、存于绑定对象
+    // 空间的旋转中心偏移直接加到每个顶点的 CoR 中心上，再由同一条
+    // cor_paper::vertexTransform 求值。插件本身不求解偏移。
+    static MObject aFitOffsets;
     static MObject aCorTriLayerExpand;
     static MObject aCorVertLayerExpand;
     static MObject aCorIncBudgetDiv;
@@ -70,6 +73,8 @@ public:
     // OCD+Corrected CoR 的中心修正上限（世界单位）。
     static MObject aOcdCenterLimit;
     static MObject aOcdEnableCenterLimit;
+    static MObject aOcdOuterGather;
+    static MObject aOcdBendFlip;
     // 显式指定主铰链的父/子骨骼名称（空 = 自动）。
     // 真实角色上如果自动选择有歧义，用它显式锁定。
     static MObject aOcdHingeParent;
@@ -201,7 +206,7 @@ private:
     //   0 = CoR，1 = DLB，2 = DQS Compensation，3 = OCD，
     //   4 = MOS，5 = OCD + Corrected CoR，6 = DDM v4
     // ================================================================
-    enum class CenteredMode { CoR, DdmV4 };
+    enum class CenteredMode { CoR, DdmV4, FixedFit };
     MStatus deformCoR(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int,
         CenteredMode mode = CenteredMode::CoR);
     MStatus deformDLB(MDataBlock&, MItGeometry&, const MMatrix&, unsigned int,

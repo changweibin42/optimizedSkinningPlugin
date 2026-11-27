@@ -100,6 +100,13 @@ struct HingeParams {
     double twist = 0.0;      // 度
     double direction = 0.0;  // 度
     double radius = 1.0;     // 肢体半径
+    // 凸侧 gather 系数：参考实现为 0.85。深弯时它会达 0.8 以上，
+    // 把外轮廓明显拉瘪。0 表示外侧按刚体搬运，保留绑定轮廓的饱满度。
+    double gatherScale = 0.85;
+    // 负弯时是否把弯面再翻转 180 度（参考实现的行为）。
+    // 关闭后，bind.y<0 的一侧在负弯时仍按「外侧」处理，
+    // inner/outer 的分支不再随弯曲方向互换。
+    bool bendFlip = true;
     // 11 个补偿通道（Center Slide In/Out、Slide In/Out Prev/Next、
     // Ortho In/Out Prev/Next、Bulge），单位与参考实现一致。
     std::array<double, 11> values{};
@@ -113,7 +120,7 @@ struct HingePoint {
 
 HingePoint hingeSection(double station, double depth, double radius,
     double weightParent, double weightChild, double weightHelper,
-    double angle, double support);
+    double angle, double support, double gatherScale = 0.85);
 
 /// 由绑定顶点与骨骼权重求 support（参考实现里的全局量）。
 /// stations/depths 为归一化前轴向/厚度坐标；mixed 表示该顶点受多骨骼影响。

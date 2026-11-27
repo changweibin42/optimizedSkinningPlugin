@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 
 namespace ocd_hinge {
@@ -245,7 +247,7 @@ double Elbow::shoulder(double distance, double peak, double end) const {
 // ================================================================
 HingePoint hingeSection(double station, double depth, double radius,
     double weightParent, double weightChild, double weightHelper,
-    double angle, double support) {
+    double angle, double support, double gatherScale) {
     (void)weightHelper;
     const double distance = std::abs(station);
     if (radius <= 1e-12) return {station, depth};
@@ -280,7 +282,10 @@ HingePoint hingeSection(double station, double depth, double radius,
     const double extra = arcLength - tangentStation;
 
     const double side = depth < 0.0 ? 1.0 : 0.0;
-    const double gather = 0.85 * sineHalf * side * side;
+    // gather 把凸侧材料沿已有弧线往铰链方向收。参考实现取 0.85，但在
+    // 深弯时 sin(angle/2) 接近 1，系数达 0.81，外轮廓会被明显拉瘪，
+    // 与绑定网格原本饱满的外侧不符。外部可通过 ocdOuterGather 调低或关闭。
+    const double gather = gatherScale * sineHalf * side * side;
     const double opening = 0.32 * distance * sineHalf * side * side *
         std::pow(1.0 - u, 5.0);
     const double material = distance * (1.0 - gather * (1.0 - u) * (1.0 - u)) + opening;
@@ -345,7 +350,14 @@ std::vector<Vec3> hingeDisplacement(
     std::vector<Vec3> out(count, Vec3{0.0, 0.0, 0.0});
     if (count == 0 || params.radius <= 1e-12) return out;
 
-    const double plane = (params.direction + (params.bend < 0.0 ? 180.0 : 0.0)) * degToRad;
+    // 参考实现用 plane 同时承担两件事：把弯面转到 direction 指定的方位，
+    // 以及在 bend<0 时把整圈材料翻转 180 度。
+    // 后果是：负弯时 bind.y<0（视觉上的外侧）会被 depth 的翻转当成「内侧」，
+    // 走 inner 分支，于是它的厚度由 inner.h 决定，outer/gather 完全不起作用。
+    // 这就是负弯时外轮廓被压瘪、而 ocdOuterGather 无效的原因。
+    // 用 ocdBendFlip 可以关掉这层翻转做对比（默认仍按参考实现翻转）。
+    const double flipDegrees = (params.bend < 0.0 && params.bendFlip) ? 180.0 : 0.0;
+    const double plane = (params.direction + flipDegrees) * degToRad;
     const double cosPlane = std::cos(plane);
     const double sinPlane = std::sin(plane);
     const double angle = std::abs(params.bend) * degToRad;
@@ -376,9 +388,9 @@ std::vector<Vec3> hingeDisplacement(
 
         const double ext = params.radius;
         const HingePoint inner = hingeSection(stations[i], ext, params.radius,
-            w.parent, w.child, w.helper, angle, support);
+            w.parent, w.child, w.helper, angle, support, params.gatherScale);
         const HingePoint outer = hingeSection(stations[i], -ext, params.radius,
-            w.parent, w.child, w.helper, angle, support);
+            w.parent, w.child, w.helper, angle, support, params.gatherScale);
         const double neutralX = (inner.x + outer.x) * 0.5;
         const double neutralH = (inner.h + outer.h) * 0.5;
         const double gradientX = (inner.x - outer.x) / (2.0 * params.radius);

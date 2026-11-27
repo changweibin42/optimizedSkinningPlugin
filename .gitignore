@@ -404,3 +404,6 @@ tests/_W.npy
 tests/_cyl_step*.py
 tests/_la_step*.py
 tests/_sup_step*.py
+
+tests/_a8_delta.json
+tests/_a8_step*.py
