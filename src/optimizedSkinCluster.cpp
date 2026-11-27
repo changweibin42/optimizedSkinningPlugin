@@ -62,6 +62,7 @@ MObject OptimizedSkinCluster::aCorMosSecondaryWeight;
 MObject OptimizedSkinCluster::aOcdTwistWeight;
 MObject OptimizedSkinCluster::aOcdAvoidOverlap;
 MObject OptimizedSkinCluster::aOcdCenterLimit;
+MObject OptimizedSkinCluster::aOcdEnableCenterLimit;
 MObject OptimizedSkinCluster::aOcdCenterOffsets;
 MObject OptimizedSkinCluster::aOcdHingeParent;
 MObject OptimizedSkinCluster::aOcdHingeChild;
@@ -314,6 +315,19 @@ MStatus OptimizedSkinCluster::initialize() {
     nAttr.setNiceNameOverride("OCD Corrected CoR Limit");
     addAttribute(aOcdCenterLimit);
     attributeAffects(aOcdCenterLimit, MPxSkinCluster::outputGeom);
+
+    // 中心限幅开关：默认 true 保持旧场景行为。关闭后跳过 structuralCenters
+    // 末尾的逐顶点长度截断，对齐参考实现的 center_limit=None。
+    // 固定硬限额会把相邻顶点截断到不同程度，在低权重边界形成局部折角；
+    // 关闭后可直接观察完整求解结果。
+    aOcdEnableCenterLimit = nAttr.create("ocdEnableCenterLimit", "oclen",
+        MFnNumericData::kBoolean, true, &status);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
+    nAttr.setKeyable(true);
+    nAttr.setStorable(true);
+    nAttr.setNiceNameOverride("OCD Enable Corrected CoR Limit");
+    addAttribute(aOcdEnableCenterLimit);
+    attributeAffects(aOcdEnableCenterLimit, MPxSkinCluster::outputGeom);
 
     MFnTypedAttribute offsetAttr;
     aOcdCenterOffsets = offsetAttr.create("ocdCenterOffsets", "ocdcf",
@@ -3379,8 +3393,16 @@ MStatus OptimizedSkinCluster::deformOCD(
         MStatus limitStatus;
         double centerLimit = block.inputValue(aOcdCenterLimit, &limitStatus).asDouble();
         if (!limitStatus || centerLimit <= 0.0) centerLimit = 16.0;
+        // 开关关闭时跳过末尾的逐顶点截断（对齐参考实现的 center_limit=None）。
+        // 注意必须在上面那个 16 回退之后判断，否则关闭路径会被回退值覆盖。
+        MStatus enableLimitStatus;
+        const bool enableCenterLimit =
+            block.inputValue(aOcdEnableCenterLimit, &enableLimitStatus).asBool();
         // 属性按世界单位暴露；求解空间是半径归一，故换算成「肢体半径的倍数」。
-        settings.centerLimit = centerLimit / radius;
+        // centerLimit <= 0 在 structuralCenters 中表示不限幅。
+        settings.centerLimit = (enableLimitStatus && !enableCenterLimit)
+            ? 0.0
+            : centerLimit / radius;
 
         std::vector<Vec3> offsetsLocal = ocd_centers::structuralCenters(
             edges, originalLocal, chainWeights, settings, guide, outer);

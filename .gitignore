@@ -389,3 +389,18 @@ tests/_alg5_3b_truth.json
 tests/_stage1.json
 tests/_python_delta.json
 tests/_delta_dump.json
+
+# 临时实验数据与分步脚本
+tests/_cyl*.json
+tests/_la*.json
+tests/_sup*.json
+tests/_stage1.json
+tests/_python_delta.json
+tests/_delta_dump.json
+tests/_clamp_exp.json
+tests/_smooth_inner.json
+tests/_delta_xy.npy
+tests/_W.npy
+tests/_cyl_step*.py
+tests/_la_step*.py
+tests/_sup_step*.py

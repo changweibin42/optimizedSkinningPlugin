@@ -69,6 +69,7 @@ public:
     static MObject aOcdAvoidOverlap;
     // OCD+Corrected CoR 的中心修正上限（世界单位）。
     static MObject aOcdCenterLimit;
+    static MObject aOcdEnableCenterLimit;
     // 显式指定主铰链的父/子骨骼名称（空 = 自动）。
     // 真实角色上如果自动选择有歧义，用它显式锁定。
     static MObject aOcdHingeParent;
