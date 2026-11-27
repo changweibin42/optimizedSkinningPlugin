@@ -385,3 +385,7 @@ tests/_alg5_original.json
 tests/_alg5_truth.json
 tests/_alg5_3b_original.json
 tests/_alg5_3b_truth.json
+
+tests/_stage1.json
+tests/_python_delta.json
+tests/_delta_dump.json

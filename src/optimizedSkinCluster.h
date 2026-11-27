@@ -76,6 +76,16 @@ public:
     // 诊断：把实际选中的 parent/child/helper 名字写成字符串，
     // 供测试与真实角色校对。不影响 outputGeom。
     static MObject aOcdHingeReport;
+    // 诊断：实际送入求解的 guide 与求出的 delta（局部归一坐标）。
+    // 只读，不参与正常驱动。用来判断凹陷到底丢在哪一步。
+    static MObject aOcdGuideDump;
+    static MObject aOcdDeltaDump;
+    static MObject aOcdCenterLimitDump;
+    // 实验：中心偏移的低权重门控。
+    // 子骨权重 w1 <= lo 时不用 delta，w1 >= hi 时全用，中间线性。
+    // 默认 0 / 0 表示关闭（保持旧行为）。
+    static MObject aOcdCenterGateLow;
+    static MObject aOcdCenterGateHigh;
     // 可选的中心偏移注入（对象空间向量）。
     // 非空时直接矩阵这些偏移，跳过求解，用于与参考实现逐级对拍。
     static MObject aOcdCenterOffsets;

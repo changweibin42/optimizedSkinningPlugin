@@ -66,6 +66,11 @@ MObject OptimizedSkinCluster::aOcdCenterOffsets;
 MObject OptimizedSkinCluster::aOcdHingeParent;
 MObject OptimizedSkinCluster::aOcdHingeChild;
 MObject OptimizedSkinCluster::aOcdHingeReport;
+MObject OptimizedSkinCluster::aOcdGuideDump;
+MObject OptimizedSkinCluster::aOcdDeltaDump;
+MObject OptimizedSkinCluster::aOcdCenterLimitDump;
+MObject OptimizedSkinCluster::aOcdCenterGateLow;
+MObject OptimizedSkinCluster::aOcdCenterGateHigh;
 MObject OptimizedSkinCluster::aOcdCenterSlideIn;
 MObject OptimizedSkinCluster::aOcdCenterSlideOut;
 MObject OptimizedSkinCluster::aOcdSlideInPrev;
@@ -347,6 +352,52 @@ MStatus OptimizedSkinCluster::initialize() {
         reportAttr.setWritable(false);
         reportAttr.setNiceNameOverride("OCD Hinge Report (debug)");
         CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aOcdHingeReport));
+    }
+
+    // 诊断导出：guide / delta / 实际使用的 centerLimit。
+    // 用普通可写 doubleArray（非 output），由 deform 里回写；
+    // 不参与 attributeAffects，也不影响驱动。
+    // 低权重门控（实验性）：两个可写 double，默认 0/0 = 关闭。
+    {
+        MObject* const gates[2] = {&aOcdCenterGateLow, &aOcdCenterGateHigh};
+        const char* const gnames[2] = {"ocdCenterGateLow", "ocdCenterGateHigh"};
+        const char* const gshorts[2] = {"ocgl", "ocgh"};
+        const char* const glabels[2] = {"OCD Center Gate Low (w1)",
+                                        "OCD Center Gate High (w1)"};
+        for (int g = 0; g < 2; ++g) {
+            MFnNumericAttribute gAttr;
+            *gates[g] = gAttr.create(gnames[g], gshorts[g],
+                MFnNumericData::kDouble, 0.0, &status);
+            CHECK_MSTATUS_AND_RETURN_IT(status);
+            gAttr.setStorable(true);
+            gAttr.setKeyable(true);
+            gAttr.setNiceNameOverride(glabels[g]);
+            CHECK_MSTATUS_AND_RETURN_IT(addAttribute(*gates[g]));
+            CHECK_MSTATUS_AND_RETURN_IT(attributeAffects(*gates[g],
+                MPxSkinCluster::outputGeom));
+        }
+    }
+
+    {
+        MObject* const dumps[3] = {&aOcdGuideDump, &aOcdDeltaDump,
+                                   &aOcdCenterLimitDump};
+        const char* const names[3] = {"ocdGuideDump", "ocdDeltaDump",
+                                      "ocdCenterLimitDump"};
+        // 注意："occl" 已被 ocdCenterLimit 占用，不能重用短名。
+        const char* const shorts[3] = {"ocgd", "ocdd", "occlu"};
+        const char* const labels[3] = {"OCD Guide Dump (debug)",
+                                       "OCD Delta Dump (debug)",
+                                       "OCD Center Limit Used (debug)"};
+        for (int dump = 0; dump < 3; ++dump) {
+            MFnTypedAttribute dumpAttr;
+            *dumps[dump] = dumpAttr.create(names[dump], shorts[dump],
+                MFnData::kDoubleArray, MObject::kNullObj, &status);
+            CHECK_MSTATUS_AND_RETURN_IT(status);
+            dumpAttr.setStorable(false);
+            dumpAttr.setKeyable(false);
+            dumpAttr.setNiceNameOverride(labels[dump]);
+            CHECK_MSTATUS_AND_RETURN_IT(addAttribute(*dumps[dump]));
+        }
     }
 
     // ---- OCD 11 个补偿通道（对应参考实现的 Channel Box 滑块） ----
@@ -3334,6 +3385,29 @@ MStatus OptimizedSkinCluster::deformOCD(
         std::vector<Vec3> offsetsLocal = ocd_centers::structuralCenters(
             edges, originalLocal, chainWeights, settings, guide, outer);
 
+        // ---- 诊断导出：guide / delta / 实际限额 ----
+        // 只写属性，不影响正常驱动。
+        {
+            MDoubleArray guideOut, deltaOut, limitOut;
+            guideOut.setLength(static_cast<unsigned int>(3 * nV));
+            deltaOut.setLength(static_cast<unsigned int>(3 * nV));
+            for (unsigned int i = 0; i < nV; ++i) {
+                guideOut[3 * i + 0] = guide[i].x;
+                guideOut[3 * i + 1] = guide[i].y;
+                guideOut[3 * i + 2] = guide[i].z;
+                deltaOut[3 * i + 0] = offsetsLocal[i].x;
+                deltaOut[3 * i + 1] = offsetsLocal[i].y;
+                deltaOut[3 * i + 2] = offsetsLocal[i].z;
+            }
+            limitOut.append(settings.centerLimit);
+            MPlug guidePlug(thisMObject(), aOcdGuideDump);
+            guidePlug.setMObject(MFnDoubleArrayData().create(guideOut));
+            MPlug deltaPlug(thisMObject(), aOcdDeltaDump);
+            deltaPlug.setMObject(MFnDoubleArrayData().create(deltaOut));
+            MPlug limitPlug(thisMObject(), aOcdCenterLimitDump);
+            limitPlug.setMObject(MFnDoubleArrayData().create(limitOut));
+        }
+
         // 可选的注入偏移（对象空间向量），用于与参考实现逐级对拍。
         std::vector<Vec3> injected;
         {
@@ -3352,10 +3426,26 @@ MStatus OptimizedSkinCluster::deformOCD(
             }
         }
 
+        // [实验] delta 门控：低权重区（w1 小）不应应用中心偏移。
+        // 实测：注入全零 delta 后 x=-0.5 处圆度 0.096，
+        // 而自动求解是 0.215（更差），解析模型 0.102。
+        // 所以 delta 在 w1 偏低时会破坏截面圆度。
+        MStatus gateStatus;
+        double gateLow = block.inputValue(aOcdCenterGateLow, &gateStatus).asDouble();
+        double gateHigh = gateStatus
+            ? block.inputValue(aOcdCenterGateHigh, &gateStatus).asDouble() : 0.0;
+        // high <= low 表示门控关闭（保持旧行为）。
+        const bool applyGate = gateHigh > gateLow + 1e-9;
         for (unsigned int i = 0; i < nV; ++i) {
             const Vec3 base = i < baseCenters.size() ? baseCenters[i] : frames[i].rest;
             if (injected.empty()) {
-                centers[i] = v3_add(base, localOffsetToWorld(offsetsLocal[i]));
+                Vec3 offset = localOffsetToWorld(offsetsLocal[i]);
+                if (applyGate) {
+                    const double w1 = chainWeights[i][1];
+                    const double gate = std::clamp((w1 - gateLow) / (gateHigh - gateLow), 0.0, 1.0);
+                    offset = v3_scale(offset, gate);
+                }
+                centers[i] = v3_add(base, offset);
             }
             else {
                 // 属性按对象空间声明，而 centres 是世界空间；
